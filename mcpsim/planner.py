@@ -43,7 +43,12 @@ MAX_PLAN_ATTEMPTS = 2  # the first ask plus one re-ask with the validation error
 DRY_RUN_PATH_ID = "happy-dry-run"
 
 # Tools a dry-run plan must not call (DESIGN §6 build spec): descriptions mentioning spend.
-EXPENSIVE_PATTERN = re.compile(r"credit|costs|SLOW|LLM")
+# A tool is skipped by the dry run only when its description CLAIMS a cost.
+# The first version also matched the bare word "LLM", which is how eleven
+# free pantry tools describe themselves ("Free — no LLM calls"), so the dry
+# run called exactly one tool. A negation ("no LLM", "free") wins.
+EXPENSIVE_PATTERN = re.compile(r"credit|\bcosts?\b|\bslow\b|\bspends?\b", re.IGNORECASE)
+FREE_PATTERN = re.compile(r"\bno llm\b|\bfree\b", re.IGNORECASE)
 
 
 class PlanError(RuntimeError):
@@ -787,8 +792,14 @@ def default_arguments(tool: ToolInfo) -> tuple[dict[str, Any] | None, list[str]]
 
 
 def is_expensive(tool: ToolInfo) -> bool:
-    """Does the description say the tool spends money, credits or an LLM call?"""
-    return EXPENSIVE_PATTERN.search(tool.description) is not None
+    """Does the description claim the tool spends money, credits or time?
+
+    A description that says "free" or "no LLM" is believed over an incidental
+    cost word, so "Free — no LLM calls" is free and "SLOW (10-60s) and costs
+    real Claude API credits" is expensive.
+    """
+    desc = tool.description or ""
+    return EXPENSIVE_PATTERN.search(desc) is not None and FREE_PATTERN.search(desc) is None
 
 
 def dry_run_plan(scenario: Scenario, catalog: Catalog) -> ExecutionPlan:

@@ -779,6 +779,15 @@ def test_default_arguments_and_expensive_detection() -> None:
     assert is_expensive(ToolInfo(name="x", description="costs money"))
     assert is_expensive(ToolInfo(name="x", description="consumes one credit"))
     assert not is_expensive(ToolInfo(name="x", description="Look up a product by slug."))
+    # The pantry server's free tools all say this; the first heuristic matched
+    # the bare word "LLM" and skipped them, leaving the dry run one tool.
+    assert not is_expensive(ToolInfo(
+        name="x", description="List all seeded recipes. Free — no LLM calls."))
+    assert not is_expensive(ToolInfo(
+        name="x", description="Resolved origin evidence per product. Free, no LLM calls."))
+    assert is_expensive(ToolInfo(
+        name="x", description="Run the pipeline. SLOW (10-60s) and costs real Claude API credits."))
+    assert not is_expensive(ToolInfo(name="x", description="Talks to an LLM"))  # no cost claimed
 
 
 def test_system_prompt_lists_resources_templates_and_prompts() -> None:
