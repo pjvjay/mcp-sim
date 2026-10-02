@@ -3,8 +3,12 @@
 Input: a :class:`~mcpsim.scenario.Scenario` and the server's live
 :class:`~mcpsim.mcpclient.Catalog`. Output: an :class:`~mcpsim.plan.ExecutionPlan` with several
 paths (happy, recovery, alternative, boundary, policy), produced by one structured-output LLM
-call. Every ``tool`` named in a step must exist in the catalog; a plan that fails validation is
-re-asked **once** with the error appended, then :class:`PlanError` is raised.
+call. The structured-output schema is built **per catalog** (``Step.tool`` is an enum of the
+catalog's tool names, so a constrained decoder cannot invent a tool); the same schema and
+:func:`validate_draft` then check argument keys and scalar types against each tool's input
+schema, ``$from_step`` references, recovery paths (at least one ``expect_error`` step) and the
+``<where>: <condition>`` shape of checkpoints. A draft that fails is re-asked **once** with every
+problem listed, then :class:`PlanError` is raised.
 
 ``dry_run=True`` needs no LLM: it emits a one-path happy plan whose steps call every catalog tool
 whose required arguments can all be defaulted from the schema, skipping tools whose description
@@ -21,7 +25,16 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from mcpsim.llm import LLM, LLMResponse
 from mcpsim.mcpclient import Catalog, ToolInfo
-from mcpsim.plan import PATH_KINDS, ExecutionPlan, Path, Step
+from mcpsim.plan import (
+    CHECKPOINT_PATTERN,
+    CHECKPOINT_SHAPE,
+    PATH_KINDS,
+    REFERENCE_KEY,
+    ExecutionPlan,
+    Path,
+    Step,
+    parse_reference,
+)
 from mcpsim.scenario import Scenario
 
 PLAN_TOOL_NAME = "emit_execution_plan"
@@ -48,15 +61,43 @@ class PlanDraft(BaseModel):
     paths: list[Path] = Field(default_factory=list)
 
 
-def plan_tool_definition() -> dict[str, Any]:
-    """The single Anthropic tool used for structured output."""
+def tool_name_enum(catalog: Catalog) -> list[str]:
+    """The sorted tool names a step may name: the ``enum`` in the plan schema and the validator."""
+    return sorted(catalog.tool_names())
+
+
+def plan_input_schema(catalog: Catalog) -> dict[str, Any]:
+    """:class:`PlanDraft`'s JSON Schema with ``Step.tool`` constrained to this catalog.
+
+    ``Step.tool`` becomes ``{"anyOf": [{"type": "string", "enum": [...]}, {"type": "null"}]}``
+    so a structured decoder (Ollama ``format``, Anthropic forced tool use) cannot emit a tool the
+    server does not have; ``Path.kind`` is already an enum. Validation uses the same enum.
+    """
+    schema = PlanDraft.model_json_schema()
+    names = tool_name_enum(catalog)
+    tool_schema: dict[str, Any] = {
+        "anyOf": [{"type": "string", "enum": names}, {"type": "null"}],
+        "default": None,
+        "description": "A tool name from the catalog, or null for a step that calls no tool.",
+    }
+    if not names:  # an empty enum is not a valid schema; only the no-tool step remains
+        tool_schema["anyOf"] = [{"type": "null"}]
+    step_schema = schema.get("$defs", {}).get("Step")
+    if not isinstance(step_schema, dict):  # pragma: no cover - pydantic always nests Step
+        raise PlanError("PlanDraft schema has no $defs.Step to constrain")
+    step_schema["properties"]["tool"] = tool_schema
+    return schema
+
+
+def plan_tool_definition(catalog: Catalog) -> dict[str, Any]:
+    """The single Anthropic tool used for structured output, built for this catalog."""
     return {
         "name": PLAN_TOOL_NAME,
         "description": (
             "Emit the execution plan: an ordered list of distinct paths through the server, "
             "each with concrete steps and observable checkpoints."
         ),
-        "input_schema": PlanDraft.model_json_schema(),
+        "input_schema": plan_input_schema(catalog),
     }
 
 
@@ -64,31 +105,240 @@ def _compact_json(value: Any) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
 
 
+# --- JSON Schema helpers shared by the digest and the validator ------------------------------
+
+JSON_TYPES: tuple[str, ...] = ("string", "integer", "number", "boolean", "array", "object", "null")
+_MAX_ENUM_IN_DIGEST = 6
+_MAX_OUTPUT_KEYS = 24
+_FIRST_SENTENCE = re.compile(r"^(.*?[.!?])(?:\s|$)")
+
+
+def resolve_ref(schema: dict[str, Any], root: dict[str, Any]) -> dict[str, Any]:
+    """Follow a local ``$ref`` (``#/$defs/Name`` or ``#/definitions/Name``) one level."""
+    ref = schema.get("$ref")
+    if not isinstance(ref, str) or not ref.startswith("#/"):
+        return schema
+    target: Any = root
+    for part in ref[2:].split("/"):
+        if not isinstance(target, dict) or part not in target:
+            return schema
+        target = target[part]
+    return target if isinstance(target, dict) else schema
+
+
+def schema_types(schema: dict[str, Any], root: dict[str, Any] | None = None) -> set[str]:
+    """Every JSON type a property schema admits (through ``anyOf``/``oneOf``/``$ref``/``enum``).
+
+    Empty when the schema says nothing about the type, in which case nothing is checked.
+    """
+    root = root if root is not None else schema
+    return _schema_types(schema, root, depth=0)
+
+
+def _schema_types(schema: dict[str, Any], root: dict[str, Any], depth: int) -> set[str]:
+    if depth > 4:
+        return set()
+    schema = resolve_ref(schema, root)
+    found: set[str] = set()
+    declared = schema.get("type")
+    if isinstance(declared, str):
+        found.add(declared)
+    elif isinstance(declared, list):
+        found.update(t for t in declared if isinstance(t, str))
+    for key in ("anyOf", "oneOf", "allOf"):
+        variants = schema.get(key)
+        if isinstance(variants, list):
+            for variant in variants:
+                if isinstance(variant, dict):
+                    found.update(_schema_types(variant, root, depth + 1))
+    enum = schema.get("enum")
+    if isinstance(enum, list):
+        found.update(json_type_of(member) for member in enum)
+    if "const" in schema:
+        found.add(json_type_of(schema["const"]))
+    if not found:
+        if "properties" in schema or "additionalProperties" in schema:
+            found.add("object")
+        elif "items" in schema:
+            found.add("array")
+    return found
+
+
+def json_type_of(value: Any) -> str:
+    """The JSON Schema type name of a Python value (``bool`` before ``int``)."""
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, int):
+        return "integer"
+    if isinstance(value, float):
+        return "number"
+    if isinstance(value, str):
+        return "string"
+    if isinstance(value, list):
+        return "array"
+    if isinstance(value, dict):
+        return "object"
+    return type(value).__name__
+
+
+def type_accepts(declared: set[str], actual: str) -> bool:
+    """Does a literal of JSON type ``actual`` satisfy the declared types? Integers are numbers."""
+    if not declared:
+        return True
+    if actual in declared:
+        return True
+    return actual == "integer" and "number" in declared
+
+
+def enum_members(schema: dict[str, Any], root: dict[str, Any]) -> list[Any] | None:
+    """The ``enum`` a property (or its non-null variant) restricts values to, if any."""
+    schema = resolve_ref(schema, root)
+    enum = schema.get("enum")
+    if isinstance(enum, list):
+        return list(enum)
+    members: list[Any] = []
+    saw_enum = False
+    for key in ("anyOf", "oneOf"):
+        variants = schema.get(key)
+        if not isinstance(variants, list):
+            continue
+        for variant in variants:
+            if not isinstance(variant, dict):
+                return None
+            if variant.get("type") == "null":
+                members.append(None)
+                continue
+            inner = enum_members(variant, root)
+            if inner is None:
+                return None
+            saw_enum = True
+            members.extend(inner)
+    return members if saw_enum else None
+
+
+def _type_label(schema: dict[str, Any], root: dict[str, Any]) -> str:
+    """A short type for the digest: ``string``, ``integer[]``, ``a|b|c``, ``object``."""
+    resolved = resolve_ref(schema, root)
+    enum = enum_members(resolved, root)
+    if enum is not None:
+        shown = [m for m in enum if m is not None]
+        if 0 < len(shown) <= _MAX_ENUM_IN_DIGEST and all(isinstance(m, str) for m in shown):
+            return "|".join(str(m) for m in shown)
+    types = sorted(t for t in schema_types(resolved, root) if t != "null")
+    if types == ["array"]:
+        items = resolved.get("items")
+        if not isinstance(items, dict):
+            for key in ("anyOf", "oneOf"):
+                for variant in resolved.get(key, []) or []:
+                    if isinstance(variant, dict) and isinstance(variant.get("items"), dict):
+                        items = variant["items"]
+                        break
+        if isinstance(items, dict):
+            inner = _type_label(items, root)
+            return f"{inner}[]" if inner != "any" else "array"
+        return "array"
+    return "|".join(types) if types else "any"
+
+
+def render_arguments(tool: ToolInfo) -> str:
+    """``name: type, other?: type`` for the digest; ``?`` marks optional (or nullable)."""
+    schema = tool.input_schema or {}
+    properties = schema.get("properties")
+    if not isinstance(properties, dict):
+        return ""
+    required = schema.get("required")
+    required_names = {str(n) for n in required} if isinstance(required, list) else set()
+    parts: list[str] = []
+    for name, prop in properties.items():
+        prop_schema = prop if isinstance(prop, dict) else {}
+        optional = name not in required_names or "null" in schema_types(prop_schema, schema)
+        parts.append(f"{name}{'?' if optional else ''}: {_type_label(prop_schema, schema)}")
+    return ", ".join(parts)
+
+
+def output_keys(schema: dict[str, Any]) -> str:
+    """What the digest says a tool returns: its top-level output keys.
+
+    A one-level ``$ref`` is resolved. When the schema wraps a single ``result`` key (the MCP SDK
+    does this for non-object return types) the inner object's keys are shown; an array of
+    objects shows ``list of {keys}``. ``object`` when the schema has no named keys.
+    """
+    resolved = resolve_ref(schema, schema)
+    properties = resolved.get("properties")
+    if isinstance(properties, dict) and list(properties) == ["result"]:
+        inner_raw = properties["result"]
+        inner = resolve_ref(inner_raw, schema) if isinstance(inner_raw, dict) else {}
+        inner_props = inner.get("properties")
+        if isinstance(inner_props, dict) and inner_props:
+            return _join_keys(list(inner_props))
+        if "array" in schema_types(inner, schema):
+            items = inner.get("items")
+            item_schema = resolve_ref(items, schema) if isinstance(items, dict) else {}
+            item_props = item_schema.get("properties")
+            if isinstance(item_props, dict) and item_props:
+                return "list of {" + _join_keys(list(item_props)) + "}"
+            return "list"
+        types = sorted(t for t in schema_types(inner, schema) if t != "null")
+        return "result (" + "|".join(types) + ")" if types else "result"
+    if isinstance(properties, dict) and properties:
+        return _join_keys(list(properties))
+    types = sorted(t for t in schema_types(resolved, schema) if t != "null")
+    return "|".join(types) if types else "object"
+
+
+def _join_keys(keys: list[str]) -> str:
+    shown = keys[:_MAX_OUTPUT_KEYS]
+    suffix = f", … ({len(keys) - len(shown)} more)" if len(keys) > len(shown) else ""
+    return ", ".join(shown) + suffix
+
+
+def first_sentence(text: str) -> str:
+    flat = " ".join(text.split())
+    m = _FIRST_SENTENCE.match(flat)
+    return m.group(1) if m else flat
+
+
+def render_tool_line(tool: ToolInfo) -> str:
+    """One digest line: ``- name(arg: type, opt?: type) → returns k1, k2 — first sentence``."""
+    line = f"- {tool.name}({render_arguments(tool)})"
+    if tool.output_schema is not None:
+        line += f" → returns {output_keys(tool.output_schema)}"
+    sentence = first_sentence(tool.description)
+    if sentence:
+        line += f" — {sentence}"
+    return line
+
+
 def render_catalog_for_prompt(catalog: Catalog) -> str:
-    """The catalog as the planner sees it: names, descriptions, schemas, resources, prompts."""
+    """The catalog digest the planner sees (LOCAL_MODELS.md, "Fitting an 8k context").
+
+    One line per tool: name, argument names with types (``?`` marks optional), ``→ returns`` the
+    top-level output keys when the server publishes an output schema, then the first sentence of
+    the description. Resources, templates and prompts follow, one line each.
+    """
     lines: list[str] = []
     lines.append(f"TOOLS ({len(catalog.tools)}) — the ONLY tools that exist:")
     for tool in catalog.tools:
-        lines.append(f"- {tool.name}")
-        if tool.description.strip():
-            lines.append(f"  description: {tool.description.strip()}")
-        lines.append(f"  input_schema: {_compact_json(tool.input_schema)}")
-        if tool.output_schema is not None:
-            lines.append(f"  output_schema: {_compact_json(tool.output_schema)}")
+        lines.append(render_tool_line(tool))
     lines.append(f"RESOURCES ({len(catalog.resources)}):")
     for res in catalog.resources:
-        desc = f" — {res.description.strip()}" if res.description.strip() else ""
-        lines.append(f"- {res.uri} [{res.name}]{desc}")
+        lines.append(f"- {res.uri} [{res.name}]{_dash(res.description)}")
     lines.append(f"RESOURCE TEMPLATES ({len(catalog.resource_templates)}):")
     for tmpl in catalog.resource_templates:
-        desc = f" — {tmpl.description.strip()}" if tmpl.description.strip() else ""
-        lines.append(f"- {tmpl.uri_template} [{tmpl.name}]{desc}")
+        lines.append(f"- {tmpl.uri_template} [{tmpl.name}]{_dash(tmpl.description)}")
     lines.append(f"PROMPTS ({len(catalog.prompts)}):")
     for prompt in catalog.prompts:
         arg_names = ", ".join(str(a.get("name", "?")) for a in prompt.arguments)
-        desc = f" — {prompt.description.strip()}" if prompt.description.strip() else ""
-        lines.append(f"- {prompt.name}({arg_names}){desc}")
+        lines.append(f"- {prompt.name}({arg_names}){_dash(prompt.description)}")
     return "\n".join(lines)
+
+
+def _dash(description: str) -> str:
+    """`` — description`` on one line (server descriptions often carry newlines), or empty."""
+    flat = " ".join(description.split())
+    return f" — {flat}" if flat else ""
 
 
 def render_scenario_for_prompt(scenario: Scenario) -> str:
@@ -111,8 +361,72 @@ def render_scenario_for_prompt(scenario: Scenario) -> str:
     return "\n".join(lines)
 
 
+def example_literal(schema: dict[str, Any], root: dict[str, Any]) -> Any:
+    """A readable, correctly typed example value for the prompt's example step."""
+    enum = enum_members(schema, root)
+    if enum is not None:
+        for member in enum:
+            if member is not None:
+                return member
+    types = sorted(t for t in schema_types(schema, root) if t != "null")
+    if "string" in types:
+        return "example"
+    if "integer" in types:
+        return 1
+    if "number" in types:
+        return 1
+    if "boolean" in types:
+        return False
+    if "array" in types:
+        return []
+    if "object" in types:
+        return {}
+    return "example"
+
+
+def example_step(catalog: Catalog) -> Step:
+    """One concrete example step using a real catalog tool (the one with the most required args).
+
+    Falls back to a no-tool step when the catalog is empty, so the prompt is always well formed.
+    """
+    if not catalog.tools:
+        return Step(
+            intent="Compose the final answer from the results so far",
+            tool=None,
+            success_looks_like="A final_result block whose fields come from tool results",
+        )
+
+    def required_count(tool: ToolInfo) -> int:
+        req = (tool.input_schema or {}).get("required")
+        return len(req) if isinstance(req, list) else 0
+
+    tool = max(catalog.tools, key=required_count)  # the first tool wins ties
+    schema = tool.input_schema or {}
+    properties = schema.get("properties")
+    properties = properties if isinstance(properties, dict) else {}
+    required = schema.get("required")
+    required = [str(n) for n in required] if isinstance(required, list) else []
+    arguments: dict[str, Any] = {}
+    for name in required:
+        prop = properties.get(name)
+        arguments[name] = example_literal(prop if isinstance(prop, dict) else {}, schema)
+    returns = "a result"
+    if tool.output_schema is not None:
+        keys = output_keys(tool.output_schema).split(", ")
+        returns = ", ".join(keys[:4]) + (", …" if len(keys) > 4 else "")
+    return Step(
+        intent=f"Call {tool.name} to make progress on the goal",
+        tool=tool.name,
+        arguments_sketch=arguments,
+        success_looks_like=f"{tool.name} returns {returns} with values the goal can use",
+        expect_error=False,
+    )
+
+
 def build_system_prompt(catalog: Catalog) -> str:
     kinds = ", ".join(PATH_KINDS)
+    example = example_step(catalog).model_dump(mode="json")
+    reference = _compact_json({REFERENCE_KEY: 1, "path": "items[*].id"})
     return "\n".join(
         [
             "You are the planner of an LLM-as-a-judge simulation framework for MCP servers.",
@@ -132,20 +446,40 @@ def build_system_prompt(catalog: Catalog) -> str:
             "Include every kind the catalog can support; omit a kind only when the server has",
             "no tool that could exercise it, and say so in another path's rationale.",
             "",
-            "Rules:",
-            "- A step's `tool` MUST be a tool name from the TOOLS list below, spelled exactly;",
-            "  never invent tools, resources or arguments that are not in the catalog. A step",
-            "  that needs no tool (e.g. composing the final answer) sets `tool` to null.",
-            "- `arguments_sketch` is a JSON object of plausible arguments matching the tool's",
-            "  input_schema (values may be placeholders the agent will refine).",
-            "- `success_looks_like` describes the result a good call returns.",
-            "- `checkpoints` are OBSERVABLE FACTS a judge can verify from the transcript, phrased",
-            "  concretely, e.g. 'origin_status in the final answer equals the value the plan",
-            "  tool returned', never vague ('the agent did well').",
-            "- `id` is a short slug (letters, digits, '.', '_', '-'), unique per path;",
-            "  `rationale` says why this path matters for this scenario.",
-            "- Prefer tools that are cheap; if a tool's description says it is slow or costs",
-            "  credits, use it only when the goal needs it and say so in the rationale.",
+            "Rules (a plan that breaks one is rejected and you are asked to fix it):",
+            "1. `tool` is a tool name from the TOOLS list below, spelled exactly, or null for a",
+            "   step that calls no tool (e.g. composing the final answer). Never invent tools,",
+            "   resources or arguments that are not in the catalog.",
+            "2. Every key in `arguments_sketch` is an argument of that tool as listed in its",
+            "   digest line, and every literal value has the listed JSON type (string, integer,",
+            "   number, boolean, array, object). Never write prose or '<placeholder>' text where",
+            "   an integer, boolean or array is required; a tool listed with `()` takes no",
+            "   arguments at all.",
+            "3. A value that only an earlier step's result can supply (an id, a slug the server",
+            "   returned) is written as a reference, not guessed:",
+            f"   {reference}  — `{REFERENCE_KEY}` is the 1-based index of an EARLIER step in the",
+            "   same path that calls a tool; `path` is a dotted path into that step's result,",
+            "   `[*]` meaning every element. The executor resolves it at run time.",
+            "4. A `recovery` path must contain the failure: at least one step with",
+            "   `expect_error: true` whose `success_looks_like` names the server's rejection",
+            "   (error text, suggestions), followed by the corrected call.",
+            "5. Every checkpoint has the shape `<where>: <observable condition>` with `<where>`",
+            "   one of final_result, tool_result[<tool_name>] or transcript, e.g.",
+            "   'final_result: origin_status equals the value tool_result[plan_recipe] carried'",
+            "   or 'transcript: no call to a tool whose description says it costs credits'.",
+            "   Never vague ('the agent did well').",
+            "6. The `→ returns` part of a digest line lists what a tool already gives back; do",
+            "   not add a call to learn something an earlier step's result already contains.",
+            "   Prefer cheap tools; one whose description says it is slow or costs credits is",
+            "   used only when the goal needs it, and the rationale says so.",
+            "Also: `id` is a short slug (letters, digits, '.', '_', '-'), unique per path;",
+            "`rationale` says why this path matters for this scenario; `success_looks_like`",
+            "describes the result a good call returns.",
+            "",
+            "Example of ONE well-formed step (a real tool from this catalog; the values are",
+            "illustrative, choose ones that fit the scenario):",
+            _compact_json(example),
+            "",
             f"Respond ONLY by calling the `{PLAN_TOOL_NAME}` tool.",
             "",
             "CATALOG:",
@@ -160,26 +494,120 @@ def build_user_prompt(scenario: Scenario) -> str:
     )
 
 
+def validate_arguments(step: Step, position: int, path: Path, tool: ToolInfo) -> list[str]:
+    """Problems with one step's ``arguments_sketch`` against ``tool``'s input schema.
+
+    ``position`` is the step's 1-based index in ``path`` (what ``$from_step`` counts). Checks:
+    every key is a declared property (unless the schema allows additional properties), every
+    literal has the declared JSON type (an integer satisfies ``number``) and sits in the
+    declared ``enum``, and every reference points at an earlier step that calls a tool.
+    """
+    problems: list[str] = []
+    schema = tool.input_schema or {}
+    properties = schema.get("properties")
+    properties = properties if isinstance(properties, dict) else {}
+    additional = schema.get("additionalProperties", False)
+    allows_extra = bool(additional) if not isinstance(additional, dict) else True
+    declared_names = ", ".join(properties) or "(none: the tool takes no arguments)"
+    for key, value in step.arguments_sketch.items():
+        if key not in properties:
+            if not allows_extra:
+                problems.append(
+                    f"argument {key!r} is not accepted by tool {tool.name}; "
+                    f"its arguments are: {declared_names}"
+                )
+            continue
+        try:
+            ref = parse_reference(value)
+        except ValueError as exc:
+            problems.append(f"argument {key!r}: {exc}")
+            continue
+        if ref is not None:
+            if ref.from_step >= position:
+                problems.append(
+                    f"argument {key!r} references step {ref.from_step}, but a reference must "
+                    f"point at an EARLIER step (this is step {position}; "
+                    f"{REFERENCE_KEY} is 1-based)"
+                )
+            elif path.steps[ref.from_step - 1].tool is None:
+                problems.append(
+                    f"argument {key!r} references step {ref.from_step}, which calls no tool "
+                    "and so has no result to take a value from"
+                )
+            continue
+        prop = properties[key]
+        prop_schema = prop if isinstance(prop, dict) else {}
+        declared = schema_types(prop_schema, schema)
+        actual = json_type_of(value)
+        if not type_accepts(declared, actual):
+            problems.append(
+                f"argument {key!r} of tool {tool.name} must be "
+                f"{' or '.join(sorted(declared))}, got {actual} {_compact_json(value)}; "
+                "if the value comes from an earlier step, write a "
+                f'{{"{REFERENCE_KEY}": n, "path": "..."}} reference instead'
+            )
+            continue
+        enum = enum_members(prop_schema, schema)
+        if enum is not None and value not in enum:
+            problems.append(
+                f"argument {key!r} of tool {tool.name} must be one of "
+                f"{_compact_json(enum)}, got {_compact_json(value)}"
+            )
+    return problems
+
+
+def validate_checkpoint(text: str) -> str | None:
+    """Why a checkpoint is rejected, or ``None`` when it has the required shape."""
+    if CHECKPOINT_PATTERN.match(text.strip()):
+        return None
+    return f"checkpoint {text!r} must have the shape {CHECKPOINT_SHAPE}"
+
+
 def validate_draft(draft: PlanDraft, catalog: Catalog) -> list[str]:
-    """Every problem with a draft, as human-readable lines; empty means valid."""
+    """Every problem with a draft, as human-readable lines; empty means valid.
+
+    Tool names are checked against the same enum the plan schema carries
+    (:func:`tool_name_enum`), then each step's arguments (:func:`validate_arguments`), the
+    ``expect_error`` requirement on recovery paths, and the shape of every checkpoint.
+    """
     problems: list[str] = []
     if not draft.paths:
         problems.append("plan has no paths; at least a happy path is required")
         return problems
-    known = catalog.tool_names()
+    known = tool_name_enum(catalog)
     seen_ids: set[str] = set()
     for p_index, path in enumerate(draft.paths):
+        where = f"paths[{p_index}] ({path.id!r})"
         if path.id in seen_ids:
             problems.append(f"paths[{p_index}]: duplicate path id {path.id!r}")
         seen_ids.add(path.id)
         if not path.steps:
-            problems.append(f"paths[{p_index}] ({path.id!r}): has no steps")
+            problems.append(f"{where}: has no steps")
         for s_index, step in enumerate(path.steps):
-            if step.tool is not None and step.tool not in known:
+            step_where = f"paths[{p_index}].steps[{s_index}] ({path.id!r})"
+            if step.tool is None:
+                continue
+            if step.tool not in known:
                 problems.append(
-                    f"paths[{p_index}].steps[{s_index}] ({path.id!r}): unknown tool "
-                    f"{step.tool!r}; the catalog only has: {', '.join(known) or '(no tools)'}"
+                    f"{step_where}: unknown tool {step.tool!r}; the catalog only has: "
+                    f"{', '.join(known) or '(no tools)'}"
                 )
+                continue
+            tool = catalog.tool(step.tool)
+            problems += [
+                f"{step_where}: {text}"
+                for text in validate_arguments(step, s_index + 1, path, tool)
+            ]
+        if path.kind == "recovery" and not path.expects_error():
+            problems.append(
+                f"{where}: a recovery path must contain at least one step with "
+                "expect_error true (the step that sends the bad input the server rejects), "
+                "followed by the corrected call"
+            )
+        for c_index, checkpoint in enumerate(path.checkpoints):
+            reason = validate_checkpoint(checkpoint)
+            if reason is not None:
+                problems.append(f"paths[{p_index}].checkpoints[{c_index}] ({path.id!r}): {reason}")
     if not any(p.kind == "happy" for p in draft.paths):
         problems.append("plan has no path of kind 'happy'")
     return problems
@@ -221,7 +649,9 @@ def _reask_text(problems: list[str]) -> str:
         "The plan you emitted is invalid and was rejected:\n"
         f"{bullet}\n\n"
         "Fix every problem and emit the whole corrected plan again by calling "
-        f"`{PLAN_TOOL_NAME}`. Use only tools that appear in the CATALOG."
+        f"`{PLAN_TOOL_NAME}`. Use only tools and argument names that appear in the CATALOG, "
+        "typed as listed; mark the deliberate failure in a recovery path with expect_error "
+        "true; shape every checkpoint as '<where>: <condition>'."
     )
 
 
@@ -244,7 +674,7 @@ async def plan_with_llm(scenario: Scenario, catalog: Catalog, llm: LLM) -> Execu
     """One structured-output call, plus a single re-ask when validation fails."""
     system = build_system_prompt(catalog)
     messages: list[dict[str, Any]] = [{"role": "user", "content": build_user_prompt(scenario)}]
-    tools = [plan_tool_definition()]
+    tools = [plan_tool_definition(catalog)]
     tool_choice = {"type": "tool", "name": PLAN_TOOL_NAME}
 
     problems: list[str] = []
@@ -404,10 +834,10 @@ def dry_run_plan(scenario: Scenario, catalog: Catalog) -> ExecutionPlan:
     if not steps:
         rationale_parts.append("No tool qualified, so the path has no steps.")
     called = [s.tool for s in steps if s.tool is not None]
-    checkpoints = [f"The transcript contains a tool_call for {name}" for name in called]
+    checkpoints = [f"transcript: contains a tool_call for {name}" for name in called]
     checkpoints.append(
-        "The final_result is the structured content of the last tool result, or null when "
-        "the last tool returned no structured content"
+        "final_result: equals the structured content of the last successful tool result, or "
+        "is null when no step returned structured content"
     )
     path = Path(
         id=DRY_RUN_PATH_ID,
@@ -417,6 +847,10 @@ def dry_run_plan(scenario: Scenario, catalog: Catalog) -> ExecutionPlan:
         steps=steps,
         checkpoints=checkpoints,
     )
+    # The dry-run plan must satisfy the same rules an LLM plan does.
+    problems = validate_draft(PlanDraft(paths=[path]), catalog)
+    if problems:  # pragma: no cover - would be a bug in default_arguments
+        raise PlanError("dry-run plan failed its own validation:\n" + "\n".join(problems))
     return ExecutionPlan(scenario=scenario.name, catalog_digest=catalog.digest(), paths=[path])
 
 

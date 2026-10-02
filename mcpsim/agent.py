@@ -13,7 +13,10 @@ carries the reason.
 
 Dry run (``dry_run=True``): no LLM at all. Each step's tool is called with its sketch arguments
 in order and ``final_result`` is synthesised from the last structured tool result, so the whole
-MCP path is exercised without an API key.
+MCP path is exercised without an API key. ``{"$from_step": n, "path": ...}`` references in a
+sketch are resolved against step ``n``'s structured result (a reference that cannot be resolved
+records an ``error`` event and skips the step), and an error result on a step marked
+``expect_error`` is the planned outcome, not a failure.
 """
 
 from __future__ import annotations
@@ -24,8 +27,9 @@ from dataclasses import dataclass
 from typing import Any
 
 from mcpsim.llm import DEFAULT_MAX_TOKENS, LLM, Usage, total_cost_usd
+from mcpsim.matcher import MISSING, resolve
 from mcpsim.mcpclient import Catalog, Session, ToolResult
-from mcpsim.plan import Mode, Path
+from mcpsim.plan import Mode, Path, Step, StepReference, parse_reference
 from mcpsim.scenario import Scenario
 from mcpsim.transcript import (
     AssistantEvent,
@@ -129,20 +133,44 @@ def _top_level_fields(spec: dict[str, Any] | None) -> list[str]:
     return names
 
 
+def readable_sketch(step: Step) -> str:
+    """The sketch as JSON with every ``$from_step`` reference shown as ``<from step n: path>``."""
+    shown: dict[str, Any] = {}
+    for key, value in step.arguments_sketch.items():
+        try:
+            ref = parse_reference(value)
+        except ValueError:
+            ref = None
+        shown[key] = ref.describe() if ref is not None else value
+    return json.dumps(shown, sort_keys=True, ensure_ascii=False)
+
+
 def steps_section(path: Path) -> str:
-    """The "Suggested approach" section a ``guided`` run adds to the agent's system prompt."""
+    """The "Suggested approach" section a ``guided`` run adds to the agent's system prompt.
+
+    References render as ``<from step n: path>`` (take the value from that step's result) and
+    ``expect_error`` steps say the server is expected to reject the call, so the agent knows
+    the error is the point of the step and must read it rather than treat it as a dead end.
+    """
     lines = [
         "## Suggested approach",
         "The following steps are one way to reach the goal. Treat them as guidance: adapt when",
         "the server responds differently, and skip anything that turns out not to be needed.",
+        "An argument written <from step n: path> means: take that value from the result of",
+        "step n (path is dotted; [*] means every element).",
     ]
     for n, step in enumerate(path.steps, start=1):
         line = f"{n}. {step.intent.strip()}"
         if step.tool:
             line += f" (tool: {step.tool}"
             if step.arguments_sketch:
-                line += f", arguments roughly {json.dumps(step.arguments_sketch, sort_keys=True)}"
+                line += f", arguments roughly {readable_sketch(step)}"
             line += ")"
+        if step.expect_error:
+            line += (
+                " — EXPECT AN ERROR: the server should reject this call; read its message"
+                " and correct the next call from it"
+            )
         if step.success_looks_like.strip():
             line += f" — success looks like: {step.success_looks_like.strip()}"
         lines.append(line)
@@ -353,19 +381,105 @@ def _describe(exc: BaseException) -> str:
     return f"{type(exc).__name__}: {text}" if text else type(exc).__name__
 
 
+class StepReferenceError(LookupError):
+    """A ``$from_step`` reference could not be resolved; the message says why."""
+
+
+def resolve_reference(ref: StepReference, results: dict[int, ToolResult | None]) -> Any:
+    """The value a reference denotes, given the results of the steps run so far.
+
+    ``results`` maps 1-based step index → that step's result (``None`` when the step called no
+    tool or was skipped). ``[*]`` yields the list of every element's value. Raises
+    :class:`StepReferenceError` when the step has no structured result or the path is missing.
+    """
+    where = f"step {ref.from_step}"
+    if ref.from_step not in results:
+        raise StepReferenceError(f"{where} has not run (references must point at an earlier step)")
+    result = results[ref.from_step]
+    if result is None:
+        raise StepReferenceError(f"{where} called no tool, so it has no result to reference")
+    if result.structured is None:
+        kind = "an error" if result.is_error else "text only"
+        raise StepReferenceError(
+            f"{where} ({result.name}) returned {kind}, no structured content to read "
+            f"{ref.path!r} from"
+        )
+    try:
+        found = resolve(result.structured, ref.path)
+    except ValueError as exc:
+        raise StepReferenceError(str(exc)) from None
+    if found.quantifier == "one":
+        if not found.present:
+            raise StepReferenceError(f"path {ref.path!r} is missing from {where}'s result")
+        return found.single
+    if not found.present:
+        raise StepReferenceError(f"path {ref.path!r} in {where}'s result is not an array")
+    missing = sum(1 for v in found.values if v is MISSING)
+    if missing:
+        raise StepReferenceError(
+            f"path {ref.path!r}: {missing} of {len(found.values)} element(s) in {where}'s "
+            "result lack the field"
+        )
+    return list(found.values)
+
+
+def resolve_arguments(step: Step, results: dict[int, ToolResult | None]) -> dict[str, Any]:
+    """The step's sketch with every reference replaced by its value (literals pass through)."""
+    arguments: dict[str, Any] = {}
+    for key, value in step.arguments_sketch.items():
+        ref = parse_reference(value)  # a malformed reference raises ValueError
+        if ref is None:
+            arguments[key] = value
+            continue
+        try:
+            arguments[key] = resolve_reference(ref, results)
+        except StepReferenceError as exc:
+            raise StepReferenceError(f"argument {key!r}: {exc}") from None
+    return arguments
+
+
 async def _dry_run(run: _Run, path: Path, session: Session) -> Transcript:
     run.transcript.add(UserEvent(text=run.scenario.goal.strip()))
     last_structured: dict[str, Any] | list[Any] | None = None
+    results: dict[int, ToolResult | None] = {}
+    skipped = 0
+    expected_errors = 0
+    unexpected_errors = 0
     for n, step in enumerate(path.steps, start=1):
+        results[n] = None
         if step.tool is None:
             continue
         reason = run.tool_budget_reason(step.tool)
         if reason is not None:
             return run.end("budget_exceeded", reason)
         try:
-            result = await run.call(session, step.tool, dict(step.arguments_sketch), f"dry-{n}")
+            arguments = resolve_arguments(step, results)
+        except (StepReferenceError, ValueError) as exc:
+            skipped += 1
+            run.transcript.add(
+                ErrorEvent(
+                    message=f"dry run: step {n} ({step.tool}) skipped, its arguments could not "
+                    f"be resolved: {exc}"
+                )
+            )
+            continue
+        try:
+            result = await run.call(session, step.tool, arguments, f"dry-{n}")
         except Exception as exc:  # noqa: BLE001 - a run never crashes; the reason is recorded
             return run.end("error", f"tool call {step.tool} failed: {_describe(exc)}")
+        results[n] = result
+        if result.is_error:
+            if step.expect_error:
+                expected_errors += 1  # the planned rejection: this step succeeded
+            else:
+                unexpected_errors += 1
+        elif step.expect_error:
+            run.transcript.add(
+                ErrorEvent(
+                    message=f"dry run: step {n} ({step.tool}) was expected to be rejected by "
+                    "the server but succeeded"
+                )
+            )
         if not result.is_error and result.structured is not None:
             last_structured = result.structured
     final: dict[str, Any] | None
@@ -382,7 +496,14 @@ async def _dry_run(run: _Run, path: Path, session: Session) -> Transcript:
             ErrorEvent(message="dry run: no step returned structured content; final_result is null")
         )
     run.transcript.final_result = final
-    return run.end("completed", f"dry run: called {run.tool_calls} planned tool(s)")
+    reason = f"dry run: called {run.tool_calls} planned tool(s)"
+    if expected_errors:
+        reason += f"; {expected_errors} expected error(s) returned as planned"
+    if unexpected_errors:
+        reason += f"; {unexpected_errors} unexpected error result(s)"
+    if skipped:
+        reason += f"; {skipped} step(s) skipped over unresolved references"
+    return run.end("completed", reason)
 
 
 async def run_path(

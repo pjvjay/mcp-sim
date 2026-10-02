@@ -7,16 +7,20 @@ import pytest
 
 from mcpsim.agent import (
     SimulatedUser,
+    StepReferenceError,
     agent_prompt_sections,
     build_agent_system_prompt,
     extract_final_result,
+    readable_sketch,
+    resolve_arguments,
+    resolve_reference,
     run_path,
     steps_section,
     tool_result_block,
 )
 from mcpsim.llm import Usage, estimate_cost_usd
 from mcpsim.mcpclient import ToolResult
-from mcpsim.plan import Mode, Path, Step
+from mcpsim.plan import Mode, Path, Step, StepReference
 from mcpsim.scenario import Scenario, parse_scenario
 from mcpsim.transcript import Transcript
 from tests.conftest import open_session
@@ -259,7 +263,7 @@ async def test_malformed_final_block_gives_none_and_an_error_event(scenario: Sce
     llm = ScriptedLLM(
         [
             opening(),
-            text_response("Here you go.\n```json final_result\n{\"slug\": penne,}\n```"),
+            text_response('Here you go.\n```json final_result\n{"slug": penne,}\n```'),
         ]
     )
     t = await run(scenario, llm)
@@ -434,6 +438,161 @@ async def test_dry_run_respects_the_tool_call_budget(scenario: Scenario) -> None
     assert len(t.tool_calls()) == 1
 
 
+def ref(from_step: int, path: str) -> dict[str, Any]:
+    return {"$from_step": from_step, "path": path}
+
+
+async def test_dry_run_resolves_a_from_step_reference_end_to_end(scenario: Scenario) -> None:
+    path = Path(
+        id="ref",
+        kind="happy",
+        title="look up, then echo the store the lookup returned",
+        steps=[
+            Step(intent="look up penne", tool="lookup", arguments_sketch={"slug": "penne"}),
+            Step(intent="echo its store", tool="echo", arguments_sketch={"text": ref(1, "store")}),
+        ],
+    )
+    t = await run(scenario, None, path=path, dry_run=True)
+
+    assert t.outcome == "completed"
+    assert t.kinds() == [
+        "system",
+        "user",
+        "tool_call",
+        "tool_result",
+        "tool_call",
+        "tool_result",
+        "final_result",
+        "usage",
+        "end",
+    ]
+    lookup_call, echo_call = t.tool_calls()
+    assert lookup_call.arguments == {"slug": "penne"}
+    assert echo_call.arguments == {"text": "Fake Mart"}  # the reference, resolved
+    echoed = t.tool_results()[1]
+    assert echoed.name == "echo" and echoed.is_error is False
+    assert echoed.text == "Fake Mart"  # the server echoed the looked-up value
+    assert t.final_result == PENNE  # echo has no structured content; lookup's stands
+
+
+async def test_dry_run_skips_a_step_whose_reference_cannot_be_resolved(
+    scenario: Scenario,
+) -> None:
+    path = Path(
+        id="ref",
+        kind="happy",
+        title="bad references",
+        steps=[
+            Step(intent="look", tool="lookup", arguments_sketch={"slug": "penne"}),
+            Step(intent="missing key", tool="echo", arguments_sketch={"text": ref(1, "nope")}),
+            Step(intent="text-only step", tool="echo", arguments_sketch={"text": "hi"}),
+            Step(intent="from text-only", tool="echo", arguments_sketch={"text": ref(3, "x")}),
+            Step(intent="forward", tool="echo", arguments_sketch={"text": ref(9, "x")}),
+            Step(intent="think", tool=None),
+            Step(intent="from no-tool", tool="echo", arguments_sketch={"text": ref(6, "x")}),
+            Step(intent="still runs", tool="list_items", arguments_sketch={"cursor": 0}),
+        ],
+    )
+    t = await run(scenario, None, path=path, dry_run=True)
+
+    assert t.outcome == "completed"
+    assert [c.name for c in t.tool_calls()] == ["lookup", "echo", "list_items"]
+    errors = [e.message for e in t.events if e.kind == "error"]
+    assert len(errors) == 4
+    assert errors[0].startswith("dry run: step 2 (echo) skipped")
+    assert "argument 'text': path 'nope' is missing from step 1's result" in errors[0]
+    assert "step 3 (echo) returned text only, no structured content" in errors[1]
+    assert "step 9 has not run" in errors[2]
+    assert "step 6 called no tool" in errors[3]
+    assert "4 step(s) skipped over unresolved references" in t.reason
+    assert isinstance(t.final_result, dict) and t.final_result["total"] == 5
+
+
+async def test_dry_run_treats_an_expected_error_as_the_planned_outcome(
+    scenario: Scenario,
+) -> None:
+    path = Path(
+        id="recovery",
+        kind="recovery",
+        title="provoke the rejection, then correct",
+        steps=[
+            Step(
+                intent="misspelt slug",
+                tool="lookup",
+                arguments_sketch={"slug": "pene"},
+                expect_error=True,
+                success_looks_like="unknown slug with suggestions",
+            ),
+            Step(intent="corrected", tool="lookup", arguments_sketch={"slug": "penne"}),
+            Step(
+                intent="should fail but will not",
+                tool="echo",
+                arguments_sketch={"text": "ok"},
+                expect_error=True,
+            ),
+            Step(intent="unplanned failure", tool="fail", arguments_sketch={"reason": "x"}),
+        ],
+    )
+    t = await run(scenario, None, path=path, dry_run=True)
+
+    assert t.outcome == "completed"
+    assert [r.is_error for r in t.tool_results()] == [True, False, False, True]
+    assert "1 expected error(s) returned as planned" in t.reason
+    assert "1 unexpected error result(s)" in t.reason
+    errors = [e.message for e in t.events if e.kind == "error"]
+    assert errors == [
+        "dry run: step 3 (echo) was expected to be rejected by the server but succeeded"
+    ]
+    assert t.final_result == PENNE  # the corrected call's result
+
+
+def test_resolve_reference_handles_scalars_wildcards_and_failures() -> None:
+    lookup = ToolResult(name="lookup", is_error=False, structured=PENNE)
+    page = ToolResult(
+        name="list_items",
+        is_error=False,
+        structured={"items": [{"slug": "a", "n": 1}, {"slug": "b"}], "next_cursor": None},
+    )
+    results: dict[str, Any] = {1: lookup, 2: page, 3: None}
+    assert resolve_reference(StepReference.model_validate(ref(1, "store")), results) == "Fake Mart"
+    assert resolve_reference(StepReference.model_validate(ref(2, "items[*].slug")), results) == [
+        "a",
+        "b",
+    ]
+    assert resolve_reference(StepReference.model_validate(ref(2, "items[1].slug")), results) == "b"
+    assert resolve_reference(StepReference.model_validate(ref(2, "next_cursor")), results) is None
+
+    with pytest.raises(StepReferenceError, match="1 of 2 element"):
+        resolve_reference(StepReference.model_validate(ref(2, "items[*].n")), results)
+    with pytest.raises(StepReferenceError, match="is not an array"):
+        resolve_reference(StepReference.model_validate(ref(1, "store[*]")), results)
+    with pytest.raises(StepReferenceError, match="called no tool"):
+        resolve_reference(StepReference.model_validate(ref(3, "x")), results)
+    with pytest.raises(StepReferenceError, match="has not run"):
+        resolve_reference(StepReference.model_validate(ref(4, "x")), results)
+    with pytest.raises(StepReferenceError, match="at most one"):
+        resolve_reference(StepReference.model_validate(ref(2, "items[*].x[*]")), results)
+
+    step = Step(
+        intent="x",
+        tool="echo",
+        arguments_sketch={"text": ref(1, "slug"), "literal": {"not": "a reference"}, "n": 2},
+    )
+    assert resolve_arguments(step, results) == {
+        "text": "penne",
+        "literal": {"not": "a reference"},
+        "n": 2,
+    }
+    with pytest.raises(StepReferenceError, match="argument 'text'"):
+        resolve_arguments(
+            Step(intent="x", tool="echo", arguments_sketch={"text": ref(9, "a")}), results
+        )
+    with pytest.raises(ValueError, match="malformed step reference"):
+        resolve_arguments(
+            Step(intent="x", tool="echo", arguments_sketch={"t": {"$from_step": 1}}), results
+        )
+
+
 # ------------------------------------------------------------------------------------------
 # prompts
 
@@ -466,6 +625,44 @@ def test_steps_section_lists_tools_and_sketches() -> None:
     assert '1. Look up penne (tool: lookup, arguments roughly {"slug": "penne"})' in section
     assert "success looks like: a price, a store and origin_status" in section
     assert "2. List the first page of products (tool: list_items" in section
+    assert "EXPECT AN ERROR" not in section
+
+
+def test_steps_section_renders_expect_error_and_references_readably() -> None:
+    path = Path(
+        id="recovery",
+        kind="recovery",
+        title="t",
+        steps=[
+            Step(
+                intent="Send a misspelt slug",
+                tool="lookup",
+                arguments_sketch={"slug": "pene"},
+                expect_error=True,
+                success_looks_like="an error naming the valid slugs",
+            ),
+            Step(
+                intent="Echo the store of the corrected lookup",
+                tool="echo",
+                arguments_sketch={"text": {"$from_step": 1, "path": "items[*].store"}},
+            ),
+        ],
+    )
+    section = steps_section(path)
+    assert "An argument written <from step n: path> means" in section
+    assert (
+        '1. Send a misspelt slug (tool: lookup, arguments roughly {"slug": "pene"}) — EXPECT AN '
+        "ERROR: the server should reject this call; read its message and correct the next call "
+        "from it — success looks like: an error naming the valid slugs"
+    ) in section
+    assert (
+        "2. Echo the store of the corrected lookup (tool: echo, arguments roughly "
+        '{"text": "<from step 1: items[*].store>"})'
+    ) in section
+    assert readable_sketch(path.steps[1]) == '{"text": "<from step 1: items[*].store>"}'
+    # A half-written reference is shown as the literal it is, never crashes the prompt.
+    broken = Step(intent="x", tool="echo", arguments_sketch={"text": {"$from_step": "one"}})
+    assert readable_sketch(broken) == '{"text": {"$from_step": "one"}}'
 
 
 # ------------------------------------------------------------------------------------------
@@ -480,7 +677,7 @@ def test_extract_named_fence() -> None:
 def test_extract_prefers_the_last_named_fence_over_other_json_fences() -> None:
     text = (
         'Example:\n```json\n{"a": 0}\n```\nAnswer:\n```json final_result\n{"a": 1}\n```\n'
-        "```json\n{\"a\": 2}\n```"
+        '```json\n{"a": 2}\n```'
     )
     assert extract_final_result(text).parsed == {"a": 1}
 

@@ -3,10 +3,11 @@ from __future__ import annotations
 from typing import Any
 
 import pytest
+from pydantic import BaseModel
 
 from mcpsim.llm import LLMResponse
 from mcpsim.mcpclient import Catalog, ToolInfo
-from mcpsim.plan import ExecutionPlan
+from mcpsim.plan import CHECKPOINT_PATTERN, ExecutionPlan
 from mcpsim.planner import (
     DRY_RUN_PATH_ID,
     PLAN_TOOL_NAME,
@@ -16,10 +17,17 @@ from mcpsim.planner import (
     default_arguments,
     default_for,
     dry_run_plan,
+    example_step,
     extract_draft,
     is_expensive,
+    output_keys,
     plan,
+    plan_input_schema,
     plan_tool_definition,
+    render_arguments,
+    render_catalog_for_prompt,
+    render_tool_line,
+    tool_name_enum,
     validate_draft,
 )
 from mcpsim.scenario import Scenario, parse_scenario
@@ -38,30 +46,42 @@ async def fake_catalog() -> Catalog:
         return await session.catalog()
 
 
-def step(tool: str | None, **arguments: Any) -> dict[str, Any]:
-    return {
+def step(tool: str | None, *, expect_error: bool = False, **arguments: Any) -> dict[str, Any]:
+    out: dict[str, Any] = {
         "intent": f"call {tool}" if tool else "answer",
         "tool": tool,
         "arguments_sketch": arguments,
-        "success_looks_like": "a result",
+        "success_looks_like": "the server rejects it" if expect_error else "a result",
     }
+    if expect_error:
+        out["expect_error"] = True
+    return out
 
 
-def path(path_id: str, kind: str, *steps: dict[str, Any]) -> dict[str, Any]:
+def path(
+    path_id: str, kind: str, *steps: dict[str, Any], checkpoints: list[str] | None = None
+) -> dict[str, Any]:
     return {
         "id": path_id,
         "kind": kind,
         "title": path_id,
         "rationale": "because",
         "steps": list(steps),
-        "checkpoints": [f"{path_id}: final_result.slug equals the slug lookup returned"],
+        "checkpoints": checkpoints
+        if checkpoints is not None
+        else [f"final_result: slug equals the slug lookup returned ({path_id})"],
     }
 
 
 GOOD_PLAN: dict[str, Any] = {
     "paths": [
         path("happy", "happy", step("lookup", slug="penne"), step(None)),
-        path("recovery", "recovery", step("lookup", slug="pene"), step("lookup", slug="penne")),
+        path(
+            "recovery",
+            "recovery",
+            step("lookup", slug="pene", expect_error=True),
+            step("lookup", slug="penne"),
+        ),
         path("boundary", "boundary", step("list_items", cursor=0, limit=2)),
     ]
 }
@@ -93,7 +113,8 @@ async def test_good_plan_first_try_uses_one_forced_tool_call(scenario: Scenario)
     assert call["model"] == scenario.models.planner
     assert call["tool_choice"] == {"type": "tool", "name": PLAN_TOOL_NAME}
     assert [t["name"] for t in call["tools"]] == [PLAN_TOOL_NAME]
-    assert call["tools"][0]["input_schema"] == PlanDraft.model_json_schema()
+    assert call["tools"][0]["input_schema"] == plan_tool_definition(catalog)["input_schema"]
+    assert call["tools"][0]["input_schema"] != PlanDraft.model_json_schema()  # constrained
     assert call["messages"][0]["role"] == "user"
     user_text = call["messages"][0]["content"]
     assert scenario.goal in user_text and scenario.role in user_text
@@ -103,7 +124,7 @@ async def test_good_plan_first_try_uses_one_forced_tool_call(scenario: Scenario)
     for name in TOOL_NAMES:
         assert f"- {name}" in call["system"]
     assert "Look up a product by slug" in call["system"]
-    assert '"required":["slug"]' in call["system"]
+    assert "- lookup(slug: string)" in call["system"]
     for kind in ("happy", "recovery", "alternative", "boundary", "policy"):
         assert kind in call["system"]
 
@@ -257,10 +278,393 @@ def test_extract_draft_rejects_non_object_input() -> None:
 
 
 def test_plan_tool_definition_shape() -> None:
-    tool = plan_tool_definition()
+    catalog = Catalog(tools=[ToolInfo(name="b"), ToolInfo(name="a")])
+    tool = plan_tool_definition(catalog)
     assert set(tool) == {"name", "description", "input_schema"}
     assert tool["name"] == PLAN_TOOL_NAME
     assert "paths" in tool["input_schema"]["properties"]
+    step_tool = tool["input_schema"]["$defs"]["Step"]["properties"]["tool"]
+    assert step_tool["anyOf"] == [{"type": "string", "enum": ["a", "b"]}, {"type": "null"}]
+    assert tool_name_enum(catalog) == ["a", "b"]
+    # Path.kind is an enum too, and expect_error is a boolean that defaults to false.
+    kind = tool["input_schema"]["$defs"]["Path"]["properties"]["kind"]
+    assert set(kind["enum"]) == {"happy", "recovery", "alternative", "boundary", "policy"}
+    expect = tool["input_schema"]["$defs"]["Step"]["properties"]["expect_error"]
+    assert expect == {"default": False, "title": "Expect Error", "type": "boolean"}
+    # An empty catalog leaves only the no-tool step (an empty enum is not a valid schema).
+    empty = plan_input_schema(Catalog())["$defs"]["Step"]["properties"]["tool"]
+    assert empty["anyOf"] == [{"type": "null"}]
+
+
+# --- constrain, don't just validate (LOCAL_MODELS.md) ----------------------------------------
+
+
+async def test_emitted_tool_schema_carries_the_enum_of_the_fake_server_tools(
+    scenario: Scenario,
+) -> None:
+    catalog = await fake_catalog()
+    llm = ScriptedLLM([structured_response(PLAN_TOOL_NAME, GOOD_PLAN)])
+    await plan(scenario, catalog, llm)
+    schema = llm.calls[0]["tools"][0]["input_schema"]
+    step_tool = schema["$defs"]["Step"]["properties"]["tool"]
+    assert step_tool["anyOf"] == [
+        {"type": "string", "enum": sorted(TOOL_NAMES)},
+        {"type": "null"},
+    ]
+    # Validation uses the same enum the schema carries.
+    assert tool_name_enum(catalog) == sorted(TOOL_NAMES)
+
+
+async def test_unknown_argument_key_is_reasked_once_with_the_key_named(
+    scenario: Scenario,
+) -> None:
+    catalog = await fake_catalog()
+    bad = {"paths": [path("happy", "happy", step("list_items", slug="penne"))]}
+    llm = ScriptedLLM(
+        [
+            structured_response(PLAN_TOOL_NAME, bad),
+            structured_response(PLAN_TOOL_NAME, GOOD_PLAN),
+        ]
+    )
+
+    result = await plan(scenario, catalog, llm)
+
+    assert len(llm.calls) == 2 and len(result.paths) == 3
+    error_text = llm.calls[1]["messages"][2]["content"][0]["content"]
+    assert "argument 'slug' is not accepted by tool list_items" in error_text
+    assert "its arguments are: cursor, limit" in error_text
+    assert "paths[0].steps[0]" in error_text
+
+
+async def test_wrong_scalar_type_is_reasked(scenario: Scenario) -> None:
+    catalog = await fake_catalog()
+    bad = {"paths": [path("happy", "happy", step("list_items", cursor="first page"))]}
+    llm = ScriptedLLM(
+        [
+            structured_response(PLAN_TOOL_NAME, bad),
+            structured_response(PLAN_TOOL_NAME, GOOD_PLAN),
+        ]
+    )
+
+    await plan(scenario, catalog, llm)
+
+    assert len(llm.calls) == 2
+    error_text = llm.calls[1]["messages"][2]["content"][0]["content"]
+    assert "argument 'cursor' of tool list_items must be integer, got string" in error_text
+    assert '"first page"' in error_text
+    assert "$from_step" in error_text  # the fix for a value only the server knows
+
+
+async def test_recovery_path_without_expect_error_is_rejected(scenario: Scenario) -> None:
+    catalog = await fake_catalog()
+    no_failure = {
+        "paths": [
+            path("happy", "happy", step("lookup", slug="penne")),
+            path("recovery", "recovery", step("lookup", slug="pene"), step("lookup", slug="penne")),
+        ]
+    }
+    llm = ScriptedLLM(
+        [
+            structured_response(PLAN_TOOL_NAME, no_failure),
+            structured_response(PLAN_TOOL_NAME, no_failure),
+        ]
+    )
+    with pytest.raises(PlanError) as excinfo:
+        await plan(scenario, catalog, llm)
+    message = str(excinfo.value)
+    assert "paths[1] ('recovery')" in message
+    assert "recovery path must contain at least one step with expect_error true" in message
+    assert len(llm.calls) == 2
+
+
+async def test_checkpoint_without_the_prefix_is_rejected(scenario: Scenario) -> None:
+    catalog = await fake_catalog()
+    vague = {
+        "paths": [
+            path(
+                "happy",
+                "happy",
+                step("lookup", slug="penne"),
+                checkpoints=["Priced shopping list for penne", "transcript: lookup was called"],
+            )
+        ]
+    }
+    llm = ScriptedLLM(
+        [
+            structured_response(PLAN_TOOL_NAME, vague),
+            structured_response(PLAN_TOOL_NAME, GOOD_PLAN),
+        ]
+    )
+    await plan(scenario, catalog, llm)
+    error_text = llm.calls[1]["messages"][2]["content"][0]["content"]
+    assert "paths[0].checkpoints[0] ('happy')" in error_text
+    assert "'Priced shopping list for penne'" in error_text
+    assert "final_result, tool_result[<tool_name>] or transcript" in error_text
+    assert "checkpoints[1]" not in error_text  # the shaped one passed
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "final_result: slug equals penne",
+        "tool_result[lookup]: origin_status is verified",
+        "transcript:no call to expensive_report",
+        "  transcript: leading space is fine",
+    ],
+)
+def test_checkpoint_shapes_accepted(text: str) -> None:
+    catalog = Catalog(tools=[ToolInfo(name="lookup")])
+    draft = PlanDraft.model_validate(
+        {"paths": [path("happy", "happy", step("lookup"), checkpoints=[text])]}
+    )
+    assert validate_draft(draft, catalog) == []
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "the agent did well",
+        "final_result:",
+        "final_result:   ",
+        "tool_result[Lookup]: uppercase tool names are not allowed by the shape",
+        "tool_result: needs the tool name in brackets",
+        "Final_result: wrong case",
+    ],
+)
+def test_checkpoint_shapes_rejected(text: str) -> None:
+    assert CHECKPOINT_PATTERN.match(text.strip()) is None
+    catalog = Catalog(tools=[ToolInfo(name="lookup")])
+    draft = PlanDraft.model_validate(
+        {"paths": [path("happy", "happy", step("lookup"), checkpoints=[text])]}
+    )
+    problems = validate_draft(draft, catalog)
+    assert len(problems) == 1 and "checkpoint" in problems[0] and "shape" in problems[0]
+
+
+def _typed_catalog() -> Catalog:
+    return Catalog(
+        tools=[
+            ToolInfo(
+                name="search",
+                input_schema={
+                    "type": "object",
+                    "properties": {
+                        "q": {"type": "string"},
+                        "limit": {"type": "integer"},
+                        "lat": {"anyOf": [{"type": "number"}, {"type": "null"}]},
+                        "tags": {"type": "array", "items": {"type": "string"}},
+                        "verbose": {"type": "boolean"},
+                        "decision": {"enum": ["approve", "reject"]},
+                        "opts": {"$ref": "#/$defs/Opts"},
+                    },
+                    "required": ["q"],
+                    "$defs": {"Opts": {"type": "object", "properties": {"a": {"type": "integer"}}}},
+                },
+            ),
+            ToolInfo(
+                name="loose",
+                input_schema={"type": "object", "properties": {}, "additionalProperties": True},
+            ),
+        ]
+    )
+
+
+def _problems(*steps: dict[str, Any]) -> list[str]:
+    draft = PlanDraft.model_validate({"paths": [path("happy", "happy", *steps)]})
+    return validate_draft(draft, _typed_catalog())
+
+
+def test_argument_types_are_checked_per_json_type() -> None:
+    assert _problems(step("search", q="x", limit=3, lat=1.5, tags=["a"], verbose=True)) == []
+    assert _problems(step("search", q="x", lat=2)) == []  # integer satisfies number
+    assert _problems(step("search", q="x", lat=None)) == []  # nullable
+    assert _problems(step("search", q="x", opts={"a": 1})) == []  # $ref resolves to object
+    assert _problems(step("search", q="x", decision="approve")) == []
+
+    assert "must be string, got integer 5" in _problems(step("search", q=5))[0]
+    assert "must be integer, got boolean true" in _problems(step("search", q="x", limit=True))[0]
+    assert "must be integer, got number 1.5" in _problems(step("search", q="x", limit=1.5))[0]
+    assert "must be array, got string" in _problems(step("search", q="x", tags="a"))[0]
+    assert "must be boolean, got string" in _problems(step("search", q="x", verbose="yes"))[0]
+    assert "must be object, got string" in _problems(step("search", q="x", opts="none"))[0]
+    enum_problem = _problems(step("search", q="x", decision="maybe"))[0]
+    assert 'must be one of ["approve","reject"], got "maybe"' in enum_problem
+
+
+def test_unknown_keys_are_allowed_when_additional_properties_is_true() -> None:
+    assert _problems(step("loose", anything="goes", n=1)) == []
+    assert (
+        "argument 'nope' is not accepted by tool search"
+        in _problems(step("search", q="x", nope=1))[0]
+    )
+
+
+def test_references_must_point_at_an_earlier_step_with_a_tool() -> None:
+    ref = {"$from_step": 1, "path": "items[*].id"}
+    assert _problems(step("search", q="first"), step("search", q=ref)) == []
+    # Any declared type accepts a reference: it is resolved at run time.
+    assert _problems(step("search", q="first"), step("search", q="x", limit=ref)) == []
+
+    forward = _problems(step("search", q={"$from_step": 2, "path": "x"}), step("search", q="y"))
+    assert "references step 2, but a reference must point at an EARLIER step" in forward[0]
+    assert "this is step 1" in forward[0]
+    self_ref = _problems(step("search", q={"$from_step": 1, "path": "x"}))
+    assert "must point at an EARLIER step" in self_ref[0]
+    no_tool = _problems(step(None), step("search", q={"$from_step": 1, "path": "x"}))
+    assert "references step 1, which calls no tool" in no_tool[0]
+    malformed = _problems(step("search", q="a"), step("search", q={"$from_step": "one"}))
+    assert "malformed step reference" in malformed[0] and "path" in malformed[0]
+
+
+def test_validate_draft_passes_the_good_plan_and_dry_run_plan(scenario: Scenario) -> None:
+    catalog = Catalog(
+        tools=[
+            ToolInfo(
+                name="lookup",
+                input_schema={
+                    "type": "object",
+                    "properties": {"slug": {"type": "string"}},
+                    "required": ["slug"],
+                },
+            ),
+            ToolInfo(
+                name="list_items",
+                input_schema={
+                    "type": "object",
+                    "properties": {"cursor": {"type": "integer"}, "limit": {"type": "integer"}},
+                },
+            ),
+        ]
+    )
+    assert validate_draft(PlanDraft.model_validate(GOOD_PLAN), catalog) == []
+    dry = dry_run_plan(scenario, catalog)
+    assert validate_draft(PlanDraft(paths=dry.paths), catalog) == []
+    for checkpoint in dry.paths[0].checkpoints:
+        assert CHECKPOINT_PATTERN.match(checkpoint)
+    assert all(step.expect_error is False for step in dry.paths[0].steps)
+
+
+# --- the catalog digest ---------------------------------------------------------------------
+
+
+class Hit(BaseModel):
+    """A typed return for the digest test (module level so the SDK can resolve the annotation)."""
+
+    slug: str
+    price: float
+    store: str
+
+
+async def test_digest_shows_returns_keys_for_structured_tools() -> None:
+    server = build_server()
+
+    @server.tool()
+    def typed_lookup(slug: str) -> Hit:
+        """Look up a product as a typed record. Second sentence is dropped."""
+        return Hit(slug=slug, price=1.0, store="x")
+
+    @server.tool()
+    def typed_list(limit: int = 2, tag: str | None = None) -> list[Hit]:
+        """List typed records."""
+        return []
+
+    async with open_session(server) as session:
+        catalog = await session.catalog()
+    digest = render_catalog_for_prompt(catalog)
+    lines = {line.split("(")[0][2:]: line for line in digest.splitlines() if line.startswith("- ")}
+
+    # The fake server's own structured tools publish an object schema without named keys.
+    assert lines["lookup"] == "- lookup(slug: string) → returns object — Look up a product by slug."
+    assert lines["list_items"].startswith(
+        "- list_items(cursor?: integer, limit?: integer) → returns object — List products"
+    )
+    # Text-only tools have no output schema and no arrow.
+    assert "→" not in lines["echo"]
+    # A typed return shows its top-level keys; a list return is unwrapped from "result".
+    assert lines["typed_lookup"] == (
+        "- typed_lookup(slug: string) → returns slug, price, store"
+        " — Look up a product as a typed record."
+    )
+    assert lines["typed_list"] == (
+        "- typed_list(limit?: integer, tag?: string) → returns list of {slug, price, store}"
+        " — List typed records."
+    )
+    assert render_tool_line(catalog.tool("typed_lookup")) == lines["typed_lookup"]
+
+
+def test_output_keys_resolves_refs_and_result_wrapping() -> None:
+    defs = {"Item": {"type": "object", "properties": {"id": {"type": "integer"}, "n": {}}}}
+    assert output_keys({"type": "object", "properties": {"a": {}, "b": {}}}) == "a, b"
+    assert output_keys({"$ref": "#/$defs/Item", "$defs": defs}) == "id, n"
+    assert (
+        output_keys(
+            {"type": "object", "properties": {"result": {"$ref": "#/$defs/Item"}}, "$defs": defs}
+        )
+        == "id, n"
+    )
+    wrapped_list = {
+        "type": "object",
+        "properties": {"result": {"type": "array", "items": {"$ref": "#/$defs/Item"}}},
+        "$defs": defs,
+    }
+    assert output_keys(wrapped_list) == "list of {id, n}"
+    assert (
+        output_keys({"properties": {"result": {"type": "array", "items": {"type": "string"}}}})
+        == "list"
+    )
+    assert output_keys({"properties": {"result": {"type": "integer"}}}) == "result (integer)"
+    assert output_keys({"type": "object", "additionalProperties": True}) == "object"
+    assert output_keys({"type": "string"}) == "string"
+    many = {"type": "object", "properties": {f"k{i}": {} for i in range(30)}}
+    assert output_keys(many).endswith("k23, … (6 more)")
+
+
+def test_render_arguments_marks_optional_and_types() -> None:
+    tool = Catalog(tools=_typed_catalog().tools).tool("search")
+    assert render_arguments(tool) == (
+        "q: string, limit?: integer, lat?: number, tags?: string[], verbose?: boolean, "
+        "decision?: approve|reject, opts?: object"
+    )
+    assert render_arguments(ToolInfo(name="bare")) == ""
+    nullable_required = ToolInfo(
+        name="t",
+        input_schema={
+            "properties": {"x": {"anyOf": [{"type": "string"}, {"type": "null"}]}},
+            "required": ["x"],
+        },
+    )
+    assert render_arguments(nullable_required) == "x?: string"
+
+
+async def test_system_prompt_states_the_six_rules_and_a_real_example_step() -> None:
+    catalog = await fake_catalog()
+    text = build_system_prompt(catalog)
+    for n in range(1, 7):
+        assert f"\n{n}. " in text
+    for phrase in (
+        "expect_error: true",
+        "$from_step",
+        "final_result, tool_result[<tool_name>] or transcript",
+        "→ returns",
+    ):
+        assert phrase in text
+    example = example_step(catalog)
+    assert example.tool in TOOL_NAMES
+    assert example.tool == "lookup"  # every fake tool has at most one required argument
+    assert example.arguments_sketch == {"slug": "example"}
+    rendered = text.split("Example of ONE well-formed step")[1].split("\n")[2]
+    assert rendered == (
+        '{"arguments_sketch":{"slug":"example"},"expect_error":false,'
+        '"intent":"Call lookup to make progress on the goal",'
+        '"success_looks_like":"lookup returns object with values the goal can use",'
+        '"tool":"lookup"}'
+    )
+    # The example step itself passes validation against the catalog it was built from.
+    draft = PlanDraft.model_validate(
+        {"paths": [path("happy", "happy", example.model_dump(mode="json"))]}
+    )
+    assert validate_draft(draft, catalog) == []
+    assert example_step(Catalog()).tool is None
 
 
 # --- dry run ----------------------------------------------------------------------------------

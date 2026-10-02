@@ -8,10 +8,11 @@ reviewed, edited and re-run.
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path as FsPath
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 PathKind = Literal["happy", "recovery", "alternative", "boundary", "policy"]
 PATH_KINDS: tuple[PathKind, ...] = ("happy", "recovery", "alternative", "boundary", "policy")
@@ -19,9 +20,64 @@ PATH_KINDS: tuple[PathKind, ...] = ("happy", "recovery", "alternative", "boundar
 Mode = Literal["guided", "free"]
 MODES: tuple[Mode, ...] = ("guided", "free")
 
+# An ``arguments_sketch`` value of this shape is a reference to an earlier step's result rather
+# than a literal: ``{"$from_step": 1, "path": "summary.lines[*].product_id"}``.
+REFERENCE_KEY = "$from_step"
+
+# A checkpoint is ``<where>: <observable condition>`` with ``<where>`` one of ``final_result``,
+# ``tool_result[<tool>]`` or ``transcript`` (LOCAL_MODELS.md, "Checkpoints need a shape").
+CHECKPOINT_PATTERN = re.compile(r"^(final_result|tool_result\[[a-z_]+\]|transcript):\s*\S")
+CHECKPOINT_SHAPE = (
+    "'<where>: <observable condition>' where <where> is final_result, "
+    "tool_result[<tool_name>] or transcript"
+)
+
+
+class StepReference(BaseModel):
+    """``{"$from_step": n, "path": "..."}``: take a value from step ``n``'s structured result.
+
+    ``from_step`` is the 1-based index of an earlier step in the same path; ``path`` is a dotted
+    path into that step's structured result, with one ``[*]`` allowed (every element) exactly as
+    in :mod:`mcpsim.matcher`. The executor resolves it at run time; the planner never has to
+    invent identifiers it cannot know.
+    """
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    from_step: int = Field(alias="$from_step", ge=1)  # == REFERENCE_KEY (mypy wants a literal)
+    path: str = Field(min_length=1)
+
+    def describe(self) -> str:
+        return f"<from step {self.from_step}: {self.path}>"
+
+
+def parse_reference(value: Any) -> StepReference | None:
+    """The :class:`StepReference` a sketch value encodes, or ``None`` for a literal.
+
+    Raises :class:`ValueError` when the value carries ``$from_step`` but is not a well-formed
+    reference, so a half-written reference is never mistaken for a literal object.
+    """
+    if not isinstance(value, dict) or REFERENCE_KEY not in value:
+        return None
+    try:
+        return StepReference.model_validate(value)
+    except ValidationError as exc:
+        details = "; ".join(
+            f"{'.'.join(str(p) for p in err['loc']) or 'reference'}: {err['msg']}"
+            for err in exc.errors()
+        )
+        raise ValueError(
+            f"malformed step reference {json.dumps(value, sort_keys=True)}: {details}; "
+            f'the shape is {{"{REFERENCE_KEY}": <1-based step index>, "path": "<dotted path>"}}'
+        ) from None
+
 
 class Step(BaseModel):
-    """One intended move: what the agent is trying to do, with which tool, roughly how."""
+    """One intended move: what the agent is trying to do, with which tool, roughly how.
+
+    ``expect_error`` marks a step that deliberately sends input the server rejects (the failure
+    a recovery path must contain); an error result on such a step is the intended outcome.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
@@ -29,6 +85,19 @@ class Step(BaseModel):
     tool: str | None = None
     arguments_sketch: dict[str, Any] = Field(default_factory=dict)
     success_looks_like: str = ""
+    expect_error: bool = False
+
+    def references(self) -> dict[str, StepReference]:
+        """Argument name → reference, for every sketch value that is a well-formed reference."""
+        found: dict[str, StepReference] = {}
+        for key, value in self.arguments_sketch.items():
+            try:
+                ref = parse_reference(value)
+            except ValueError:
+                continue
+            if ref is not None:
+                found[key] = ref
+        return found
 
 
 class Path(BaseModel):
@@ -50,6 +119,10 @@ class Path(BaseModel):
             if step.tool is not None and step.tool not in seen:
                 seen.append(step.tool)
         return seen
+
+    def expects_error(self) -> bool:
+        """Does any step deliberately provoke a server error?"""
+        return any(step.expect_error for step in self.steps)
 
 
 class ExecutionPlan(BaseModel):
