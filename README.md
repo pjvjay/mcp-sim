@@ -213,16 +213,37 @@ whole MCP path:
 
 * the **planner** emits a one-path happy plan from the catalog without an LLM: one step per
   tool whose required arguments can all be defaulted from its schema (strings `""`, integers
-  `1`, booleans `false`, arrays `[]`), skipping tools whose descriptions say they are slow or
-  cost credits and saying so in the path rationale;
-* the **agent** makes no LLM call: it calls each step's tool with its sketch arguments in order
-  and synthesises `final_result` from the last structured tool result;
+  `1`, booleans `false`, arrays `[]`), skipping tools whose descriptions *claim* a cost
+  ("costs real Claude API credits", "SLOW") — a description that says "free" or "no LLM" is
+  believed over an incidental cost word — and saying so in the path rationale;
+* the **agent** makes no LLM call: it calls each step's tool with its sketch arguments in order,
+  records error results (a `""` slug is rejected by the server, as it should be) and
+  synthesises `final_result` from the last structured tool result; the scenario's
+  `max_tool_calls` budget applies, so a catalog with more free tools than the budget ends the
+  run with outcome `budget_exceeded`, which is itself a checked behaviour;
 * the **judge** is skipped: the verdict comes from the deterministic matcher alone and says
   `judge_model: "dry-run"`.
 
 Expect the matcher to fail in dry run for most scenarios (default arguments rarely produce the
 expected outcome). The point is the artefacts: a `plan.json` listing real tools, a transcript
 whose `tool_result` events came from the real server, a verdict and a report.
+
+## Sample run
+
+[`examples/cheapest-penne/`](examples/cheapest-penne/) holds three artefact sets from this
+machine against the real pantry server (DEMO_MODE, seeded SQLite), described in
+[`examples/README.md`](examples/README.md):
+
+* `dry-run/` — the smoke above: a plan over ten free tools, a transcript with the server's real
+  `tool_result` events (seven succeed, three reject the placeholder arguments), a matcher-only
+  verdict and the report;
+* `local-plan/` — a plan written by the local Cohere model (`ollama:command-r7b`, 24 minutes on
+  a loaded CPU): two paths, every tool real, arguments schema-checked by the hardened validator;
+* `local-run/` — one guided run of that plan with `command-r7b` as the agent. It made **no tool
+  call** and wrote a plausible, entirely fabricated answer (product ids 12345 and 67890, a
+  "Health Food Store" that does not exist). That is precisely the failure the framework exists
+  to catch: the deterministic matcher fails it (`match` is `relaxed`, not `direct`; the
+  top-level `product_id`/`store`/`price` are missing) regardless of what any judge model says.
 
 ## Pointing at the live pantry `/mcp`
 

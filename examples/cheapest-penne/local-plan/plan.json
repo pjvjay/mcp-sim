@@ -1,0 +1,56 @@
+{
+  "scenario": "cheapest-penne",
+  "catalog_digest": "fda001da06264e04d9ff84f9888abe6249fbbe5ee7859f23945979b453c94ee2",
+  "paths": [
+    {
+      "id": "1",
+      "kind": "happy",
+      "title": "Find the cheapest penne product",
+      "rationale": "The agent needs to find the cheapest penne product in the catalog.",
+      "steps": [
+        {
+          "intent": "Use find_product to find the cheapest penne product",
+          "tool": "find_product",
+          "arguments_sketch": {
+            "query": "penne",
+            "limit": 1
+          },
+          "success_looks_like": "",
+          "expect_error": false
+        }
+      ],
+      "checkpoints": [
+        "final_result: origin_status equals the value tool_result[find_product] carried"
+      ]
+    },
+    {
+      "id": "2",
+      "kind": "recovery",
+      "title": "Handle relaxed or none matches",
+      "rationale": "The agent needs to handle cases where find_product returns 'relaxed' or 'none' matches.",
+      "steps": [
+        {
+          "intent": "Use find_product to find the cheapest penne product",
+          "tool": "find_product",
+          "arguments_sketch": {
+            "query": "penne",
+            "limit": 1
+          },
+          "success_looks_like": "",
+          "expect_error": true
+        },
+        {
+          "intent": "The agent should report the result of the find_product call",
+          "tool": null,
+          "arguments_sketch": {},
+          "success_looks_like": "",
+          "expect_error": false
+        }
+      ],
+      "checkpoints": [
+        "transcript: find_product returns 'relaxed' or 'none'",
+        "transcript: find_product returns the product details"
+      ]
+    }
+  ]
+}
