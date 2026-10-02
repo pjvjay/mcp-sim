@@ -1349,6 +1349,51 @@ async def test_fail_effect_marks_the_transcript_and_flags_are_kept(
     assert saved.hard_failures == t.hard_failures and saved.flags == t.flags
 
 
+async def test_fail_effect_in_the_loop_fails_the_judge_despite_three_passing_votes(
+    scenario_data: dict[str, Any],
+) -> None:
+    """End to end: a code observer's ``fail`` effect at ``end`` lands on the agent-loop
+    transcript and the judge cannot overrule it, whatever the votes say."""
+    from mcpsim.judge import judge
+    from tests.test_judge import vote
+
+    clerk = {
+        "name": "strict_clerk",
+        "identity": "A clerk who allows five words and not one more.",
+        "kind": "code",
+        "watches": ["final_answer"],
+        "on": ["end"],
+        "conditions": [
+            {
+                "id": "too_long",
+                "when": "the final answer is longer than five words",
+                "check": {"word_count": {"of": "final_answer", "gt": 5}},
+                "then": {"flag": "verbose", "fail": True},
+            }
+        ],
+    }
+    scenario = observed(scenario_data, clerk)
+    t = await run(scenario, ScriptedLLM([opening(), text_response(FINAL_TEXT)]))
+    assert t.outcome == "completed" and t.final_result == PENNE
+    assert t.hard_failures == ["strict_clerk.too_long — 11 words"], (
+        "Penne is $2.49 at Fake Mart and its origin is verified. (the fenced block not counted)"
+    )
+    assert t.flags == ["verbose"]
+    assert t.kinds()[-4:] == ["final_result", "informant_report", "usage", "end"]
+
+    votes = ScriptedLLM([vote(True, 1.0), vote(True, 1.0), vote(True, 1.0)])
+    verdict = await judge(scenario, two_tool_path(), t, votes, votes=3)
+    assert verdict.matcher_passed and verdict.votes == 3 and verdict.score == 1.0
+    assert verdict.passed is False, "3/3 passing votes cannot overrule an observer fail effect"
+    assert verdict.failure_reasons == ["observer: strict_clerk.too_long — 11 words"]
+    assert verdict.failure_reasons[0].startswith("observer:")
+    assert verdict.flags == ["verbose"]
+    # The judge saw the report that failed the run, with its trigger and evidence.
+    prompt = votes.calls[0]["messages"][0]["content"]
+    assert "- at end: strict_clerk.too_long = true — 11 words (confidence 1.00)" in prompt
+    assert "  - observer: strict_clerk.too_long — 11 words" in prompt
+
+
 async def test_llm_observer_usage_is_charged_to_the_run(scenario_data: dict[str, Any]) -> None:
     auditor = {
         "name": "auditor",

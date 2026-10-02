@@ -365,7 +365,7 @@ def _model_args(parser: argparse.ArgumentParser) -> None:
         type=_models_arg,
         metavar="key=value[,key=value]",
         help=(
-            "override the scenario's models for this run; keys planner|agent|judge|user, "
+            "override the scenario's models for this run; keys planner|agent|judge|user|observer, "
             "values provider:model (e.g. ollama:command-r7b; a bare name is an Anthropic model)"
         ),
     )
