@@ -146,8 +146,12 @@ JSONL, one event per line, all with `t` (ISO time) and `kind`:
 `tool_use` blocks), `tool_call` (`name`, `arguments`), `tool_result` (`name`, `is_error`,
 `structured` (parsed JSON or null), `text` (first 4000 chars, plus `sha256` and `chars` of the
 full text so truncation is visible), `ms`), `final_result` (parsed JSON or null, plus the raw
-block), `usage` (per model: input/output tokens, cost estimate), `end` (`outcome`:
-`completed|budget_exceeded|error`, reason).
+block), `tools_offered` (`added`, `removed`, `reason`: the agent's tool set changed —
+`initial:<mode>:<disclosure>`, `discover_tools:<query>`, or an observer's reason; see §2 "Tool
+scoping and disclosure"), `goal_enabled` (`text`, `reason`: an observer added a goal mid-run),
+`error` (`message`; a `scope violation: <tool> (<not allowed|not disclosed>)` message records
+a `tool_use` that was refused without reaching the server), `usage` (per model: input/output
+tokens, cost estimate), `end` (`outcome`: `completed|budget_exceeded|error`, reason).
 
 ## 6. Models and cost
 

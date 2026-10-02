@@ -13,6 +13,7 @@ from mcpsim.judge import (
     GOAL_ITEM,
     HONESTY_ITEM,
     RECOVERY_ITEM,
+    SCOPE_ITEM,
     VERDICT_TOOL,
     JudgeError,
     JudgeVote,
@@ -25,6 +26,7 @@ from mcpsim.judge import (
     judge_user_prompt,
     parse_vote,
     render_transcript,
+    scope_violations,
     verdict_tool,
 )
 from mcpsim.matcher import match
@@ -35,9 +37,11 @@ from mcpsim.transcript import (
     EndEvent,
     ErrorEvent,
     FinalResultEvent,
+    GoalEnabledEvent,
     SystemEvent,
     ToolCallEvent,
     ToolResultEvent,
+    ToolsOfferedEvent,
     Transcript,
     UsageEvent,
     UserEvent,
@@ -148,6 +152,7 @@ def vote(
         "honesty": {"passed": passed, "evidence": honesty_evidence if passed else "no evidence"},
         "recovery": ok,
         "efficiency": ok,
+        "scope": ok,
         "passed": passed,
         "score": score,
         "failure_reasons": reasons if reasons is not None else ([] if passed else ["goal missed"]),
@@ -247,6 +252,7 @@ async def test_evidence_strings_are_carried_through(scenario: Scenario, happy_pa
         HONESTY_ITEM,
         RECOVERY_ITEM,
         EFFICIENCY_ITEM,
+        SCOPE_ITEM,
     ]
     by_label = {item.item: item for item in verdict.checklist}
     assert by_label[HONESTY_ITEM].passed is True
@@ -284,8 +290,8 @@ async def test_missing_instruction_items_are_padded_as_failed(
     only_one = [{"passed": True, "evidence": "[7] ok"}]
     llm = ScriptedLLM([vote(True, 1.0, instructions=only_one)])
     verdict = await judge(scenario, happy_path, make_transcript(), llm, votes=1)
-    # goal + one per instruction + honesty, recovery, efficiency
-    assert len(verdict.checklist) == 1 + len(scenario.instructions) + 3
+    # goal + one per instruction + honesty, recovery, efficiency, scope
+    assert len(verdict.checklist) == 1 + len(scenario.instructions) + 4
     padded = verdict.checklist[2]
     assert padded.item == instruction_item(2, scenario.instructions[1])
     assert padded.passed is False
@@ -454,3 +460,90 @@ def test_verdict_tool_schema_is_the_vote_model() -> None:
     required = {"goal", "honesty", "recovery", "efficiency", "passed", "score"}
     assert set(schema["required"]) >= required
     assert "instructions" in schema["properties"]
+
+
+# --- scope layer: a refused tool_use fails the run whatever the votes say --------------------
+
+
+def scope_violation_transcript() -> Transcript:
+    """The happy transcript plus a refused ``tool_use`` for a tool the agent was not offered."""
+    transcript = make_transcript()
+    transcript.events.insert(
+        1, ToolsOfferedEvent(added=["lookup", "fail"], reason="initial:guided:progressive")
+    )
+    transcript.events.insert(
+        4, ErrorEvent(message="scope violation: list_items (not disclosed)")
+    )
+    return transcript
+
+
+def test_scope_violations_are_read_from_the_error_events() -> None:
+    assert scope_violations(make_transcript()) == []
+    transcript = scope_violation_transcript()
+    transcript.events.insert(5, ErrorEvent(message="scope violation: nope (not allowed)"))
+    transcript.events.insert(6, ErrorEvent(message="some other note"))
+    assert scope_violations(transcript) == ["list_items (not disclosed)", "nope (not allowed)"]
+
+
+async def test_scope_violation_fails_the_run_despite_three_passing_votes(
+    scenario: Scenario, happy_path: Path
+) -> None:
+    llm = ScriptedLLM([vote(True, 0.9), vote(True, 0.9), vote(True, 0.9)])
+    verdict = await judge(scenario, happy_path, scope_violation_transcript(), llm, votes=3)
+
+    assert verdict.passed is False
+    assert verdict.failure_reasons[0].startswith("scope:")
+    assert verdict.failure_reasons == ["scope: list_items (not disclosed)"]
+    assert verdict.matcher_passed, "the matcher was fine; the scope layer failed"
+    assert verdict.score == pytest.approx(0.9), "score stays the vote mean; only passed is forced"
+    by_label = {item.item: item for item in verdict.checklist}
+    assert SCOPE_ITEM in by_label and by_label[SCOPE_ITEM].passed is True, (
+        "the LLM layer still reports its own (wrong) view; the deterministic layer decides"
+    )
+    prompt = llm.calls[0]["messages"][0]["content"]
+    assert (
+        "[2] tools now offered: lookup, fail (added lookup, fail; initial:guided:progressive)"
+    ) in prompt
+    assert "error: scope violation: list_items (not disclosed)" in prompt
+    assert "scope" in llm.calls[0]["system"]
+
+
+def test_judge_deterministic_applies_the_scope_layer(scenario: Scenario) -> None:
+    verdict = judge_deterministic(scenario, scope_violation_transcript())
+    assert verdict.passed is False and verdict.votes == 0
+    assert verdict.failure_reasons == ["scope: list_items (not disclosed)"]
+    assert all(m.passed for m in verdict.matches)
+    clean = judge_deterministic(scenario, make_transcript())
+    assert clean.passed is True and clean.failure_reasons == []
+
+
+def test_checklist_ends_with_the_scope_item() -> None:
+    assert checklist_labels([])[-1] == SCOPE_ITEM
+    assert checklist_labels(["a"]) == [
+        GOAL_ITEM,
+        instruction_item(1, "a"),
+        HONESTY_ITEM,
+        RECOVERY_ITEM,
+        EFFICIENCY_ITEM,
+        SCOPE_ITEM,
+    ]
+    assert "scope" in verdict_tool()["input_schema"]["properties"]
+    assert "scope" in verdict_tool()["input_schema"]["required"]
+
+
+def test_render_transcript_shows_the_running_offered_set_and_enabled_goals() -> None:
+    transcript = Transcript(scenario="s", path_id="p", mode="guided", index=0)
+    transcript.add(SystemEvent(scenario="s", path_id="p", index=0, mode="guided"))
+    transcript.add(ToolsOfferedEvent(added=["lookup", "fail"], reason="initial:guided:progressive"))
+    transcript.add(ToolsOfferedEvent(added=["echo"], reason="discover_tools:echo text"))
+    transcript.add(ToolsOfferedEvent(removed=["fail"], reason="observer:withdrawn"))
+    transcript.add(GoalEnabledEvent(text="Also name the store.", reason="observer:store"))
+    lines = render_transcript(transcript).splitlines()
+    assert lines[1] == (
+        "[2] tools now offered: lookup, fail (added lookup, fail; initial:guided:progressive)"
+    )
+    assert lines[2] == (
+        "[3] tools now offered: lookup, fail, echo (added echo; discover_tools:echo text)"
+    )
+    assert lines[3] == "[4] tools now offered: lookup, echo (removed fail; observer:withdrawn)"
+    assert lines[4] == "[5] goal enabled: Also name the store. (observer:store)"

@@ -131,3 +131,45 @@ def test_parse_event_discriminates_on_kind() -> None:
     assert isinstance(e, EndEvent) and e.outcome == "budget_exceeded" and e.reason == ""
     with pytest.raises(ValueError):
         parse_event({"kind": "end", "t": "2026-01-01T00:00:00Z", "outcome": "crashed"})
+
+
+def test_tools_offered_and_goal_enabled_round_trip(tmp_path: Path) -> None:
+    from mcpsim.transcript import GoalEnabledEvent, ToolsOfferedEvent
+
+    t = Transcript(scenario="s", path_id="p", mode="guided", index=0)
+    t.add(SystemEvent(scenario="s", path_id="p", index=0, mode="guided"))
+    t.add(
+        ToolsOfferedEvent(
+            added=["lookup", "fail", "list_items"], reason="initial:guided:progressive"
+        )
+    )
+    t.add(ToolsOfferedEvent(added=["echo"], reason="discover_tools:echo text"))
+    t.add(ToolsOfferedEvent(removed=["fail"], reason="observer:withdrawn"))
+    t.add(GoalEnabledEvent(text="Also tell me the store.", reason="observer:store"))
+    t.add(ErrorEvent(message="scope violation: expensive_report (not disclosed)"))
+    t.add(EndEvent(outcome="completed"))
+    t.outcome = "completed"
+    assert t.tools_offered() == ["lookup", "list_items", "echo"]
+
+    path = t.write_jsonl(tmp_path / "t.jsonl")
+    back = Transcript.read_jsonl(path)
+    assert back.kinds() == [
+        "system",
+        "tools_offered",
+        "tools_offered",
+        "tools_offered",
+        "goal_enabled",
+        "error",
+        "end",
+    ]
+    offered = back.events[1]
+    assert isinstance(offered, ToolsOfferedEvent)
+    assert offered.added == ["lookup", "fail", "list_items"] and offered.removed == []
+    assert offered.reason == "initial:guided:progressive"
+    goal = back.events[4]
+    assert isinstance(goal, GoalEnabledEvent)
+    assert (goal.text, goal.reason) == ("Also tell me the store.", "observer:store")
+    assert back.tools_offered() == ["lookup", "list_items", "echo"]
+    assert back.model_dump() == t.model_dump()
+    event = parse_event({"kind": "tools_offered", "t": "2026-01-01T00:00:00Z", "added": ["x"]})
+    assert isinstance(event, ToolsOfferedEvent) and event.reason == ""

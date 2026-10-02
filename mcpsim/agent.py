@@ -11,18 +11,34 @@ the scenario gives it. The run ends when the agent delivers a ``final_result`` b
 raises (``error``). A run never raises for any of those; the :class:`~mcpsim.transcript.Transcript`
 carries the reason.
 
+Tool disclosure (DESIGN §2 "Tool scoping and disclosure"): the LLM only ever sees the tools in
+:class:`ToolScope`'s ``offered`` list, built from the *allowed* catalog per
+``scenario.tools.disclosure`` — ``all`` (every allowed tool from turn one), ``plan`` (the path's
+tools when guided, everything when free) or ``progressive`` (the explicit ``initial`` globs or
+:func:`mcpsim.scoping.initial_tools`, plus the framework's own ``discover_tools`` meta-tool that
+adds up to three more per query without touching the server). Every change to the set is a
+``tools_offered`` transcript event. A ``tool_use`` naming a tool that is not offered never
+reaches the server: the agent gets an error ``tool_result`` and the transcript an ``error``
+event ``scope violation: <tool> (not allowed|not disclosed)``. An observer holds a
+:class:`LiveRun` (``run_path(..., on_start=...)``) whose ``offer_tools`` and ``enable_goal``
+widen the set or add a goal mid-run.
+
 Dry run (``dry_run=True``): no LLM at all. Each step's tool is called with its sketch arguments
 in order and ``final_result`` is synthesised from the last structured tool result, so the whole
 MCP path is exercised without an API key. ``{"$from_step": n, "path": ...}`` references in a
 sketch are resolved against step ``n``'s structured result (a reference that cannot be resolved
 records an ``error`` event and skips the step), and an error result on a step marked
-``expect_error`` is the planned outcome, not a failure.
+``expect_error`` is the planned outcome, not a failure. The dry run follows the plan, so it is
+offered exactly the path's allowed tools whatever the disclosure mode says; a step naming a
+tool outside the allowed catalog is refused the same way as in a live run.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from typing import Any
 
@@ -31,15 +47,18 @@ from mcpsim.matcher import MISSING, resolve
 from mcpsim.mcpclient import Catalog, Session, ToolResult
 from mcpsim.plan import Mode, Path, Step, StepReference, parse_reference
 from mcpsim.scenario import Scenario
+from mcpsim.scoping import first_sentence, initial_tools, rank_tools, tokens
 from mcpsim.transcript import (
     AssistantEvent,
     EndEvent,
     ErrorEvent,
     FinalResultEvent,
+    GoalEnabledEvent,
     Outcome,
     SystemEvent,
     ToolCallEvent,
     ToolResultEvent,
+    ToolsOfferedEvent,
     Transcript,
     UsageEvent,
     UserEvent,
@@ -48,6 +67,11 @@ from mcpsim.transcript import (
 FINAL_RESULT_NAME = "final_result"
 USER_MAX_TOKENS = 512
 DRY_RUN_MODEL = "dry-run"
+DISCOVER_TOOL_NAME = "discover_tools"
+DISCOVER_LIMIT = 3
+NOW_AVAILABLE = "now available"
+NOT_AVAILABLE = "tool {name} is not available in this conversation"
+SCOPE_VIOLATION = "scope violation: {name} ({why})"
 
 # ---------------------------------------------------------------------------------------------
 # final_result extraction
@@ -306,6 +330,169 @@ def tool_result_block(tool_use_id: str, result: ToolResult) -> dict[str, Any]:
     return block
 
 
+# ---------------------------------------------------------------------------------------------
+# tool disclosure
+
+
+def discover_tool_definition() -> dict[str, Any]:
+    """The framework's ``discover_tools`` meta-tool, offered in ``progressive`` disclosure.
+
+    It is answered by :meth:`ToolScope.discover`, never sent to the MCP server, and does not
+    count against ``max_tool_calls`` (``max_turns`` bounds it).
+    """
+    return {
+        "name": DISCOVER_TOOL_NAME,
+        "description": (
+            "Ask for more tools. Not every tool of this server is offered at first: describe "
+            "in a few words what you need to do (for example 'list items', 'submit a label "
+            f"reading') and up to {DISCOVER_LIMIT} matching tools are added to the ones you can "
+            "call and listed in the reply."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "What you need a tool for."}
+            },
+            "required": ["query"],
+        },
+    }
+
+
+def goal_note(goals: list[str]) -> str:
+    """The text block that carries goals an observer enabled mid-run to the agent."""
+    bullets = "\n".join(f"- {g.strip()}" for g in goals)
+    return (
+        "## Additional goal\n"
+        "The person's situation changed. In addition to the goal above, from now on also:\n"
+        f"{bullets}"
+    )
+
+
+def user_content(primary: str | list[dict[str, Any]], goals: list[str]) -> Any:
+    """A user message's ``content``: the reply or tool results, plus any pending goal note."""
+    if not goals:
+        return primary
+    blocks = [{"type": "text", "text": primary}] if isinstance(primary, str) else list(primary)
+    blocks.append({"type": "text", "text": goal_note(goals)})
+    return blocks
+
+
+class ToolScope:
+    """Which allowed tools the agent is offered right now, and how the set grows.
+
+    ``allowed`` is the scenario's allowed catalog (``scenario.tools`` allow/deny already
+    applied); ``offered`` is the ordered subset whose definitions go to the LLM on every turn.
+    Every change appends a ``tools_offered`` event to the transcript with a reason
+    (``initial:<mode>:<disclosure>``, ``discover_tools:<query>``, or an observer's own).
+    """
+
+    def __init__(self, scenario: Scenario, allowed: Catalog, transcript: Transcript) -> None:
+        self.scenario = scenario
+        self.policy = scenario.tools
+        self.allowed = allowed
+        self.transcript = transcript
+        self.offered: list[str] = []
+        self.discoverable = self.policy.disclosure == "progressive" and self.policy.discover_tool
+
+    def disclose_initial(self, path: Path, mode: Mode) -> list[str]:
+        """Turn one's set per ``disclosure``; always recorded, even when empty."""
+        disclosure = self.policy.disclosure
+        if disclosure == "all":
+            names = self.allowed.tool_names()
+        elif disclosure == "plan":
+            names = self.allowed.tool_names() if mode == "free" else path.tools_used()
+        elif self.policy.initial is not None:
+            names = [t.name for t in self.allowed.select(self.policy.initial)]
+        else:
+            names = [t.name for t in initial_tools(self.scenario, self.allowed)]
+        return self.offer(names, f"initial:{mode}:{disclosure}", always_record=True)
+
+    def offer(self, names: Iterable[str], reason: str, *, always_record: bool = False) -> list[str]:
+        """Add the allowed tools among ``names`` that are not offered yet; returns the added."""
+        added: list[str] = []
+        for name in names:
+            if name in self.offered or name in added or not self.allowed.has_tool(name):
+                continue
+            added.append(name)
+        if added or always_record:
+            self.offered.extend(added)
+            self.transcript.add(ToolsOfferedEvent(added=added, reason=reason))
+        return added
+
+    def definitions(self) -> list[dict[str, Any]]:
+        """The ``tools`` the LLM sees this turn: the offered tools, then ``discover_tools``."""
+        defs = [self.allowed.tool(name).to_anthropic_tool() for name in self.offered]
+        if self.discoverable:
+            defs.append(discover_tool_definition())
+        return defs
+
+    def refusal(self, name: str) -> str | None:
+        """Why a ``tool_use`` of ``name`` must not reach the server, or ``None`` when it may."""
+        if name == DISCOVER_TOOL_NAME and self.discoverable:
+            return None
+        if not self.allowed.has_tool(name):
+            return "not allowed"
+        if name not in self.offered:
+            return "not disclosed"
+        return None
+
+    def discover(self, query: str) -> str:
+        """Answer ``discover_tools``: offer the top matches among the unoffered allowed tools.
+
+        ``query`` is the only term source; the same relevance weights as the initial scoring
+        apply; at most :data:`DISCOVER_LIMIT` tools with a score above zero are added.
+        """
+        unoffered = [t for t in self.allowed.tools if t.name not in self.offered]
+        ranked = [(t, s) for t, s in rank_tools(tokens(query), unoffered) if s > 0]
+        ranked = ranked[:DISCOVER_LIMIT]
+        if not ranked:
+            if not unoffered:
+                return "Every tool of this server is already available to you."
+            return (
+                f"No further tool matches {query!r}; {len(unoffered)} undisclosed tool(s) "
+                "remain. Try different words for what you need to do."
+            )
+        self.offer([t.name for t, _ in ranked], f"{DISCOVER_TOOL_NAME}:{query}")
+        lines = [
+            f"- {t.name}: {first_sentence(t.description) or '(no description)'} ({NOW_AVAILABLE})"
+            for t, _ in ranked
+        ]
+        return f"{len(ranked)} tool(s) {NOW_AVAILABLE}:\n" + "\n".join(lines)
+
+
+class LiveRun:
+    """The handle an observer holds on a run in flight (``run_path(..., on_start=...)``).
+
+    ``offer_tools`` widens the offered set (names or globs; only allowed tools are added, the
+    return value says which); ``enable_goal`` records a ``goal_enabled`` event and the text
+    reaches the agent in its next user message. Both are the effects the Informant-Report
+    observers apply; nothing here can offer a tool the scenario denies.
+    """
+
+    def __init__(self, scope: ToolScope, transcript: Transcript) -> None:
+        self.scope = scope
+        self.transcript = transcript
+        self._goals: list[str] = []
+
+    @property
+    def offered(self) -> list[str]:
+        return list(self.scope.offered)
+
+    def offer_tools(self, names: Iterable[str], reason: str) -> list[str]:
+        patterns = list(names)
+        selected = [t.name for t in self.scope.allowed.select(patterns)]
+        return self.scope.offer(selected, reason)
+
+    def enable_goal(self, text: str, reason: str) -> None:
+        self.transcript.add(GoalEnabledEvent(text=text, reason=reason))
+        self._goals.append(text)
+
+    def take_goals(self) -> list[str]:
+        """The goals enabled since the last call (they go into the next user message)."""
+        goals, self._goals = self._goals, []
+        return goals
+
+
 class _Run:
     """Mutable state of one run: the transcript being built, counters and budgets."""
 
@@ -356,6 +543,39 @@ class _Run:
         self.tool_calls += 1
         self.transcript.add(ToolCallEvent(name=name, arguments=arguments, tool_use_id=tool_use_id))
         result = await session.call_tool(name, arguments)
+        self.transcript.add(ToolResultEvent.from_result(result, tool_use_id=tool_use_id))
+        return result
+
+    def refuse(self, name: str, why: str, tool_use_id: str | None) -> dict[str, Any]:
+        """Record a scope violation; the ``tool_result`` block the agent gets instead."""
+        self.transcript.add(ErrorEvent(message=SCOPE_VIOLATION.format(name=name, why=why)))
+        return {
+            "type": "tool_result",
+            "tool_use_id": tool_use_id or "",
+            "content": NOT_AVAILABLE.format(name=name),
+            "is_error": True,
+        }
+
+    def discover(
+        self, scope: ToolScope, arguments: dict[str, Any], tool_use_id: str | None
+    ) -> ToolResult:
+        """Answer ``discover_tools`` in-process: recorded like a call, never sent, not budgeted."""
+        self.transcript.add(
+            ToolCallEvent(name=DISCOVER_TOOL_NAME, arguments=arguments, tool_use_id=tool_use_id)
+        )
+        query = str(arguments.get("query", "") or "").strip()
+        if query:
+            text, is_error = scope.discover(query), False
+        else:
+            text = f"{DISCOVER_TOOL_NAME} needs a 'query': a few words on what you need to do"
+            is_error = True
+        result = ToolResult(
+            name=DISCOVER_TOOL_NAME,
+            is_error=is_error,
+            text=text,
+            sha256=hashlib.sha256(text.encode("utf-8")).hexdigest(),
+            chars=len(text),
+        )
         self.transcript.add(ToolResultEvent.from_result(result, tool_use_id=tool_use_id))
         return result
 
@@ -438,16 +658,29 @@ def resolve_arguments(step: Step, results: dict[int, ToolResult | None]) -> dict
     return arguments
 
 
-async def _dry_run(run: _Run, path: Path, session: Session) -> Transcript:
+async def _dry_run(
+    run: _Run, path: Path, mode: Mode, session: Session, catalog: Catalog | None
+) -> Transcript:
+    if catalog is None:
+        catalog = await session.catalog()
+    catalog = catalog.filtered(run.scenario.tools.allow, run.scenario.tools.deny)
+    scope = ToolScope(run.scenario, catalog, run.transcript)
+    scope.offer(path.tools_used(), f"initial:{mode}:dry-run", always_record=True)
     run.transcript.add(UserEvent(text=run.scenario.goal.strip()))
     last_structured: dict[str, Any] | list[Any] | None = None
     results: dict[int, ToolResult | None] = {}
     skipped = 0
+    refused = 0
     expected_errors = 0
     unexpected_errors = 0
     for n, step in enumerate(path.steps, start=1):
         results[n] = None
         if step.tool is None:
+            continue
+        why = scope.refusal(step.tool)
+        if why is not None:
+            refused += 1
+            run.refuse(step.tool, why, f"dry-{n}")
             continue
         reason = run.tool_budget_reason(step.tool)
         if reason is not None:
@@ -503,6 +736,8 @@ async def _dry_run(run: _Run, path: Path, session: Session) -> Transcript:
         reason += f"; {unexpected_errors} unexpected error result(s)"
     if skipped:
         reason += f"; {skipped} step(s) skipped over unresolved references"
+    if refused:
+        reason += f"; {refused} step(s) refused as out of scope"
     return run.end("completed", reason)
 
 
@@ -516,12 +751,15 @@ async def run_path(
     *,
     dry_run: bool = False,
     catalog: Catalog | None = None,
+    on_start: Callable[[LiveRun], None] | None = None,
 ) -> Transcript:
     """Run ``path`` once in ``mode`` and return the transcript (never raises for run failures).
 
     ``llm`` may be ``None`` only when ``dry_run`` is true. ``catalog`` is the *allowed* catalog
     (the runner applies ``scenario.tools`` once); when not given it is discovered from the
-    session and filtered here, so the agent never sees a tool the scenario denies.
+    session and filtered here, so the agent never sees a tool the scenario denies. ``on_start``
+    is called with the :class:`LiveRun` handle after the initial disclosure and before the
+    first turn; an observer keeps it to call ``offer_tools`` / ``enable_goal`` during the run.
     """
     if not dry_run and llm is None:
         raise ValueError("run_path needs an llm unless dry_run=True")
@@ -541,14 +779,21 @@ async def run_path(
         )
     )
     if dry_run:
-        return await _dry_run(run, path, session)
+        try:
+            return await _dry_run(run, path, mode, session, catalog)
+        except Exception as exc:  # noqa: BLE001 - a run never crashes; the reason is recorded
+            return run.end("error", _describe(exc))
     assert llm is not None  # for the type checker; guarded above
 
     try:
         if catalog is None:
             catalog = await session.catalog()
         catalog = catalog.filtered(scenario.tools.allow, scenario.tools.deny)
-        tools = catalog.to_anthropic_tools()
+        scope = ToolScope(scenario, catalog, run.transcript)
+        scope.disclose_initial(path, mode)
+        live = LiveRun(scope, run.transcript)
+        if on_start is not None:
+            on_start(live)
         user = SimulatedUser(scenario, llm, user_model)
 
         opening, usage = await user.open()
@@ -556,7 +801,9 @@ async def run_path(
         reason = run.record_usage(user_model, usage)
         if reason is not None:
             return run.end("budget_exceeded", reason)
-        messages: list[dict[str, Any]] = [{"role": "user", "content": opening}]
+        messages: list[dict[str, Any]] = [
+            {"role": "user", "content": user_content(opening, live.take_goals())}
+        ]
 
         while True:
             reason = run.turn_budget_reason()
@@ -566,7 +813,7 @@ async def run_path(
                 model=agent_model,
                 system=agent_system,
                 messages=list(messages),
-                tools=tools or None,
+                tools=scope.definitions() or None,
                 max_tokens=DEFAULT_MAX_TOKENS,
             )
             run.turns += 1
@@ -587,12 +834,22 @@ async def run_path(
                     tool_use_id = str(block.get("id", "")) or None
                     raw_input = block.get("input")
                     arguments = dict(raw_input) if isinstance(raw_input, dict) else {}
+                    why = scope.refusal(name)
+                    if why is not None:
+                        results.append(run.refuse(name, why, tool_use_id))
+                        continue
+                    if name == DISCOVER_TOOL_NAME:
+                        result = run.discover(scope, arguments, tool_use_id)
+                        results.append(tool_result_block(tool_use_id or "", result))
+                        continue
                     reason = run.tool_budget_reason(name)
                     if reason is not None:
                         return run.end("budget_exceeded", reason)
                     result = await run.call(session, name, arguments, tool_use_id)
                     results.append(tool_result_block(tool_use_id or "", result))
-                messages.append({"role": "user", "content": results})
+                messages.append(
+                    {"role": "user", "content": user_content(results, live.take_goals())}
+                )
                 continue
 
             final = extract_final_result(text)
@@ -610,6 +867,6 @@ async def run_path(
             reason = run.record_usage(user_model, usage)
             if reason is not None:
                 return run.end("budget_exceeded", reason)
-            messages.append({"role": "user", "content": reply})
+            messages.append({"role": "user", "content": user_content(reply, live.take_goals())})
     except Exception as exc:  # noqa: BLE001 - a run never crashes; the reason is recorded
         return run.end("error", _describe(exc))

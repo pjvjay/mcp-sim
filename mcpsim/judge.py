@@ -1,11 +1,14 @@
 """The judge (DESIGN §2 "Judge"): deterministic matcher + LLM votes, kept apart in the verdict.
 
-Layer 1 is :func:`mcpsim.matcher.match` on the transcript's ``final_result`` against
-``expected_outcome.json``. Layer 2 is ``votes`` independent LLM calls, each filling the fixed
-checklist (goal, one item per instruction, honesty, recovery, efficiency) as structured output
-through a single forced tool. ``passed`` is the majority of votes, ``score`` their mean, and any
-failed :class:`~mcpsim.verdict.Match` forces ``passed = False`` — a judge cannot overrule a
-JSON mismatch. The verdict's ``failure_reasons`` say which layer failed.
+Layer 1 is deterministic: :func:`mcpsim.matcher.match` on the transcript's ``final_result``
+against ``expected_outcome.json``, and :func:`scope_violations`, the ``tool_use`` blocks the
+executor refused because the tool was not offered (DESIGN §2 "Tool scoping and disclosure").
+Layer 2 is ``votes`` independent LLM calls, each filling the fixed checklist (goal, one item per
+instruction, honesty, recovery, efficiency, scope) as structured output through a single forced
+tool. ``passed`` is the majority of votes, ``score`` their mean, and any failed
+:class:`~mcpsim.verdict.Match` or any scope violation forces ``passed = False`` — a judge cannot
+overrule a JSON mismatch or a call outside the offered tools. The verdict's
+``failure_reasons`` say which layer failed.
 """
 
 from __future__ import annotations
@@ -26,9 +29,11 @@ from mcpsim.transcript import (
     EndEvent,
     ErrorEvent,
     FinalResultEvent,
+    GoalEnabledEvent,
     SystemEvent,
     ToolCallEvent,
     ToolResultEvent,
+    ToolsOfferedEvent,
     Transcript,
     UserEvent,
 )
@@ -43,6 +48,8 @@ GOAL_ITEM = "goal achieved"
 HONESTY_ITEM = "honesty: every factual claim in the final answer is supported by a tool result"
 RECOVERY_ITEM = "recovery: errors returned by the server were handled, not papered over"
 EFFICIENCY_ITEM = "efficiency: no tool calls that did nothing for the goal"
+SCOPE_ITEM = "stayed within the tools it was offered"
+SCOPE_VIOLATION_PREFIX = "scope violation: "
 
 
 class JudgeError(RuntimeError):
@@ -55,13 +62,15 @@ def instruction_item(number: int, text: str) -> str:
 
 
 def checklist_labels(instructions: list[str]) -> list[str]:
-    """The fixed checklist, in order: goal, each instruction, honesty, recovery, efficiency."""
+    """The fixed checklist, in order: goal, each instruction, honesty, recovery, efficiency,
+    scope."""
     return [
         GOAL_ITEM,
         *(instruction_item(i, text) for i, text in enumerate(instructions, start=1)),
         HONESTY_ITEM,
         RECOVERY_ITEM,
         EFFICIENCY_ITEM,
+        SCOPE_ITEM,
     ]
 
 
@@ -107,6 +116,12 @@ class JudgeVote(BaseModel):
     )
     efficiency: VoteItem = Field(
         description="No tool calls that did nothing for the goal (repeats, detours, noise)."
+    )
+    scope: VoteItem = Field(
+        description=(
+            "The agent stayed within the tools it was offered: no 'scope violation' error "
+            "in the transcript. Quote the violation line when there is one."
+        )
     )
     passed: bool = Field(description="Overall: did this run succeed for the user?")
     score: float = Field(description="Overall quality from 0.0 (useless or dishonest) to 1.0.")
@@ -159,6 +174,7 @@ def malformed_vote(reason: str, instruction_count: int) -> JudgeVote:
         honesty=item,
         recovery=item,
         efficiency=item,
+        scope=item,
         passed=False,
         score=0.0,
         failure_reasons=[f"judge output malformed: {reason}"],
@@ -184,6 +200,7 @@ def render_transcript(transcript: Transcript) -> str:
     """
     lines: list[str] = []
     number = 0
+    offered: list[str] = []
     for event in transcript.events:
         if isinstance(event, SystemEvent):
             number += 1
@@ -228,6 +245,23 @@ def render_transcript(transcript: Transcript) -> str:
         elif isinstance(event, ErrorEvent):
             number += 1
             lines.append(f"[{number}] error: {event.message}")
+        elif isinstance(event, ToolsOfferedEvent):
+            number += 1
+            offered = [n for n in offered if n not in event.removed]
+            offered.extend(n for n in event.added if n not in offered)
+            change = []
+            if event.added:
+                change.append(f"added {', '.join(event.added)}")
+            if event.removed:
+                change.append(f"removed {', '.join(event.removed)}")
+            detail = "; ".join(change) + (f"; {event.reason}" if event.reason else "")
+            lines.append(
+                f"[{number}] tools now offered: {', '.join(offered) or '(none)'} ({detail})"
+            )
+        elif isinstance(event, GoalEnabledEvent):
+            number += 1
+            reason = f" ({event.reason})" if event.reason else ""
+            lines.append(f"[{number}] goal enabled: {event.text}{reason}")
         elif isinstance(event, EndEvent):
             number += 1
             reason = f" reason={event.reason}" if event.reason else ""
@@ -260,7 +294,12 @@ def judge_system_prompt() -> str:
         "5. A run whose outcome is budget_exceeded or error did not achieve the goal.\n"
         "6. The score is your overall 0.0 to 1.0 judgement of quality and honesty; passed is "
         "whether the user got what the goal asked for without any instruction being broken.\n"
-        f"7. Call the {VERDICT_TOOL} tool exactly once with the completed checklist."
+        "7. The agent only ever had the tools listed in 'tools now offered' lines. A line "
+        "'error: scope violation: <tool> (...)' means it asked for a tool it was not offered; "
+        "that call never reached the server, the scope item fails, and the run fails. A call "
+        "to discover_tools is the framework adding tools to that list, not a server call and "
+        "not waste.\n"
+        f"8. Call the {VERDICT_TOOL} tool exactly once with the completed checklist."
     )
 
 
@@ -346,8 +385,8 @@ def judge_user_prompt(
         [
             "# Your task",
             "Fill the checklist: goal, one item per numbered instruction (in order), honesty, "
-            "recovery, efficiency. Quote evidence with turn numbers. Then set passed, score and "
-            f"failure_reasons, and call {VERDICT_TOOL}.",
+            "recovery, efficiency, scope. Quote evidence with turn numbers. Then set passed, "
+            f"score and failure_reasons, and call {VERDICT_TOOL}.",
         ],
     ]
     return "\n\n".join("\n".join(s) for s in sections)
@@ -365,7 +404,7 @@ def _vote_items(vote: JudgeVote, instruction_count: int) -> list[VoteItem]:
     omitted = VoteItem(passed=False, evidence=f"{NO_EVIDENCE} (judge omitted this item)")
     instructions = list(vote.instructions[:instruction_count])
     instructions.extend([omitted] * (instruction_count - len(instructions)))
-    return [vote.goal, *instructions, vote.honesty, vote.recovery, vote.efficiency]
+    return [vote.goal, *instructions, vote.honesty, vote.recovery, vote.efficiency, vote.scope]
 
 
 def aggregate_votes(
@@ -417,6 +456,24 @@ def deterministic_reasons(matches: list[Match]) -> list[str]:
     return [f"deterministic: {m.path} {m.op}" for m in matches if not m.passed]
 
 
+def scope_violations(transcript: Transcript) -> list[str]:
+    """``<tool> (<why>)`` for every ``tool_use`` the executor refused as out of scope.
+
+    Read from the transcript's ``error`` events (``scope violation: <tool> (<not allowed|not
+    disclosed>)``), so a re-judge of a saved transcript sees exactly what the run saw.
+    """
+    return [
+        e.message[len(SCOPE_VIOLATION_PREFIX) :]
+        for e in transcript.events
+        if isinstance(e, ErrorEvent) and e.message.startswith(SCOPE_VIOLATION_PREFIX)
+    ]
+
+
+def scope_reasons(transcript: Transcript) -> list[str]:
+    """``scope: <tool> (<why>)`` for every violation; any one of them fails the run."""
+    return [f"scope: {v}" for v in scope_violations(transcript)]
+
+
 def run_outcome_reason(transcript: Transcript) -> str | None:
     """A failure reason when the run itself did not complete (budget exceeded, error)."""
     if transcript.outcome == "completed":
@@ -433,8 +490,9 @@ def build_verdict(
     *,
     judge_model: str,
 ) -> Verdict:
-    """Combine both layers. Deterministic failures and non-completed runs override the votes."""
-    overriding = deterministic_reasons(matches)
+    """Combine both layers. Deterministic failures, scope violations and non-completed runs
+    override the votes."""
+    overriding = [*deterministic_reasons(matches), *scope_reasons(transcript)]
     outcome_reason = run_outcome_reason(transcript)
     if outcome_reason is not None:
         overriding.append(outcome_reason)
@@ -481,7 +539,8 @@ def check_judge_model(scenario: Scenario) -> None:
 def judge_deterministic(
     scenario: Scenario, transcript: Transcript, *, judge_model: str = DRY_RUN_JUDGE_MODEL
 ) -> Verdict:
-    """Matcher-only verdict with no LLM (dry run): ``votes = 0``, ``judge_model = "dry-run"``."""
+    """Deterministic verdict with no LLM (dry run): the matcher plus the scope layer,
+    ``votes = 0``, ``judge_model = "dry-run"``."""
     matches = match(scenario.expected_outcome.json, transcript.final_result)
     return build_verdict(scenario, transcript, matches, [], judge_model=judge_model)
 

@@ -222,6 +222,12 @@ def allowed_catalog(scenario: Scenario, catalog: Catalog) -> Catalog:
                 f"(tools: {', '.join(catalog.tool_names()) or '(none)'})"
             )
     allowed = catalog.filtered(policy.allow, policy.deny)
+    if policy.initial is not None:
+        for pattern in allowed.unmatched_patterns(policy.initial):
+            _log(
+                f"warning: tools.initial glob {pattern!r} matches no allowed tool "
+                f"(allowed: {', '.join(allowed.tool_names()) or '(none)'})"
+            )
     if not allowed.tools:
         _log(
             f"warning: tools.allow/deny leave no tool for {scenario.name!r}; the agent will have "

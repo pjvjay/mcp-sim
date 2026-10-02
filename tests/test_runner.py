@@ -220,6 +220,7 @@ def _vote(passed: bool, score: float, instruction_count: int) -> Any:
             "honesty": item,
             "recovery": ok,
             "efficiency": ok,
+            "scope": ok,
             "passed": passed,
             "score": score,
             "failure_reasons": [] if passed else ["goal missed"],
@@ -299,7 +300,8 @@ def test_judge_run_dir_uses_the_llm_judge_for_real_transcripts(
     assert verdict.votes == 3
     assert verdict.passed is True and verdict.score == pytest.approx(0.7)
     assert [m.passed for m in verdict.matches] == [True, True, True]
-    assert len(verdict.checklist) == 4 + n  # goal, n instructions, honesty, recovery, efficiency
+    # goal, n instructions, honesty, recovery, efficiency, scope
+    assert len(verdict.checklist) == 5 + n
     assert len(llm.calls) == 3 and all(c["model"] == scenario.models.judge for c in llm.calls)
     report = Report.load(run_dir / "report.json")
     assert (report.runs, report.passed, report.judge_models) == (1, 1, [scenario.models.judge])

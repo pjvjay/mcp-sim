@@ -109,6 +109,28 @@ class ErrorEvent(_EventBase):
     message: str
 
 
+class ToolsOfferedEvent(_EventBase):
+    """The set of tools the agent is offered changed (DESIGN §2 "Tool scoping and disclosure").
+
+    ``reason`` says why: ``initial:<mode>:<disclosure>`` on turn one,
+    ``discover_tools:<query>`` when the agent asked for more, or whatever an observer passed to
+    ``offer_tools``. The judge renders the running set after each change.
+    """
+
+    kind: Literal["tools_offered"] = "tools_offered"
+    added: list[str] = Field(default_factory=list)
+    removed: list[str] = Field(default_factory=list)
+    reason: str = ""
+
+
+class GoalEnabledEvent(_EventBase):
+    """An observer added a goal mid-run (``enable_goal``); the agent reads it next turn."""
+
+    kind: Literal["goal_enabled"] = "goal_enabled"
+    text: str
+    reason: str = ""
+
+
 class EndEvent(_EventBase):
     kind: Literal["end"] = "end"
     outcome: Outcome
@@ -124,6 +146,8 @@ Event = Annotated[
     | FinalResultEvent
     | UsageEvent
     | ErrorEvent
+    | ToolsOfferedEvent
+    | GoalEnabledEvent
     | EndEvent,
     Field(discriminator="kind"),
 ]
@@ -165,6 +189,15 @@ class Transcript(BaseModel):
 
     def tool_results(self) -> list[ToolResultEvent]:
         return [e for e in self.events if isinstance(e, ToolResultEvent)]
+
+    def tools_offered(self) -> list[str]:
+        """The tools offered at the end of the run, in the order they were offered."""
+        offered: list[str] = []
+        for e in self.events:
+            if isinstance(e, ToolsOfferedEvent):
+                offered = [n for n in offered if n not in e.removed]
+                offered.extend(n for n in e.added if n not in offered)
+        return offered
 
     def to_jsonl(self) -> str:
         return "".join(e.model_dump_json() + "\n" for e in self.events)
