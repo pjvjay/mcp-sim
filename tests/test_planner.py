@@ -412,6 +412,8 @@ async def test_checkpoint_without_the_prefix_is_rejected(scenario: Scenario) -> 
         "tool_result[lookup]: origin_status is verified",
         "transcript:no call to expensive_report",
         "  transcript: leading space is fine",
+        "report: shelf_auditor.direct_match is true",
+        "report:librarian.exists is false",
     ],
 )
 def test_checkpoint_shapes_accepted(text: str) -> None:
@@ -431,6 +433,9 @@ def test_checkpoint_shapes_accepted(text: str) -> None:
         "tool_result[Lookup]: uppercase tool names are not allowed by the shape",
         "tool_result: needs the tool name in brackets",
         "Final_result: wrong case",
+        "report: direct_match is true",
+        "report: shelf_auditor.direct_match is maybe",
+        "report: shelf_auditor.direct_match",
     ],
 )
 def test_checkpoint_shapes_rejected(text: str) -> None:
@@ -703,8 +708,9 @@ async def test_dry_run_plans_the_relevant_tool_with_arguments_from_the_expected_
     assert 'take that value: lookup(slug="penne")' in only.rationale
     assert only.checkpoints == [
         "transcript: contains a tool_call for lookup",
-        "final_result: equals the structured content of the last successful tool result, or "
-        "is null when no step returned structured content",
+        "final_result: equals the structured content of the successful tool result that covers "
+        "the most expected_outcome.json keys (the last one otherwise), or is null when no step "
+        "returned structured content",
     ]
 
 

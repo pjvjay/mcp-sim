@@ -13,11 +13,17 @@ HTTP shares the URL). A stdio ``setup`` command runs once per ``run_scenario`` (
 ``plan_scenario``, which also has to connect) with the stdio ``env`` applied. Every path runs in
 ``guided`` mode; a ``happy`` path additionally runs in ``free`` mode.
 
+Before planning, whenever the scenario's disclosure is not ``all``, the :mod:`mcpsim.scout`
+observes the server read-only on the same session that discovered the catalog, the observers
+report at the ``scout`` trigger, and the result is saved as ``scout.json`` beside ``plan.json``
+(``--plan`` reuse skips the scout; the runs' observers still fire).
+
 Dry run (``dry_run=True``): :func:`mcpsim.planner.plan` with ``dry_run=True``,
 :func:`mcpsim.agent.run_path` with ``dry_run=True`` and the matcher-only
-:func:`mcpsim.judge.judge_deterministic`; no LLM is constructed. Otherwise every LLM comes from
-:func:`make_llm_for`, which reads ``scenario.models.<role>`` (``provider:model``, see
-docs/LOCAL_MODELS.md) and asks :func:`mcpsim.llm.make_llm` for that provider's cached client.
+:func:`mcpsim.judge.judge_deterministic`; no LLM is constructed (code and group observers still
+run). Otherwise every LLM comes from :func:`make_llm_for`, which reads ``scenario.models.<role>``
+(``provider:model``, see docs/LOCAL_MODELS.md) and asks :func:`mcpsim.llm.make_llm` for that
+provider's cached client.
 
 ``model_overrides`` / ``allow_same_judge`` (the CLI's ``--models`` and ``--allow-same-judge``)
 are applied with :func:`apply_model_overrides` right after the scenario is loaded, so scenario
@@ -48,7 +54,8 @@ from mcpsim.llm import (
     make_llm,
     parse_model_spec,
 )
-from mcpsim.mcpclient import Catalog, connect
+from mcpsim.mcpclient import Catalog, Session, connect
+from mcpsim.observers import ObserverRunner
 from mcpsim.plan import MODES, ExecutionPlan, Mode, Path
 from mcpsim.planner import plan as plan_paths
 from mcpsim.report import (
@@ -62,6 +69,7 @@ from mcpsim.report import (
 )
 from mcpsim.report import exit_code as report_exit_code
 from mcpsim.scenario import MODEL_ROLES, Models, Observer, Scenario, load_scenario
+from mcpsim.scout import SCOUT_FILE, ScoutResult, scout, should_scout
 from mcpsim.transcript import EndEvent, SystemEvent, Transcript
 from mcpsim.verdict import Verdict
 
@@ -233,6 +241,45 @@ async def discover_catalog(scenario: Scenario) -> Catalog:
         return await session.catalog()
 
 
+def scout_observers(scenario: Scenario, *, dry_run: bool) -> ObserverRunner | None:
+    """The observer runner the scout uses: code and group observers only in dry run, every
+    observer (with its LLM) otherwise; ``None`` when no observer reports at ``scout``."""
+    if not any("scout" in o.on for o in scenario.observers):
+        return None
+    if dry_run:
+        return ObserverRunner(scenario, None, include_llm=False)
+    needs_llm = any("scout" in o.on for o in llm_observers(scenario))
+    return ObserverRunner(scenario, make_llm_for(scenario, "observer") if needs_llm else None)
+
+
+async def discover_and_scout(
+    scenario: Scenario, *, dry_run: bool
+) -> tuple[Catalog, ScoutResult | None]:
+    """One session: discover the catalog, apply the tool policy, scout (unless disclosure is
+    ``all``), and say what was disclosed."""
+    async with connect(scenario.server) as session:
+        catalog = allowed_catalog(scenario, await session.catalog())
+        if not should_scout(scenario):
+            return catalog, None
+        result = await _scout(scenario, catalog, session, dry_run=dry_run)
+    return catalog, result
+
+
+async def _scout(
+    scenario: Scenario, catalog: Catalog, session: Session, *, dry_run: bool
+) -> ScoutResult:
+    result = await scout(
+        scenario, catalog, session, observers=scout_observers(scenario, dry_run=dry_run)
+    )
+    _log(
+        f"{scenario.name}: scouted {len(result.observations)} observation(s) "
+        f"({result.tool_calls} tool call(s) of {result.budget}); "
+        f"{len(result.disclosed)} tool(s) disclosed, {len(result.on_request)} on request"
+        + (f"; {len(result.reports)} informant report(s)" if result.reports else "")
+    )
+    return result
+
+
 def allowed_catalog(scenario: Scenario, catalog: Catalog) -> Catalog:
     """The catalog after ``scenario.tools`` allow/deny globs, warning once per unmatched glob.
 
@@ -272,9 +319,15 @@ def allowed_catalog(scenario: Scenario, catalog: Catalog) -> Catalog:
     return allowed
 
 
-async def _plan(scenario: Scenario, catalog: Catalog, *, dry_run: bool) -> ExecutionPlan:
+async def _plan(
+    scenario: Scenario,
+    catalog: Catalog,
+    *,
+    dry_run: bool,
+    scout_result: ScoutResult | None = None,
+) -> ExecutionPlan:
     llm = None if dry_run else make_llm_for(scenario, "planner")
-    return await plan_paths(scenario, catalog, llm, dry_run=dry_run)
+    return await plan_paths(scenario, catalog, llm, scout=scout_result, dry_run=dry_run)
 
 
 def _write_scenario(scenario: Scenario, run_dir: FsPath) -> FsPath:
@@ -432,8 +485,8 @@ async def _run_scenario_async(
                 "(allowed by models.allow_same_judge)"
             )
 
-    catalog = allowed_catalog(scenario, await discover_catalog(scenario))
     if plan_path is not None:
+        catalog = allowed_catalog(scenario, await discover_catalog(scenario))
         plan = ExecutionPlan.load(FsPath(plan_path))
         if plan.scenario != scenario.name:
             _log(
@@ -447,7 +500,10 @@ async def _run_scenario_async(
                 "review the plan"
             )
     else:
-        plan = await _plan(scenario, catalog, dry_run=dry_run)
+        catalog, scout_result = await discover_and_scout(scenario, dry_run=dry_run)
+        plan = await _plan(scenario, catalog, dry_run=dry_run, scout_result=scout_result)
+        if scout_result is not None:
+            scout_result.save(run_dir / SCOUT_FILE)
     plan.save(run_dir / PLAN_FILE)
 
     cells = run_matrix(
@@ -507,13 +563,16 @@ def plan_scenario(
     )
     run_setup(scenario)
 
-    async def body() -> ExecutionPlan:
-        catalog = allowed_catalog(scenario, await discover_catalog(scenario))
-        return await _plan(scenario, catalog, dry_run=dry_run)
+    async def body() -> tuple[ExecutionPlan, ScoutResult | None]:
+        catalog, scout_result = await discover_and_scout(scenario, dry_run=dry_run)
+        plan = await _plan(scenario, catalog, dry_run=dry_run, scout_result=scout_result)
+        return plan, scout_result
 
-    plan = asyncio.run(body())
+    plan, scout_result = asyncio.run(body())
     run_dir = new_run_dir(out_dir, scenario.name)
     _write_scenario(scenario, run_dir)
+    if scout_result is not None:
+        scout_result.save(run_dir / SCOUT_FILE)
     return plan.save(run_dir / PLAN_FILE)
 
 

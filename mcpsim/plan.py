@@ -25,11 +25,15 @@ MODES: tuple[Mode, ...] = ("guided", "free")
 REFERENCE_KEY = "$from_step"
 
 # A checkpoint is ``<where>: <observable condition>`` with ``<where>`` one of ``final_result``,
-# ``tool_result[<tool>]`` or ``transcript`` (LOCAL_MODELS.md, "Checkpoints need a shape").
-CHECKPOINT_PATTERN = re.compile(r"^(final_result|tool_result\[[a-z_]+\]|transcript):\s*\S")
+# ``tool_result[<tool>]`` or ``transcript`` (LOCAL_MODELS.md, "Checkpoints need a shape"), or
+# ``report: <observer>.<condition> is true|false`` over an informant report (DESIGN §2b).
+CHECKPOINT_PATTERN = re.compile(
+    r"^(?:(final_result|tool_result\[[a-z_]+\]|transcript):\s*\S"
+    r"|report:\s*[a-z_][a-z0-9_]*\.[a-z_][a-z0-9_]*\s+is\s+(true|false)\s*$)"
+)
 CHECKPOINT_SHAPE = (
     "'<where>: <observable condition>' where <where> is final_result, "
-    "tool_result[<tool_name>] or transcript"
+    "tool_result[<tool_name>] or transcript, or 'report: <observer>.<condition> is true|false'"
 )
 
 

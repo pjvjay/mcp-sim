@@ -138,6 +138,19 @@ def matches_any(name: str, patterns: list[str]) -> bool:
     return any(fnmatchcase(name, p) for p in patterns)
 
 
+class ResourceContent(BaseModel):
+    """A normalised ``resources/read`` result: the joined text (binary parts noted, not
+    decoded), the mime type the server declared and the full length."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    uri: str
+    text: str = ""
+    mime_type: str | None = None
+    chars: int = 0
+    ms: float = 0.0
+
+
 class ToolResult(BaseModel):
     """A normalised ``tools/call`` result.
 
@@ -306,6 +319,34 @@ class Session:
             resources=resources,
             resource_templates=templates,
             prompts=prompts,
+        )
+
+    async def read_resource(
+        self, uri: str, *, text_limit: int = TEXT_LIMIT * 25
+    ) -> ResourceContent:
+        """Read a static resource; text parts are joined, blobs noted by size, never decoded.
+
+        ``text`` is truncated to ``text_limit`` characters (``chars`` has the full length).
+        Transport failures raise, like :meth:`call_tool`.
+        """
+        started = time.perf_counter()
+        result = await self._session.read_resource(uri)
+        ms = (time.perf_counter() - started) * 1000
+        parts: list[str] = []
+        mime_type: str | None = None
+        for item in getattr(result, "contents", []) or []:
+            if mime_type is None:
+                mime_type = getattr(item, "mime_type", None)
+            text = getattr(item, "text", None)
+            if isinstance(text, str):
+                parts.append(text)
+            else:
+                blob = getattr(item, "blob", None)
+                size = len(blob) if isinstance(blob, str | bytes) else 0
+                parts.append(f"[binary content omitted: {size} bytes base64]")
+        full = "\n".join(parts)
+        return ResourceContent(
+            uri=uri, text=full[:text_limit], mime_type=mime_type, chars=len(full), ms=round(ms, 3)
         )
 
     async def call_tool(self, name: str, arguments: dict[str, Any] | None = None) -> ToolResult:

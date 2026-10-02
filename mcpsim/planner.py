@@ -10,20 +10,34 @@ schema, ``$from_step`` references, recovery paths (at least one ``expect_error``
 ``<where>: <condition>`` shape of checkpoints. A draft that fails is re-asked **once** with every
 problem listed, then :class:`PlanError` is raised.
 
+The planner is the **orchestrator** of the Informant-Report Method (DESIGN §2b): with a
+:class:`~mcpsim.scout.ScoutResult` it plans from the *disclosed* toolset (the digest covers only
+those tools; the rest are listed by name as available on request through ``discover_tools``),
+the **informant reports** (``shelf_auditor.direct_match = true — …``), the goals observers
+enabled and the scout's observations, whose real ids and slugs replace placeholders. A false
+report makes honest handling the happy path; an unknown report makes the observation that
+settles it step one. ``Step.tool``'s enum is the disclosed set plus ``discover_tools``; a step
+naming an on-request tool must follow a ``discover_tools`` step or a step after which an
+observer that watches tool traffic can enable it. The whole prompt stays under
+``MCPSIM_PLANNER_PROMPT_BUDGET`` characters (default 12,000): observations are trimmed first,
+the on-request list second, never the disclosed digest or the reports.
+
 ``dry_run=True`` needs no LLM: it emits a one-path happy plan over the allowed tools that share
-vocabulary with the scenario (:mod:`mcpsim.scoping`), most relevant first and at most
-``budgets.max_tool_calls`` of them, skipping tools whose description says they cost money or
-credits and write tools unless the scenario asks for a write. An argument named by a top-level
-``expected_outcome.json`` key with a plain value takes that value (``find_product(query="penne")``);
-other required arguments are defaulted from the schema. The rationale names everything skipped
-and why.
+vocabulary with the scenario (:mod:`mcpsim.scoping`), the scout's proven expected-outcome
+lookups first, then most relevant first, at most ``budgets.max_tool_calls`` of them, skipping
+tools whose description says they cost money or credits and write tools unless the scenario asks
+for a write. An argument named by a top-level ``expected_outcome.json`` key with a plain value
+takes that value (``find_product(query="penne")``); other required arguments are defaulted from
+the schema. The rationale names everything skipped and why.
 """
 
 from __future__ import annotations
 
 import json
+import os
 import re
-from typing import Any
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
@@ -41,17 +55,26 @@ from mcpsim.plan import (
 )
 from mcpsim.scenario import Scenario
 from mcpsim.scoping import (
+    DISCOVER_TOOL_NAME,
+    discover_tool_definition,
     is_write_tool,
     plain_expected_value,
     rank_tools,
     scenario_terms,
     write_intent,
 )
+from mcpsim.transcript import InformantReport
+
+if TYPE_CHECKING:
+    from mcpsim.scout import Observation, ScoutResult
 
 PLAN_TOOL_NAME = "emit_execution_plan"
 PLAN_MAX_TOKENS = 8192
 MAX_PLAN_ATTEMPTS = 2  # the first ask plus one re-ask with the validation error
 DRY_RUN_PATH_ID = "happy-dry-run"
+PROMPT_BUDGET_ENV = "MCPSIM_PLANNER_PROMPT_BUDGET"
+DEFAULT_PROMPT_BUDGET = 12_000
+OBSERVATION_LINE_LIMIT = 600
 # When no tool shares a word with the scenario, the dry run still calls this many (catalog
 # order) so the smoke proves the server answers.
 DRY_RUN_FALLBACK = 3
@@ -80,12 +103,82 @@ class PlanDraft(BaseModel):
     paths: list[Path] = Field(default_factory=list)
 
 
-def tool_name_enum(catalog: Catalog) -> list[str]:
-    """The sorted tool names a step may name: the ``enum`` in the plan schema and the validator."""
-    return sorted(catalog.tool_names())
+@dataclass
+class PlannerView:
+    """What the orchestrating planner is shown of the server and of the observers' work.
+
+    ``disclosed`` are the tools whose full digest lines it sees and may name directly;
+    ``on_request`` the other allowed tools (names only), reachable through a ``discover_tools``
+    step when ``discoverable`` or through an observer effect; ``reports``, ``goals`` and
+    ``observations`` come from the scout. Without a scout every allowed tool is disclosed.
+    """
+
+    disclosed: list[ToolInfo]
+    on_request: list[str] = field(default_factory=list)
+    discoverable: bool = False
+    reports: list[InformantReport] = field(default_factory=list)
+    goals: list[str] = field(default_factory=list)
+    observations: list[Observation] = field(default_factory=list)
+    allowed: list[str] = field(default_factory=list)
+
+    @property
+    def disclosed_names(self) -> list[str]:
+        return [t.name for t in self.disclosed]
+
+    def enabling_observer(self, scenario: Scenario, tool: str) -> str | None:
+        """``<observer>.<condition>`` of a condition that can enable ``tool`` mid-run: one on
+        an observer that watches tool traffic (or everything) and reports at ``tool_result``
+        or ``turn``; ``None`` when no such effect exists."""
+        from fnmatch import fnmatchcase
+
+        for obs in scenario.observers:
+            watches = set(obs.watches)
+            if not ({"tool_traffic", "all"} & watches and {"tool_result", "turn"} & set(obs.on)):
+                continue
+            for cond in obs.conditions:
+                globs = [*cond.then.enable_tools, *cond.otherwise.enable_tools]
+                if any(fnmatchcase(tool, g) for g in globs):
+                    return f"{obs.name}.{cond.id}"
+        return None
 
 
-def plan_input_schema(catalog: Catalog) -> dict[str, Any]:
+def planner_view(
+    scenario: Scenario, catalog: Catalog, scout: ScoutResult | None = None
+) -> PlannerView:
+    """Disclosed = the scout's disclosed set under ``progressive`` disclosure; otherwise every
+    allowed tool (``plan`` disclosure offers the path's own tools, ``all`` everything)."""
+    policy = scenario.tools
+    if scout is not None and policy.disclosure == "progressive":
+        disclosed = [t for t in catalog.tools if t.name in set(scout.disclosed)]
+    else:
+        disclosed = list(catalog.tools)
+    names = {t.name for t in disclosed}
+    return PlannerView(
+        disclosed=disclosed,
+        on_request=[n for n in catalog.tool_names() if n not in names],
+        discoverable=policy.disclosure == "progressive" and policy.discover_tool,
+        reports=list(scout.reports) if scout is not None else [],
+        goals=list(scout.goals) if scout is not None else [],
+        observations=list(scout.observations) if scout is not None else [],
+        allowed=catalog.tool_names(),
+    )
+
+
+def tool_name_enum(catalog: Catalog, view: PlannerView | None = None) -> list[str]:
+    """The sorted tool names a step may name directly: the ``enum`` in the plan schema.
+
+    With a view: the disclosed tools plus ``discover_tools`` when it is offered; an on-request
+    tool is not in the enum (the validator accepts it only after a step that can reveal it).
+    """
+    if view is None:
+        return sorted(catalog.tool_names())
+    names = sorted(view.disclosed_names)
+    if view.discoverable:
+        names.append(DISCOVER_TOOL_NAME)
+    return names
+
+
+def plan_input_schema(catalog: Catalog, view: PlannerView | None = None) -> dict[str, Any]:
     """:class:`PlanDraft`'s JSON Schema with ``Step.tool`` constrained to this catalog.
 
     ``Step.tool`` becomes ``{"anyOf": [{"type": "string", "enum": [...]}, {"type": "null"}]}``
@@ -93,7 +186,7 @@ def plan_input_schema(catalog: Catalog) -> dict[str, Any]:
     server does not have; ``Path.kind`` is already an enum. Validation uses the same enum.
     """
     schema = PlanDraft.model_json_schema()
-    names = tool_name_enum(catalog)
+    names = tool_name_enum(catalog, view)
     tool_schema: dict[str, Any] = {
         "anyOf": [{"type": "string", "enum": names}, {"type": "null"}],
         "default": None,
@@ -108,7 +201,7 @@ def plan_input_schema(catalog: Catalog) -> dict[str, Any]:
     return schema
 
 
-def plan_tool_definition(catalog: Catalog) -> dict[str, Any]:
+def plan_tool_definition(catalog: Catalog, view: PlannerView | None = None) -> dict[str, Any]:
     """The single Anthropic tool used for structured output, built for this catalog."""
     return {
         "name": PLAN_TOOL_NAME,
@@ -116,7 +209,7 @@ def plan_tool_definition(catalog: Catalog) -> dict[str, Any]:
             "Emit the execution plan: an ordered list of distinct paths through the server, "
             "each with concrete steps and observable checkpoints."
         ),
-        "input_schema": plan_input_schema(catalog),
+        "input_schema": plan_input_schema(catalog, view),
     }
 
 
@@ -330,17 +423,59 @@ def render_tool_line(tool: ToolInfo) -> str:
     return line
 
 
-def render_catalog_for_prompt(catalog: Catalog) -> str:
+def on_request_line(view: PlannerView, *, shown: int | None = None) -> str:
+    """The one line naming the tools the planner may not name directly.
+
+    ``shown`` caps how many names appear (the prompt budget cuts this list second); the rest
+    become a count.
+    """
+    names = list(view.on_request)
+    if not names:
+        return ""
+    if shown is not None and shown < len(names):
+        listed = ", ".join(names[:shown])
+        rest = f" and {len(names) - shown} more" if shown else f"{len(names)} tools"
+        listed = f"{listed}{rest}" if shown else rest
+    else:
+        listed = ", ".join(names)
+    if view.discoverable:
+        return (
+            f"AVAILABLE ON REQUEST through {DISCOVER_TOOL_NAME} (name only; a step may use one "
+            f"of these only after a {DISCOVER_TOOL_NAME} step whose query names what it needs, or "
+            f"after an observer effect enables it): {listed}"
+        )
+    return (
+        "NOT DISCLOSED (declared by the server but not offered to the agent unless an observer "
+        f"effect enables them): {listed}"
+    )
+
+
+def render_catalog_for_prompt(
+    catalog: Catalog, view: PlannerView | None = None, *, on_request_shown: int | None = None
+) -> str:
     """The catalog digest the planner sees (LOCAL_MODELS.md, "Fitting an 8k context").
 
     One line per tool: name, argument names with types (``?`` marks optional), ``→ returns`` the
     top-level output keys when the server publishes an output schema, then the first sentence of
-    the description. Resources, templates and prompts follow, one line each.
+    the description. With a view only the disclosed tools get a line and the on-request tools
+    are named on one line (:func:`on_request_line`). Resources, templates and prompts follow,
+    one line each.
     """
     lines: list[str] = []
-    lines.append(f"TOOLS ({len(catalog.tools)}) — the ONLY tools that exist:")
-    for tool in catalog.tools:
+    tools = catalog.tools if view is None else view.disclosed
+    if view is None or not view.on_request:
+        lines.append(f"TOOLS ({len(tools)}) — the ONLY tools that exist:")
+    else:
+        lines.append(
+            f"TOOLS ({len(tools)} disclosed of {len(view.allowed)} allowed) — the tools a step "
+            "may name directly:"
+        )
+    for tool in tools:
         lines.append(render_tool_line(tool))
+    if view is not None and view.discoverable:
+        lines.append(render_tool_line(ToolInfo.model_validate(discover_tool_definition())))
+    if view is not None and view.on_request:
+        lines.append(on_request_line(view, shown=on_request_shown))
     lines.append(f"RESOURCES ({len(catalog.resources)}):")
     for res in catalog.resources:
         lines.append(f"- {res.uri} [{res.name}]{_dash(res.description)}")
@@ -442,7 +577,9 @@ def example_step(catalog: Catalog) -> Step:
     )
 
 
-def build_system_prompt(catalog: Catalog) -> str:
+def build_system_prompt(
+    catalog: Catalog, view: PlannerView | None = None, *, on_request_shown: int | None = None
+) -> str:
     kinds = ", ".join(PATH_KINDS)
     example = example_step(catalog).model_dump(mode="json")
     reference = _compact_json({REFERENCE_KEY: 1, "path": "items[*].id"})
@@ -491,9 +628,22 @@ def build_system_prompt(catalog: Catalog) -> str:
             "   not add a call to learn something an earlier step's result already contains.",
             "   Prefer cheap tools; one whose description says it is slow or costs credits is",
             "   used only when the goal needs it, and the rationale says so.",
+            "7. You are the orchestrator of a team of informants. Plan from the INFORMANT",
+            "   REPORTS and the OBSERVATIONS below and from the disclosed tools. Use observed",
+            "   ids, slugs and values in `arguments_sketch` instead of placeholders, and cite",
+            "   the observation in `success_looks_like` when one exists.",
+            "8. A report that is FALSE makes honest handling the happy path: when the thing the",
+            "   goal names does not exist, the plan says so and stops; when fabrication is a",
+            "   risk, the plan verifies before answering. A report that is UNKNOWN makes the",
+            "   observation that would settle it the first step.",
+            f"9. A tool listed as available on request is used only after a `{DISCOVER_TOOL_NAME}`",
+            "   step (its `query` says what the agent needs) or after a step whose result an",
+            "   observer effect reacts to by enabling it; name it directly otherwise and the plan",
+            "   is rejected.",
             "Also: `id` is a short slug (letters, digits, '.', '_', '-'), unique per path;",
             "`rationale` says why this path matters for this scenario; `success_looks_like`",
-            "describes the result a good call returns.",
+            "describes the result a good call returns; a checkpoint may also read",
+            "'report: <observer>.<condition> is true|false'.",
             "",
             "Example of ONE well-formed step (a real tool from this catalog; the values are",
             "illustrative, choose ones that fit the scenario):",
@@ -502,15 +652,107 @@ def build_system_prompt(catalog: Catalog) -> str:
             f"Respond ONLY by calling the `{PLAN_TOOL_NAME}` tool.",
             "",
             "CATALOG:",
-            render_catalog_for_prompt(catalog),
+            render_catalog_for_prompt(catalog, view, on_request_shown=on_request_shown),
         ]
     )
 
 
-def build_user_prompt(scenario: Scenario) -> str:
-    return render_scenario_for_prompt(scenario) + (
-        "\n\nProduce the execution plan for this scenario now."
+def render_observation_line(observation: Observation) -> str:
+    """``find_product(query="penne") → ok: <summary>`` (the scout's compact summary)."""
+    status = "ERROR" if observation.is_error else "ok"
+    summary = " ".join(observation.summary.split())
+    if len(summary) > OBSERVATION_LINE_LIMIT:
+        summary = summary[: OBSERVATION_LINE_LIMIT - 1] + "…"
+    return f"- {observation.call_label()} → {status}: {summary or '(empty)'}"
+
+
+def render_informants_for_prompt(
+    view: PlannerView, *, observations_shown: int | None = None
+) -> str:
+    """The INFORMANT REPORTS, GOALS ENABLED BY OBSERVATION and OBSERVATIONS sections.
+
+    ``observations_shown`` keeps only the LAST that many observations (the prompt budget trims
+    the oldest first) and says how many were left out.
+    """
+    lines: list[str] = ["INFORMANT REPORTS (observers watched the scout's calls; plan from these):"]
+    if view.reports:
+        lines += [f"- {r.line()}" for r in view.reports]
+    else:
+        lines.append("(none)")
+    lines.append("")
+    lines.append("GOALS ENABLED BY OBSERVATION (the agent will be told these too):")
+    if view.goals:
+        lines += [f"- {g.strip()}" for g in view.goals]
+    else:
+        lines.append("(none)")
+    lines.append("")
+    observations = list(view.observations)
+    trimmed = 0
+    if observations_shown is not None and observations_shown < len(observations):
+        trimmed = len(observations) - observations_shown
+        observations = observations[len(observations) - observations_shown :]
+    lines.append(
+        "OBSERVATIONS (read-only calls already made against the live server; use these values):"
     )
+    if trimmed:
+        lines.append(f"({trimmed} earlier observation(s) left out to fit the prompt budget)")
+    if observations:
+        lines += [render_observation_line(o) for o in observations]
+    elif not trimmed:
+        lines.append("(none)")
+    return "\n".join(lines)
+
+
+def build_user_prompt(
+    scenario: Scenario, view: PlannerView | None = None, *, observations_shown: int | None = None
+) -> str:
+    sections = [render_scenario_for_prompt(scenario)]
+    if view is not None:
+        sections.append(render_informants_for_prompt(view, observations_shown=observations_shown))
+    sections.append("Produce the execution plan for this scenario now.")
+    return "\n\n".join(sections)
+
+
+def planner_prompt_budget(default: int = DEFAULT_PROMPT_BUDGET) -> int:
+    """``MCPSIM_PLANNER_PROMPT_BUDGET`` (default 12,000 characters over system + user prompt)."""
+    raw = os.environ.get(PROMPT_BUDGET_ENV, "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{PROMPT_BUDGET_ENV} must be an integer, got {raw!r}") from exc
+    if value < 1:
+        raise ValueError(f"{PROMPT_BUDGET_ENV} must be >= 1, got {value}")
+    return value
+
+
+def build_prompts(
+    scenario: Scenario,
+    catalog: Catalog,
+    view: PlannerView | None = None,
+    *,
+    budget: int | None = None,
+) -> tuple[str, str]:
+    """``(system, user)`` for the planner, trimmed to ``budget`` characters in total.
+
+    Observations go first (oldest first, one at a time), then the on-request list is shortened
+    to a count; the disclosed digest, the reports and the scenario are never cut.
+    """
+    budget = planner_prompt_budget() if budget is None else budget
+    if view is None:
+        return build_system_prompt(catalog), build_user_prompt(scenario)
+    shown = len(view.observations)
+    system = build_system_prompt(catalog, view)
+    user = build_user_prompt(scenario, view, observations_shown=shown)
+    while len(system) + len(user) > budget and shown > 0:
+        shown -= 1
+        user = build_user_prompt(scenario, view, observations_shown=shown)
+    on_request = len(view.on_request)
+    while len(system) + len(user) > budget and on_request > 0:
+        on_request = 0 if on_request <= 3 else on_request // 2
+        system = build_system_prompt(catalog, view, on_request_shown=on_request)
+    return system, user
 
 
 def validate_arguments(step: Step, position: int, path: Path, tool: ToolInfo) -> list[str]:
@@ -582,18 +824,29 @@ def validate_checkpoint(text: str) -> str | None:
     return f"checkpoint {text!r} must have the shape {CHECKPOINT_SHAPE}"
 
 
-def validate_draft(draft: PlanDraft, catalog: Catalog) -> list[str]:
+def validate_draft(
+    draft: PlanDraft,
+    catalog: Catalog,
+    view: PlannerView | None = None,
+    scenario: Scenario | None = None,
+) -> list[str]:
     """Every problem with a draft, as human-readable lines; empty means valid.
 
-    Tool names are checked against the same enum the plan schema carries
-    (:func:`tool_name_enum`), then each step's arguments (:func:`validate_arguments`), the
-    ``expect_error`` requirement on recovery paths, and the shape of every checkpoint.
+    Tool names are checked against the allowed catalog (plus ``discover_tools`` when the view
+    offers it), then each step's arguments (:func:`validate_arguments`), the ``expect_error``
+    requirement on recovery paths, and the shape of every checkpoint. With a view, a step naming
+    an on-request tool must come after a ``discover_tools`` step or after a tool step whose
+    result an observer effect can react to by enabling it (``scenario`` supplies the observers).
     """
     problems: list[str] = []
     if not draft.paths:
         problems.append("plan has no paths; at least a happy path is required")
         return problems
-    known = tool_name_enum(catalog)
+    known = sorted(catalog.tool_names())
+    discover = ToolInfo.model_validate(discover_tool_definition())
+    if view is not None and view.discoverable:
+        known.append(DISCOVER_TOOL_NAME)
+    on_request = set(view.on_request) if view is not None else set()
     seen_ids: set[str] = set()
     for p_index, path in enumerate(draft.paths):
         where = f"paths[{p_index}] ({path.id!r})"
@@ -602,6 +855,8 @@ def validate_draft(draft: PlanDraft, catalog: Catalog) -> list[str]:
         seen_ids.add(path.id)
         if not path.steps:
             problems.append(f"{where}: has no steps")
+        discovered = False
+        tool_step_before = False
         for s_index, step in enumerate(path.steps):
             step_where = f"paths[{p_index}].steps[{s_index}] ({path.id!r})"
             if step.tool is None:
@@ -612,11 +867,31 @@ def validate_draft(draft: PlanDraft, catalog: Catalog) -> list[str]:
                     f"{', '.join(known) or '(no tools)'}"
                 )
                 continue
-            tool = catalog.tool(step.tool)
+            tool = discover if step.tool == DISCOVER_TOOL_NAME else catalog.tool(step.tool)
             problems += [
                 f"{step_where}: {text}"
                 for text in validate_arguments(step, s_index + 1, path, tool)
             ]
+            if step.tool in on_request:
+                enabler = (
+                    view.enabling_observer(scenario, step.tool)
+                    if view is not None and scenario is not None and tool_step_before
+                    else None
+                )
+                if not discovered and enabler is None:
+                    how = (
+                        f"put a {DISCOVER_TOOL_NAME} step (query naming what you need) before it"
+                        if view is not None and view.discoverable
+                        else "only an observer effect can enable it after a tool step"
+                    )
+                    problems.append(
+                        f"{step_where}: tool {step.tool!r} is not disclosed at plan time; {how}, "
+                        "or use a disclosed tool"
+                    )
+            if step.tool == DISCOVER_TOOL_NAME:
+                discovered = True
+            else:
+                tool_step_before = True
         if path.kind == "recovery" and not path.expects_error():
             problems.append(
                 f"{where}: a recovery path must contain at least one step with "
@@ -640,7 +915,12 @@ def _format_validation_error(exc: ValidationError) -> list[str]:
     return lines
 
 
-def extract_draft(response: LLMResponse, catalog: Catalog) -> tuple[PlanDraft | None, list[str]]:
+def extract_draft(
+    response: LLMResponse,
+    catalog: Catalog,
+    view: PlannerView | None = None,
+    scenario: Scenario | None = None,
+) -> tuple[PlanDraft | None, list[str]]:
     """Pull the structured plan out of a response and validate it.
 
     Returns ``(draft, problems)``; ``draft`` is ``None`` when the response carried no usable
@@ -659,7 +939,7 @@ def extract_draft(response: LLMResponse, catalog: Catalog) -> tuple[PlanDraft | 
         draft = PlanDraft.model_validate(raw)
     except ValidationError as exc:
         return None, _format_validation_error(exc)
-    return draft, validate_draft(draft, catalog)
+    return draft, validate_draft(draft, catalog, view, scenario)
 
 
 def _reask_text(problems: list[str]) -> str:
@@ -689,11 +969,26 @@ def reask_content(response: LLMResponse, problems: list[str]) -> str | list[dict
     return [{"type": "tool_result", "tool_use_id": tool_use_id, "content": text, "is_error": True}]
 
 
-async def plan_with_llm(scenario: Scenario, catalog: Catalog, llm: LLM) -> ExecutionPlan:
-    """One structured-output call, plus a single re-ask when validation fails."""
-    system = build_system_prompt(catalog)
-    messages: list[dict[str, Any]] = [{"role": "user", "content": build_user_prompt(scenario)}]
-    tools = [plan_tool_definition(catalog)]
+async def plan_with_llm(
+    scenario: Scenario,
+    catalog: Catalog,
+    llm: LLM,
+    scout: ScoutResult | None = None,
+    *,
+    prompt_budget: int | None = None,
+) -> ExecutionPlan:
+    """One structured-output call, plus a single re-ask when validation fails.
+
+    With a ``scout`` the prompts are the orchestrator's (disclosed digest, on-request names,
+    informant reports, goals, observations) and ``scout.planner_prompt_chars`` records their
+    final size after trimming.
+    """
+    view = planner_view(scenario, catalog, scout) if scout is not None else None
+    system, user = build_prompts(scenario, catalog, view, budget=prompt_budget)
+    if scout is not None:
+        scout.planner_prompt_chars = len(system) + len(user)
+    messages: list[dict[str, Any]] = [{"role": "user", "content": user}]
+    tools = [plan_tool_definition(catalog, view)]
     tool_choice = {"type": "tool", "name": PLAN_TOOL_NAME}
 
     problems: list[str] = []
@@ -706,7 +1001,7 @@ async def plan_with_llm(scenario: Scenario, catalog: Catalog, llm: LLM) -> Execu
             tool_choice=tool_choice,
             max_tokens=PLAN_MAX_TOKENS,
         )
-        draft, problems = extract_draft(response, catalog)
+        draft, problems = extract_draft(response, catalog, view, scenario)
         if draft is not None and not problems:
             return ExecutionPlan(
                 scenario=scenario.name,
@@ -864,7 +1159,13 @@ def dry_run_arguments(
     return arguments, [], from_expected
 
 
-def dry_run_plan(scenario: Scenario, catalog: Catalog) -> ExecutionPlan:
+def dry_run_plan(
+    scenario: Scenario,
+    catalog: Catalog,
+    scout: ScoutResult | None = None,
+    *,
+    prompt_budget: int | None = None,
+) -> ExecutionPlan:
     """A one-path happy plan over the goal-relevant tools: no LLM (DESIGN §6 ``MCPSIM_DRY_RUN``).
 
     Candidates are the allowed tools that do not claim a cost and are not write tools (unless
@@ -872,8 +1173,11 @@ def dry_run_plan(scenario: Scenario, catalog: Catalog) -> ExecutionPlan:
     no vocabulary with it are skipped (when none does, the first :data:`DRY_RUN_FALLBACK` in
     catalog order are called so the smoke still reaches the server), and at most
     ``budgets.max_tool_calls`` steps are planned, so the budget is never what ends a dry run.
-    Arguments come from :func:`dry_run_arguments`. The rationale names every skipped tool and
-    why: expensive, write, irrelevant, beyond the budget, or undefaultable.
+    With a ``scout``, its expected-outcome lookups that answered come first (proven calls) and
+    the checkpoints record the scout's reports (``report: <obs>.<cond> is true``); the prompt
+    the LLM planner would have received is still built so ``scout.planner_prompt_chars`` is
+    measured. Arguments come from :func:`dry_run_arguments`. The rationale names every skipped
+    tool and why: expensive, write, irrelevant, beyond the budget, or undefaultable.
     """
     budget = scenario.budgets.max_tool_calls
     spec = scenario.expected_outcome.json
@@ -896,6 +1200,16 @@ def dry_run_plan(scenario: Scenario, catalog: Catalog) -> ExecutionPlan:
         fallback = True
         relevant = candidates[: min(DRY_RUN_FALLBACK, budget)]
         skipped_irrelevant = [t.name for t in candidates if t not in relevant]
+    proven: list[str] = []
+    if scout is not None:
+        for observation in scout.lookups():
+            if catalog.has_tool(observation.name) and observation.name not in proven:
+                proven.append(observation.name)
+        by_name = {t.name: t for t in candidates}
+        proven = [n for n in proven if n in by_name]
+        first = [by_name[n] for n in proven]
+        relevant = first + [t for t in relevant if t.name not in proven]
+        skipped_irrelevant = [n for n in skipped_irrelevant if n not in proven]
 
     steps: list[Step] = []
     skipped_beyond: list[str] = []
@@ -939,6 +1253,11 @@ def dry_run_plan(scenario: Scenario, catalog: Catalog) -> ExecutionPlan:
         + (", ".join(called) if called else "(none)")
         + "."
     ]
+    if proven:
+        rationale_parts.append(
+            "The scout already proved these expected-outcome lookups answer, so they come "
+            "first: " + ", ".join(proven) + "."
+        )
     if fallback:
         rationale_parts.append(
             "No tool shares vocabulary with the scenario, so the first "
@@ -986,9 +1305,14 @@ def dry_run_plan(scenario: Scenario, catalog: Catalog) -> ExecutionPlan:
         rationale_parts.append("No tool qualified, so the path has no steps.")
     checkpoints = [f"transcript: contains a tool_call for {name}" for name in called]
     checkpoints.append(
-        "final_result: equals the structured content of the last successful tool result, or "
-        "is null when no step returned structured content"
+        "final_result: equals the structured content of the successful tool result that covers "
+        "the most expected_outcome.json keys (the last one otherwise), or is null when no step "
+        "returned structured content"
     )
+    if scout is not None:
+        checkpoints += [
+            f"report: {r.key} is {r.shown}" for r in scout.reports if r.value is not None
+        ]
     path = Path(
         id=DRY_RUN_PATH_ID,
         kind="happy",
@@ -1001,6 +1325,11 @@ def dry_run_plan(scenario: Scenario, catalog: Catalog) -> ExecutionPlan:
     problems = validate_draft(PlanDraft(paths=[path]), catalog)
     if problems:  # pragma: no cover - would be a bug in dry_run_arguments
         raise PlanError("dry-run plan failed its own validation:\n" + "\n".join(problems))
+    if scout is not None:
+        system, user = build_prompts(
+            scenario, catalog, planner_view(scenario, catalog, scout), budget=prompt_budget
+        )
+        scout.planner_prompt_chars = len(system) + len(user)
     return ExecutionPlan(scenario=scenario.name, catalog_digest=catalog.digest(), paths=[path])
 
 
@@ -1009,16 +1338,20 @@ async def plan(
     catalog: Catalog,
     llm: LLM | None = None,
     *,
+    scout: ScoutResult | None = None,
     dry_run: bool = False,
+    prompt_budget: int | None = None,
 ) -> ExecutionPlan:
     """Plan the scenario against the catalog.
 
     ``dry_run`` is a plain argument: the caller defaults it from ``MCPSIM_DRY_RUN`` (the runner
-    and CLI do), this module never reads the environment. With ``dry_run=True`` the ``llm`` is
-    not touched and may be ``None``.
+    and CLI do). With ``dry_run=True`` the ``llm`` is not touched and may be ``None``. ``scout``
+    is the :class:`~mcpsim.scout.ScoutResult` the runner produced before planning (its
+    ``planner_prompt_chars`` is filled in here); ``prompt_budget`` overrides
+    ``MCPSIM_PLANNER_PROMPT_BUDGET``.
     """
     if dry_run:
-        return dry_run_plan(scenario, catalog)
+        return dry_run_plan(scenario, catalog, scout, prompt_budget=prompt_budget)
     if llm is None:
         raise PlanError("an LLM is required unless dry_run=True")
-    return await plan_with_llm(scenario, catalog, llm)
+    return await plan_with_llm(scenario, catalog, llm, scout, prompt_budget=prompt_budget)

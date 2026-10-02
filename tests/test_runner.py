@@ -25,6 +25,7 @@ from mcpsim.plan import ExecutionPlan, Path, Step
 from mcpsim.planner import DRY_RUN_PATH_ID
 from mcpsim.report import Report, SuiteReport
 from mcpsim.scenario import Scenario, ServerSpec, parse_scenario
+from mcpsim.scout import ScoutResult
 from mcpsim.transcript import (
     AssistantEvent,
     EndEvent,
@@ -346,6 +347,73 @@ async def _fake_catalog() -> Any:
 
     async with open_session() as session:
         return await session.catalog()
+
+
+# --- scout: read-only observations before planning, saved beside the plan --------------------
+
+
+def test_progressive_scenario_is_scouted_and_scout_json_feeds_the_plan(
+    tmp_path: FsPath,
+    quick_data: dict[str, Any],
+    out_dir: FsPath,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    quick_data["tools"] = {"disclosure": "progressive", "initial": ["lookup", "fail"]}
+    quick_data["observers"] = [
+        {
+            "name": "shelf_auditor",
+            "identity": "An independent auditor.",
+            "kind": "code",
+            "watches": ["scout"],
+            "on": ["scout"],
+            "conditions": [
+                {
+                    "id": "direct_match",
+                    "when": "lookup returned penne",
+                    "check": {"tool_result": {"tool": "lookup", "where": {"slug": "penne"}}},
+                    "then": {"enable_tools": ["echo"]},
+                }
+            ],
+        }
+    ]
+    path = tmp_path / "scouted.yaml"
+    path.write_text(yaml.safe_dump(quick_data, sort_keys=False), encoding="utf-8")
+
+    plan_path = runner.plan_scenario(path, out_dir, dry_run=True)
+    scout = ScoutResult.load(plan_path.parent / "scout.json")
+    assert [o.call_label() for o in scout.observations] == [
+        "fake://about",
+        'lookup(slug="penne")',
+        "fail()",
+    ]
+    assert scout.disclosed == ["lookup", "fail", "echo"]
+    assert scout.on_request == ["list_items", "expensive_report"]
+    assert [(r.key, r.value) for r in scout.reports] == [("shelf_auditor.direct_match", True)]
+    assert scout.planner_prompt_chars > 1000
+    plan = ExecutionPlan.load(plan_path)
+    assert plan.paths[0].steps[0].arguments_sketch == {"slug": "penne"}
+    assert plan.paths[0].checkpoints[-1] == "report: shelf_auditor.direct_match is true"
+    err = capsys.readouterr().err
+    assert (
+        "fake-lookup: scouted 3 observation(s) (2 tool call(s) of 10); 3 tool(s) disclosed, "
+        "2 on request; 1 informant report(s)"
+    ) in err
+
+    run_dir = runner.run_scenario(path, out_dir, dry_run=True, repeat=1, mode="guided")
+    assert (run_dir / "scout.json").is_file()
+    assert ScoutResult.load(run_dir / "scout.json").disclosed == scout.disclosed
+
+    reused = runner.run_scenario(
+        path, out_dir, plan_path=plan_path, dry_run=True, repeat=1, mode="guided"
+    )
+    assert not (reused / "scout.json").exists(), "a reused plan skips the scout"
+
+
+def test_all_disclosure_is_not_scouted(quick_path: FsPath, out_dir: FsPath) -> None:
+    plan_path = runner.plan_scenario(quick_path, out_dir, dry_run=True)
+    assert not (plan_path.parent / "scout.json").exists()
+    run_dir = runner.run_scenario(quick_path, out_dir, dry_run=True, repeat=1, mode="guided")
+    assert not (run_dir / "scout.json").exists()
 
 
 # --- observers: the runner wires them into every run and warns about dead globs --------------
