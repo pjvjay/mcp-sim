@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib
 import json
 from pathlib import Path
 from typing import Any
@@ -7,7 +8,7 @@ from typing import Any
 import pytest
 import yaml
 
-from mcpsim.cli import EXIT_FAILURE, EXIT_OK, EXIT_USAGE, build_parser, main, render_catalog
+from mcpsim.cli import EXIT_FAILURE, EXIT_OK, RUNNER_MODULE, build_parser, main, render_catalog
 from mcpsim.mcpclient import Catalog, PromptInfo, ResourceInfo, ResourceTemplateInfo, ToolInfo
 from tests.fake_server import SERVER_NAME, TOOL_NAMES
 
@@ -58,19 +59,66 @@ def test_catalog_missing_bearer_env(
     assert "MCPSIM_TEST_TOKEN is not set" in capsys.readouterr().err
 
 
+def test_runner_is_wired() -> None:
+    """``mcpsim.runner`` exists and exposes the five functions the CLI docstring promises."""
+    runner = importlib.import_module(RUNNER_MODULE)
+    for name in ("plan_scenario", "run_scenario", "judge_run_dir", "report_run_dir", "run_suite"):
+        assert callable(getattr(runner, name)), name
+
+
 @pytest.mark.parametrize(
-    "argv",
+    ("argv", "expected"),
     [
-        ["plan", "s.yaml"],
-        ["run", "s.yaml", "--only-path", "happy", "--mode", "free", "--repeat", "1"],
-        ["judge", "runs/x"],
-        ["report", "runs/x"],
-        ["suite", "scenarios", "--threshold", "0.8"],
+        (["plan", "missing.yaml"], "cannot read scenario"),
+        (
+            ["run", "missing.yaml", "--only-path", "happy", "--mode", "free", "--repeat", "1"],
+            "cannot read scenario",
+        ),
+        (["judge", "runs/x"], "no scenario.json"),
+        (["report", "runs/x"], "no scenario.json"),
+        (["suite", "scenarios", "--threshold", "0.8"], "scenario directory not found"),
     ],
 )
-def test_unwired_subcommands_exit_2(argv: list[str], capsys: pytest.CaptureFixture[str]) -> None:
-    assert main(argv) == EXIT_USAGE
-    assert f"mcpsim {argv[0]}: not yet wired" in capsys.readouterr().err
+def test_bad_paths_exit_1_through_the_real_runner(
+    argv: list[str],
+    expected: str,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("MCPSIM_DEBUG", raising=False)
+    assert main(argv) == EXIT_FAILURE
+    err = capsys.readouterr().err
+    assert err.startswith(f"mcpsim {argv[0]}: ") and expected in err
+    assert "not yet wired" not in err
+
+
+def test_dry_run_through_the_cli(
+    scenario_path: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    out = tmp_path / "runs"
+    code = main(
+        [
+            "run",
+            str(scenario_path),
+            "--out",
+            str(out),
+            "--dry-run",
+            "--repeat",
+            "1",
+            "--mode",
+            "guided",
+        ]
+    )
+    captured = capsys.readouterr().out
+    assert code == EXIT_FAILURE  # the matcher fails in dry run; the artefacts are the point
+    assert "run dir: " in captured and "0/1 runs passed (0.0%)" in captured
+    run_dir = Path(captured.split("run dir: ", 1)[1].splitlines()[0])
+    assert (run_dir / "report.md").is_file()
+    assert main(["report", str(run_dir), "--threshold", "0"]) == EXIT_OK
+    assert main(["judge", str(run_dir), "--threshold", "0"]) == EXIT_OK
+    assert "judged 1 transcript(s)" in capsys.readouterr().out
 
 
 def test_no_subcommand_is_a_usage_error() -> None:
