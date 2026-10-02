@@ -257,6 +257,26 @@ Defaults: agent `claude-sonnet-5-5`, planner and judge `claude-opus-5-5`. Also a
 in/out: sonnet-5-5 3/15, opus-5-5 15/75, fable-5-1 15/75, haiku-4-5 1/5). Budgets end a run
 with outcome `budget_exceeded` (a failed run with a reason, never a crash).
 
+## Local models
+
+Every `models` entry is `provider:model`; a bare name means `anthropic`. With `ollama:<model>`
+the planner, the agent, the simulated user and (with `allow_same_judge`) the judge run on a
+local [Ollama](https://ollama.com) server at `OLLAMA_HOST` (default `http://localhost:11434`)
+with zero API spend and no key. `--models` overrides a scenario's `models` block for one run, so
+scenario files stay provider-neutral:
+
+```bash
+mcpsim plan scenarios/pantry/tomato-penne-boycott.yaml --models planner=ollama:command-r7b
+mcpsim run  scenarios/pantry/cheapest-penne.yaml \
+  --models agent=ollama:command-r7b,user=ollama:llama3.2:3b,judge=ollama:qwen2.5:7b \
+  --allow-same-judge --repeat 1
+```
+
+A 404 from Ollama names the `ollama pull <model>` to run; the report's cost line says the local
+calls cost 0. How the protocol maps onto `/api/chat`, how an 8k context is respected, what to
+expect from a 7–8B model and the smoke sequence are in
+[docs/LOCAL_MODELS.md](docs/LOCAL_MODELS.md).
+
 ## Development
 
 ```bash

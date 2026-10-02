@@ -405,9 +405,7 @@ async def run_path(
         raise ValueError("run_path needs an llm unless dry_run=True")
     run = _Run(scenario, path, mode, index)
     agent_model = DRY_RUN_MODEL if dry_run else scenario.models.agent
-    user_model = DRY_RUN_MODEL if dry_run else str(
-        getattr(scenario.models, "user", scenario.models.agent)
-    )
+    user_model = DRY_RUN_MODEL if dry_run else scenario.models.user_model
     agent_system = build_agent_system_prompt(scenario, path, mode)
     user_system = build_user_system_prompt(scenario)
     run.transcript.add(

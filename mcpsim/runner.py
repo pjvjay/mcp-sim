@@ -16,8 +16,13 @@ HTTP shares the URL). A stdio ``setup`` command runs once per ``run_scenario`` (
 Dry run (``dry_run=True``): :func:`mcpsim.planner.plan` with ``dry_run=True``,
 :func:`mcpsim.agent.run_path` with ``dry_run=True`` and the matcher-only
 :func:`mcpsim.judge.judge_deterministic`; no LLM is constructed. Otherwise every LLM comes from
-:func:`make_llm_for` — the single place a provider is chosen, so a provider factory can replace
-it without touching the orchestration.
+:func:`make_llm_for`, which reads ``scenario.models.<role>`` (``provider:model``, see
+docs/LOCAL_MODELS.md) and asks :func:`mcpsim.llm.make_llm` for that provider's cached client.
+
+``model_overrides`` / ``allow_same_judge`` (the CLI's ``--models`` and ``--allow-same-judge``)
+are applied with :func:`apply_model_overrides` right after the scenario is loaded, so scenario
+files stay provider-neutral and the ``scenario.json`` written to the run directory records the
+models that actually ran.
 """
 
 from __future__ import annotations
@@ -27,14 +32,22 @@ import os
 import shlex
 import subprocess
 import sys
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from datetime import UTC, datetime
 from pathlib import Path as FsPath
 from typing import Literal
 
 from mcpsim.agent import DRY_RUN_MODEL, run_path
 from mcpsim.judge import check_judge_model, judge, judge_deterministic
-from mcpsim.llm import LLM, AnthropicLLM
+from mcpsim.llm import (
+    API_KEY_ENV,
+    LLM,
+    LOCAL_COST_NOTE,
+    RoutingLLM,
+    is_local_model,
+    make_llm,
+    parse_model_spec,
+)
 from mcpsim.mcpclient import Catalog, connect
 from mcpsim.plan import MODES, ExecutionPlan, Mode, Path
 from mcpsim.planner import plan as plan_paths
@@ -48,11 +61,11 @@ from mcpsim.report import (
     summary_line,
 )
 from mcpsim.report import exit_code as report_exit_code
-from mcpsim.scenario import Scenario, load_scenario
+from mcpsim.scenario import MODEL_ROLES, Models, Scenario, load_scenario
 from mcpsim.transcript import EndEvent, SystemEvent, Transcript
 from mcpsim.verdict import Verdict
 
-Role = Literal["planner", "agent", "judge"]
+Role = Literal["planner", "agent", "judge", "user"]
 
 SCENARIO_FILE = "scenario.json"
 PLAN_FILE = "plan.json"
@@ -63,26 +76,66 @@ REPORT_MD = "report.md"
 SUITE_JSON = "suite.json"
 SUITE_MD = "suite.md"
 SCENARIO_SUFFIXES = (".yaml", ".yml", ".json")
-API_KEY_ENV = "ANTHROPIC_API_KEY"
 SETUP_TIMEOUT_S = 600
+
+__all__ = ["API_KEY_ENV"]  # re-exported for callers that check the key through the runner
 
 
 # --- LLM construction -------------------------------------------------------------------------
 
 
 def make_llm_for(scenario: Scenario, role: Role) -> LLM:
-    """The one place an LLM client is built for a role (planner / agent / judge).
+    """The one place an LLM client is built for a role (planner / agent / judge / user).
 
-    Today every role is served by :class:`~mcpsim.llm.AnthropicLLM`; a provider factory keyed
-    on ``scenario.models.<role>`` (``provider:model``, see docs/LOCAL_MODELS.md) is meant to
-    replace this function and nothing else in the runner.
+    The provider comes from ``scenario.models.<role>`` (``provider:model``; a bare name is an
+    Anthropic model) and :func:`mcpsim.llm.make_llm` returns that provider's cached client. The
+    ``agent`` client also serves the simulated user (``agent.run_path`` takes one ``llm``), so
+    when the user's provider differs from the agent's a :class:`~mcpsim.llm.RoutingLLM` is
+    returned that picks the provider per call.
     """
-    if not os.environ.get(API_KEY_ENV):
-        raise RuntimeError(
-            f"{API_KEY_ENV} is not set; export it for a real run or use --dry-run "
-            f"(MCPSIM_DRY_RUN=1) for the no-LLM smoke mode (needed for the {role})"
+    provider, _ = parse_model_spec(scenario.models.for_role(role))
+    if role == "agent":
+        user_provider, _ = parse_model_spec(scenario.models.user_model)
+        if user_provider != provider:
+            # Build both now so a missing key or unknown provider fails before any run.
+            make_llm(provider, purpose="agent")
+            make_llm(user_provider, purpose="simulated user")
+            return RoutingLLM()
+    return make_llm(provider, purpose=role)
+
+
+def apply_model_overrides(
+    scenario: Scenario,
+    overrides: Mapping[str, str] | None = None,
+    *,
+    allow_same_judge: bool = False,
+) -> Scenario:
+    """``--models`` / ``--allow-same-judge`` applied to a loaded scenario (a validated copy).
+
+    ``overrides`` maps a role (``planner`` / ``agent`` / ``judge`` / ``user``) to a model spec;
+    ``allow_same_judge=True`` sets ``models.allow_same_judge`` (it never resets a scenario's own
+    ``true``). Unknown roles raise ``ValueError``.
+    """
+    overrides = dict(overrides or {})
+    if not overrides and not allow_same_judge:
+        return scenario
+    unknown = sorted(set(overrides) - set(MODEL_ROLES))
+    if unknown:
+        raise ValueError(
+            f"unknown model role(s) {', '.join(unknown)}; expected one of {', '.join(MODEL_ROLES)}"
         )
-    return AnthropicLLM()
+    for spec in overrides.values():
+        parse_model_spec(spec)  # raises ValueError for an empty name
+    data = {**scenario.models.model_dump(), **overrides}
+    if allow_same_judge:
+        data["allow_same_judge"] = True
+    models = Models.model_validate(data)
+    return scenario.model_copy(update={"models": models})
+
+
+def uses_local_models(scenario: Scenario) -> bool:
+    """True when any role (including the simulated user) runs on a local provider."""
+    return any(is_local_model(scenario.models.for_role(role)) for role in MODEL_ROLES)
 
 
 # --- paths and timestamps ---------------------------------------------------------------------
@@ -282,11 +335,13 @@ def _is_dry_run_transcript(transcript: Transcript) -> bool:
 
 def _write_report(
     run_dir: FsPath,
-    scenario_name: str,
+    scenario: Scenario,
     verdicts: Iterable[Verdict],
     transcripts: Iterable[Transcript],
 ) -> tuple[FsPath, FsPath]:
-    report = aggregate(list(verdicts), list(transcripts), scenario=scenario_name, run_dir=run_dir)
+    report = aggregate(list(verdicts), list(transcripts), scenario=scenario.name, run_dir=run_dir)
+    if uses_local_models(scenario):
+        report.cost_note = f"{LOCAL_COST_NOTE}; hosted calls, if any, are an {report.cost_note}"
     json_path = report.save(run_dir / REPORT_JSON)
     md_path = run_dir / REPORT_MD
     md_path.write_text(render_markdown(report), encoding="utf-8")
@@ -354,7 +409,7 @@ async def _run_scenario_async(
     results = await asyncio.gather(*(cell(p, m, i) for p, m, i in cells))
     transcripts = [t for t, _ in results]
     verdicts = [v for _, v in results]
-    _write_report(run_dir, scenario.name, verdicts, transcripts)
+    _write_report(run_dir, scenario, verdicts, transcripts)
     return run_dir
 
 
@@ -366,9 +421,13 @@ def plan_scenario(
     out_dir: str | os.PathLike[str],
     *,
     dry_run: bool = False,
+    model_overrides: Mapping[str, str] | None = None,
+    allow_same_judge: bool = False,
 ) -> FsPath:
     """Load, discover, plan; write ``<out_dir>/<scenario.name>/<timestamp>/plan.json``."""
-    scenario = load_scenario(FsPath(scenario_path))
+    scenario = apply_model_overrides(
+        load_scenario(FsPath(scenario_path)), model_overrides, allow_same_judge=allow_same_judge
+    )
     run_setup(scenario)
 
     async def body() -> ExecutionPlan:
@@ -390,9 +449,13 @@ def run_scenario(
     repeat: int | None = None,
     mode: Mode | None = None,
     dry_run: bool = False,
+    model_overrides: Mapping[str, str] | None = None,
+    allow_same_judge: bool = False,
 ) -> FsPath:
     """``plan -> runs -> judge -> report``; returns the run directory (see the module docstring)."""
-    scenario = load_scenario(FsPath(scenario_path))
+    scenario = apply_model_overrides(
+        load_scenario(FsPath(scenario_path)), model_overrides, allow_same_judge=allow_same_judge
+    )
     if repeat is not None and repeat < 1:
         raise ValueError(f"repeat must be >= 1, got {repeat}")
     if plan_path is not None and not FsPath(plan_path).is_file():
@@ -463,7 +526,7 @@ def judge_run_dir(
         v.save(folder / VERDICTS_DIR / f"{t.stem}.json")
         for t, v in zip(transcripts, verdicts, strict=True)
     ]
-    _write_report(folder, scenario.name, verdicts, transcripts)
+    _write_report(folder, scenario, verdicts, transcripts)
     return written
 
 
@@ -475,7 +538,7 @@ def report_run_dir(
     scenario = _load_scenario_json(folder)
     transcripts = _read_transcripts(folder)
     verdicts = _read_verdicts(folder)
-    return _write_report(folder, scenario.name, verdicts, transcripts)
+    return _write_report(folder, scenario, verdicts, transcripts)
 
 
 def scenario_files(scenario_dir: str | os.PathLike[str]) -> list[FsPath]:
@@ -497,6 +560,8 @@ def run_suite(
     *,
     threshold: float = 1.0,
     dry_run: bool = False,
+    model_overrides: Mapping[str, str] | None = None,
+    allow_same_judge: bool = False,
 ) -> int:
     """Run every scenario in the directory, write ``suite.json`` / ``suite.md``, return exit."""
     if not 0.0 <= threshold <= 1.0:
@@ -504,7 +569,13 @@ def run_suite(
     files = scenario_files(scenario_dir)
     reports: list[Report] = []
     for file in files:
-        run_dir = run_scenario(file, out_dir, dry_run=dry_run)
+        run_dir = run_scenario(
+            file,
+            out_dir,
+            dry_run=dry_run,
+            model_overrides=model_overrides,
+            allow_same_judge=allow_same_judge,
+        )
         report = Report.load(run_dir / REPORT_JSON)
         reports.append(report)
         print(f"{report.scenario}: {summary_line(report)}  ({run_dir})")

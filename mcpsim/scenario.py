@@ -18,6 +18,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_valida
 DEFAULT_AGENT_MODEL = "claude-sonnet-5-5"
 DEFAULT_PLANNER_MODEL = "claude-opus-5-5"
 DEFAULT_JUDGE_MODEL = "claude-opus-5-5"
+MODEL_ROLES: tuple[str, ...] = ("planner", "agent", "judge", "user")
 
 
 class ScenarioError(ValueError):
@@ -88,9 +89,29 @@ class Budgets(_Strict):
 
 
 class Models(_Strict):
-    agent: str = DEFAULT_AGENT_MODEL
-    planner: str = DEFAULT_PLANNER_MODEL
-    judge: str = DEFAULT_JUDGE_MODEL
+    """Which model serves each role, as ``provider:model`` (a bare name means ``anthropic``).
+
+    ``user`` is the simulated user's model and defaults to the agent's. ``allow_same_judge``
+    lets the judge and the agent share a model (DESIGN §6 warns against it; docs/LOCAL_MODELS.md
+    explains when a local-only setup needs it).
+    """
+
+    agent: str = Field(default=DEFAULT_AGENT_MODEL, min_length=1)
+    planner: str = Field(default=DEFAULT_PLANNER_MODEL, min_length=1)
+    judge: str = Field(default=DEFAULT_JUDGE_MODEL, min_length=1)
+    user: str | None = Field(default=None, min_length=1)
+    allow_same_judge: bool = False
+
+    @property
+    def user_model(self) -> str:
+        """The simulated user's model: ``user`` when set, else the agent's."""
+        return self.user if self.user is not None else self.agent
+
+    def for_role(self, role: str) -> str:
+        """The model spec for ``planner`` / ``agent`` / ``judge`` / ``user``."""
+        if role not in MODEL_ROLES:
+            raise KeyError(f"unknown model role {role!r}; expected one of {', '.join(MODEL_ROLES)}")
+        return self.user_model if role == "user" else str(getattr(self, role))
 
 
 class Scenario(_Strict):

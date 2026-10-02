@@ -17,6 +17,8 @@ the positional path(s), so keyword names are part of the contract::
         out_dir: str | os.PathLike[str],
         *,
         dry_run: bool = False,
+        model_overrides: Mapping[str, str] | None = None,  # --models, only when given
+        allow_same_judge: bool = False,                    # --allow-same-judge, only when given
     ) -> pathlib.Path:
         '''Load the scenario, discover the catalog, plan (LLM; or the one-path dry-run plan
         when dry_run), write <out_dir>/<scenario.name>/<timestamp>/plan.json and return
@@ -31,6 +33,8 @@ the positional path(s), so keyword names are part of the contract::
         repeat: int | None = None,                         # override scenario.repeat
         mode: Literal["guided", "free"] | None = None,     # run only this mode
         dry_run: bool = False,
+        model_overrides: Mapping[str, str] | None = None,  # --models, only when given
+        allow_same_judge: bool = False,                    # --allow-same-judge, only when given
     ) -> pathlib.Path:
         '''plan -> runs -> judge -> report. Returns the run directory
         <out_dir>/<scenario.name>/<timestamp>/ holding plan.json, scenario.json (the validated
@@ -60,6 +64,8 @@ the positional path(s), so keyword names are part of the contract::
         *,
         threshold: float = 1.0,
         dry_run: bool = False,
+        model_overrides: Mapping[str, str] | None = None,  # --models, only when given
+        allow_same_judge: bool = False,                    # --allow-same-judge, only when given
     ) -> int:
         '''Run every *.yaml / *.yml / *.json scenario in the directory (sorted by name) with
         run_scenario, write <out_dir>/suite-<timestamp>/suite.json and suite.md
@@ -77,6 +83,12 @@ Conventions the CLI relies on:
 * ``run``, ``judge`` and ``report`` take ``--threshold`` (default 1.0) and exit with
   ``mcpsim.report.exit_code`` over the run directory's ``report.json``; ``suite`` returns the
   runner's exit code.
+* ``plan``, ``run`` and ``suite`` take ``--models key=value[,key=value]`` (keys ``planner`` /
+  ``agent`` / ``judge`` / ``user``, values ``provider:model`` such as ``ollama:command-r7b``;
+  see docs/LOCAL_MODELS.md) and ``--allow-same-judge``. The CLI passes ``model_overrides`` /
+  ``allow_same_judge`` **only when the flag was given**, so a plain call keeps the exact keyword
+  set above; the runner applies them with ``scenario.model_copy(update=...)`` so scenario files
+  stay provider-neutral.
 """
 
 from __future__ import annotations
@@ -94,7 +106,7 @@ from typing import Any
 from mcpsim import __version__
 from mcpsim.mcpclient import Catalog, MCPClientError, connect
 from mcpsim.report import Report, exit_code, render_markdown, summary_line
-from mcpsim.scenario import Scenario, ScenarioError, load_scenario
+from mcpsim.scenario import MODEL_ROLES, Scenario, ScenarioError, load_scenario
 
 EXIT_OK = 0
 EXIT_FAILURE = 1
@@ -175,6 +187,52 @@ def dry_run_requested(flag: bool = False, env: Mapping[str, str] | None = None) 
     return bool(flag) or value in {"1", "true", "yes"}
 
 
+def parse_model_overrides(text: str) -> dict[str, str]:
+    """``planner=ollama:command-r7b,user=ollama:llama3.2:3b`` -> ``{role: spec}``.
+
+    Keys must be one of ``planner``, ``agent``, ``judge``, ``user``; values are split on the
+    first ``=`` only so a ``provider:model:tag`` value survives. Raises ``ValueError``.
+    """
+    overrides: dict[str, str] = {}
+    for item in text.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        key, sep, value = item.partition("=")
+        key, value = key.strip(), value.strip()
+        if not sep or not key or not value:
+            raise ValueError(f"--models expects key=value, got {item!r}")
+        if key not in MODEL_ROLES:
+            raise ValueError(
+                f"--models: unknown key {key!r}; expected one of {', '.join(MODEL_ROLES)}"
+            )
+        overrides[key] = value
+    if not overrides:
+        raise ValueError("--models expects at least one key=value")
+    return overrides
+
+
+def _models_arg(text: str) -> dict[str, str]:
+    try:
+        return parse_model_overrides(text)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from None
+
+
+def model_kwargs(args: argparse.Namespace) -> dict[str, Any]:
+    """``model_overrides`` / ``allow_same_judge`` keyword arguments, present only when given."""
+    kwargs: dict[str, Any] = {}
+    given: list[dict[str, str]] = getattr(args, "models", None) or []
+    if given:
+        merged: dict[str, str] = {}
+        for chunk in given:
+            merged.update(chunk)
+        kwargs["model_overrides"] = merged
+    if getattr(args, "allow_same_judge", False):
+        kwargs["allow_same_judge"] = True
+    return kwargs
+
+
 def _load_runner(command: str) -> Any | None:
     """Import ``mcpsim.runner`` lazily; ``None`` (after a message) when it does not exist yet."""
     try:
@@ -216,7 +274,10 @@ def cmd_plan(args: argparse.Namespace) -> int:
 
     def body() -> int:
         plan_path = runner.plan_scenario(
-            args.scenario, args.out, dry_run=dry_run_requested(args.dry_run)
+            args.scenario,
+            args.out,
+            dry_run=dry_run_requested(args.dry_run),
+            **model_kwargs(args),
         )
         print(str(plan_path))
         return EXIT_OK
@@ -239,6 +300,7 @@ def cmd_run(args: argparse.Namespace) -> int:
                 repeat=args.repeat,
                 mode=args.mode,
                 dry_run=dry_run_requested(args.dry_run),
+                **model_kwargs(args),
             )
         )
         print(f"run dir: {run_dir}")
@@ -289,10 +351,29 @@ def cmd_suite(args: argparse.Namespace) -> int:
             args.out,
             threshold=args.threshold,
             dry_run=dry_run_requested(args.dry_run),
+            **model_kwargs(args),
         )
         return int(code)
 
     return _guarded(args.command, body)
+
+
+def _model_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--models",
+        action="append",
+        type=_models_arg,
+        metavar="key=value[,key=value]",
+        help=(
+            "override the scenario's models for this run; keys planner|agent|judge|user, "
+            "values provider:model (e.g. ollama:command-r7b; a bare name is an Anthropic model)"
+        ),
+    )
+    parser.add_argument(
+        "--allow-same-judge",
+        action="store_true",
+        help="let the judge use the same model as the agent (read verdicts as a first pass)",
+    )
 
 
 def _threshold_arg(parser: argparse.ArgumentParser) -> None:
@@ -322,6 +403,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("scenario", help="scenario YAML/JSON file")
     p.add_argument("--out", default="runs", help="output root (default: runs)")
     p.add_argument("--dry-run", action="store_true", help="no LLM; one happy path from catalog")
+    _model_args(p)
     p.set_defaults(func=cmd_plan)
 
     p = sub.add_parser("run", help="plan, run, judge and report a scenario")
@@ -332,6 +414,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--repeat", type=int, help="override the scenario's repeat count")
     p.add_argument("--mode", choices=["guided", "free"], help="run only this mode")
     p.add_argument("--dry-run", action="store_true", help="no LLM; call planned tools, match")
+    _model_args(p)
     _threshold_arg(p)
     p.set_defaults(func=cmd_run)
 
@@ -352,6 +435,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--out", default="runs", help="output root (default: runs)")
     _threshold_arg(p)
     p.add_argument("--dry-run", action="store_true", help="no LLM; see `run --dry-run`")
+    _model_args(p)
     p.set_defaults(func=cmd_suite)
     return parser
 

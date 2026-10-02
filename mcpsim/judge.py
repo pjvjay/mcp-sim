@@ -471,8 +471,7 @@ def build_verdict(
 def check_judge_model(scenario: Scenario) -> None:
     """DESIGN §6: the judge must differ from the agent unless ``models.allow_same_judge``."""
     models = scenario.models
-    allow_same = bool(getattr(models, "allow_same_judge", False))
-    if models.judge == models.agent and not allow_same:
+    if models.judge == models.agent and not models.allow_same_judge:
         raise ValueError(
             f"judge model {models.judge!r} is the same as the agent model; use a different "
             "judge or set models.allow_same_judge to override deliberately"

@@ -1,22 +1,49 @@
-"""The one LLM boundary (DESIGN §6).
+"""The one LLM boundary (DESIGN §6, docs/LOCAL_MODELS.md).
 
 Everything that talks to a model goes through the :class:`LLM` protocol so tests can substitute
-a scripted fake (``tests/fake_llm.py``). :class:`AnthropicLLM` is the real implementation:
-retries with exponential backoff on 429/5xx (max 5 attempts), records usage per model and
-estimates cost from :data:`RATE_TABLE`. Nothing outside this module imports ``anthropic``.
+a scripted fake (``tests/fake_llm.py``). Two real implementations:
+
+* :class:`AnthropicLLM` — the Messages API; retries with exponential backoff on 429/5xx (max 5
+  attempts). Nothing outside this module imports ``anthropic``.
+* :class:`OllamaLLM` — a local Ollama server over ``POST {host}/api/chat`` with the mapping
+  table from docs/LOCAL_MODELS.md; retries on connection errors and 5xx (max 3 attempts); a
+  404 for an unknown model fails at once with the ``ollama pull`` hint. Cost is always 0.
+
+A model is addressed as ``provider:model`` (:func:`parse_model_spec`); a bare name means
+``anthropic``. :func:`make_llm` builds (and caches) one client per provider; the runner's
+``make_llm_for`` picks the provider from ``scenario.models.<role>``. Both clients record usage
+per model and estimate cost from :data:`RATE_TABLE` (0 for anything not in the table).
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
+import os
 import random
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from typing import Any, Protocol
 
 import anthropic
+import httpx
 from pydantic import BaseModel, ConfigDict, Field
 
 DEFAULT_MAX_TOKENS = 4096
+
+ANTHROPIC = "anthropic"
+OLLAMA = "ollama"
+PROVIDERS: tuple[str, ...] = (ANTHROPIC, OLLAMA)
+DEFAULT_PROVIDER = ANTHROPIC
+
+API_KEY_ENV = "ANTHROPIC_API_KEY"
+OLLAMA_HOST_ENV = "OLLAMA_HOST"
+OLLAMA_NUM_CTX_ENV = "MCPSIM_OLLAMA_NUM_CTX"
+DEFAULT_OLLAMA_HOST = "http://localhost:11434"
+DEFAULT_OLLAMA_NUM_CTX = 8192
+# A local 7B model on a CPU can take many minutes per answer (docs/LOCAL_MODELS.md "Speed").
+DEFAULT_OLLAMA_TIMEOUT_S = 3600.0
+# Rendered after "Cost is an ..." in report.md, hence the leading noun.
+LOCAL_COST_NOTE = "estimate; local model(s) via Ollama cost 0 (no API spend)"
 
 # USD per million tokens (input, output). These are estimates and the report says so.
 RATE_TABLE: dict[str, tuple[float, float]] = {
@@ -83,12 +110,40 @@ class LLM(Protocol):
     ) -> LLMResponse: ...
 
 
+def parse_model_spec(spec: str) -> tuple[str, str]:
+    """``provider:model`` -> ``(provider, model)``; a bare name is an Anthropic model.
+
+    Only a known provider counts as a prefix, so ``ollama:llama3.2:3b`` splits once into
+    ``("ollama", "llama3.2:3b")`` while ``claude-sonnet-5-5`` is ``("anthropic", ...)``.
+    """
+    text = spec.strip()
+    provider, sep, rest = text.partition(":")
+    if sep and provider.strip().lower() in PROVIDERS:
+        provider, name = provider.strip().lower(), rest.strip()
+    else:
+        provider, name = DEFAULT_PROVIDER, text
+    if not name:
+        raise ValueError(f"model spec {spec!r} has no model name (expected provider:model)")
+    return provider, name
+
+
+def is_local_model(spec: str) -> bool:
+    """True when the spec names a provider that runs on this machine (Ollama)."""
+    return parse_model_spec(spec)[0] == OLLAMA
+
+
 def rate_for(model: str) -> tuple[float, float] | None:
-    """Longest-prefix lookup in :data:`RATE_TABLE` (so dated ids like ``-20251001`` resolve)."""
+    """Longest-prefix lookup in :data:`RATE_TABLE` (so dated ids like ``-20251001`` resolve).
+
+    The provider prefix is stripped first; a local model has no rate and returns ``None``.
+    """
+    provider, name = parse_model_spec(model)
+    if provider != ANTHROPIC:
+        return None
     best: tuple[float, float] | None = None
     best_len = -1
     for prefix, rates in RATE_TABLE.items():
-        if model.startswith(prefix) and len(prefix) > best_len:
+        if name.startswith(prefix) and len(prefix) > best_len:
             best, best_len = rates, len(prefix)
     return best
 
@@ -165,8 +220,9 @@ class AnthropicLLM:
         tool_choice: dict[str, Any] | None = None,
         max_tokens: int = DEFAULT_MAX_TOKENS,
     ) -> LLMResponse:
+        _, model_id = parse_model_spec(model)
         kwargs: dict[str, Any] = {
-            "model": model,
+            "model": model_id,
             "max_tokens": max_tokens,
             "system": system,
             "messages": messages,
@@ -202,3 +258,462 @@ class AnthropicLLM:
                 usage=usage,
                 model=message.model,
             )
+
+
+# --- Ollama -------------------------------------------------------------------------------------
+
+
+class OllamaError(RuntimeError):
+    """A user-facing Ollama failure (unknown model, bad request, server down after retries)."""
+
+
+def ollama_host(env: Mapping[str, str] | None = None) -> str:
+    """``OLLAMA_HOST`` (default ``http://localhost:11434``), normalised to an ``http(s)://`` URL."""
+    source = os.environ if env is None else env
+    host = source.get(OLLAMA_HOST_ENV, "").strip() or DEFAULT_OLLAMA_HOST
+    if not host.startswith(("http://", "https://")):
+        host = f"http://{host}"
+    return host.rstrip("/")
+
+
+def ollama_num_ctx(env: Mapping[str, str] | None = None) -> int:
+    """``MCPSIM_OLLAMA_NUM_CTX`` (default 8192); a bad value raises ``ValueError``."""
+    source = os.environ if env is None else env
+    raw = source.get(OLLAMA_NUM_CTX_ENV, "").strip()
+    if not raw:
+        return DEFAULT_OLLAMA_NUM_CTX
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{OLLAMA_NUM_CTX_ENV} must be an integer, got {raw!r}") from exc
+    if value < 1:
+        raise ValueError(f"{OLLAMA_NUM_CTX_ENV} must be >= 1, got {value}")
+    return value
+
+
+def _block_text(content: Any) -> str:
+    """The text of a ``content`` that is a string or a list of Anthropic ``text`` blocks."""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, dict):
+                if item.get("type") == "text":
+                    parts.append(str(item.get("text", "")))
+                else:
+                    parts.append(json.dumps(item, ensure_ascii=False))
+            else:
+                parts.append(str(item))
+        return "\n".join(parts)
+    return json.dumps(content, ensure_ascii=False)
+
+
+def to_ollama_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Anthropic ``{name, description, input_schema}`` -> Ollama function definitions.
+
+    The MCP input schema is JSON Schema already and is passed through untouched.
+    """
+    out: list[dict[str, Any]] = []
+    for tool in tools:
+        out.append(
+            {
+                "type": "function",
+                "function": {
+                    "name": tool["name"],
+                    "description": tool.get("description", ""),
+                    "parameters": tool.get("input_schema") or {"type": "object"},
+                },
+            }
+        )
+    return out
+
+
+def to_ollama_messages(system: str, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Anthropic-shaped messages -> Ollama chat messages (docs/LOCAL_MODELS.md mapping table).
+
+    * ``text`` blocks become ``user`` / ``assistant`` messages (consecutive text blocks in one
+      message are joined).
+    * assistant ``tool_use`` blocks become ``tool_calls`` on the assistant message.
+    * user ``tool_result`` blocks become ``{role: tool, tool_name, content}``; the tool name is
+      recovered from the ``tool_use`` block with the same id earlier in the conversation.
+    """
+    out: list[dict[str, Any]] = []
+    if system.strip():
+        out.append({"role": "system", "content": system})
+    names_by_id: dict[str, str] = {}
+    for message in messages:
+        role = str(message.get("role", "user"))
+        content = message.get("content")
+        if isinstance(content, str) or content is None:
+            out.append({"role": role, "content": content or ""})
+            continue
+        if role == "assistant":
+            texts: list[str] = []
+            tool_calls: list[dict[str, Any]] = []
+            for block in content:
+                kind = block.get("type")
+                if kind == "text":
+                    texts.append(str(block.get("text", "")))
+                elif kind == "tool_use":
+                    names_by_id[str(block.get("id", ""))] = str(block["name"])
+                    tool_calls.append(
+                        {
+                            "function": {
+                                "name": block["name"],
+                                "arguments": block.get("input") or {},
+                            }
+                        }
+                    )
+            entry: dict[str, Any] = {"role": "assistant", "content": "\n".join(texts)}
+            if tool_calls:
+                entry["tool_calls"] = tool_calls
+            out.append(entry)
+            continue
+        pending: list[str] = []
+        for block in content:
+            kind = block.get("type")
+            if kind == "tool_result":
+                if pending:
+                    out.append({"role": role, "content": "\n".join(pending)})
+                    pending = []
+                tool_use_id = str(block.get("tool_use_id", ""))
+                name = names_by_id.get(tool_use_id, tool_use_id)
+                text = _block_text(block.get("content"))
+                if block.get("is_error"):
+                    text = f"ERROR: {text}" if text else "ERROR"
+                out.append({"role": "tool", "tool_name": name, "content": text})
+            elif kind == "text":
+                pending.append(str(block.get("text", "")))
+            else:
+                pending.append(json.dumps(block, ensure_ascii=False))
+        if pending:
+            out.append({"role": role, "content": "\n".join(pending)})
+    return out
+
+
+def forced_tool(
+    tools: list[dict[str, Any]] | None, tool_choice: dict[str, Any] | None
+) -> dict[str, Any] | None:
+    """The tool definition named by ``tool_choice = {type: tool, name: X}``; else ``None``."""
+    if not tool_choice or tool_choice.get("type") != "tool":
+        return None
+    name = tool_choice.get("name")
+    for tool in tools or []:
+        if tool.get("name") == name:
+            return tool
+    raise ValueError(f"tool_choice names {name!r}, which is not in tools")
+
+
+def _parse_arguments(raw: Any) -> dict[str, Any]:
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str) and raw.strip():
+        parsed = json.loads(raw)
+        if isinstance(parsed, dict):
+            return parsed
+    return {}
+
+
+def is_retryable_ollama(exc: BaseException) -> bool:
+    """Connection-level failures and 5xx responses; never a 4xx."""
+    if isinstance(exc, httpx.HTTPStatusError):
+        return exc.response.status_code >= 500
+    return isinstance(exc, httpx.TransportError)
+
+
+class OllamaLLM:
+    """A local Ollama server behind the :class:`LLM` protocol (``POST {host}/api/chat``)."""
+
+    def __init__(
+        self,
+        host: str | None = None,
+        *,
+        client: httpx.AsyncClient | None = None,
+        num_ctx: int | None = None,
+        timeout: float | None = DEFAULT_OLLAMA_TIMEOUT_S,
+        max_attempts: int = 3,
+        base_delay: float = 1.0,
+        max_delay: float = 30.0,
+        sleep: SleepFn = asyncio.sleep,
+        jitter: Callable[[], float] = random.random,
+    ) -> None:
+        if max_attempts < 1:
+            raise ValueError("max_attempts must be >= 1")
+        self.host = (host or ollama_host()).rstrip("/")
+        self.num_ctx = num_ctx if num_ctx is not None else ollama_num_ctx()
+        self._client = client or httpx.AsyncClient(
+            timeout=httpx.Timeout(timeout, connect=min(30.0, timeout or 30.0))
+        )
+        self._max_attempts = max_attempts
+        self._base_delay = base_delay
+        self._max_delay = max_delay
+        self._sleep = sleep
+        self._jitter = jitter
+        self._next_call_id = 0
+        self.usage: dict[str, Usage] = {}
+        self.calls = 0
+        self.retries = 0
+
+    def _record(self, model: str, usage: Usage) -> None:
+        self.usage[model] = self.usage.get(model, Usage()) + usage
+
+    def cost_usd(self) -> float:
+        """Always 0: nothing local is billed (the report says "local")."""
+        return 0.0
+
+    def _delay(self, attempt: int) -> float:
+        return min(self._base_delay * (2 ** (attempt - 1)), self._max_delay) + self._jitter()
+
+    def _call_id(self) -> str:
+        self._next_call_id += 1
+        return f"call_{self._next_call_id}"
+
+    def build_request(
+        self,
+        *,
+        model: str,
+        system: str,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None,
+        tool_choice: dict[str, Any] | None,
+        max_tokens: int,
+    ) -> dict[str, Any]:
+        """The ``/api/chat`` body for one call (pure; tests inspect it)."""
+        forced = forced_tool(tools, tool_choice)
+        if forced is not None:
+            hint = (
+                f"Answer with exactly one JSON object matching the `{forced['name']}` schema; "
+                "no prose before or after it."
+            )
+            description = str(forced.get("description", "")).strip()
+            if description:
+                hint = f"{hint}\n{description}"
+            system = f"{system.rstrip()}\n\n{hint}" if system.strip() else hint
+        body: dict[str, Any] = {
+            "model": model,
+            "messages": to_ollama_messages(system, messages),
+            "stream": False,
+            "options": {
+                "temperature": 0,
+                "num_ctx": self.num_ctx,
+                "num_predict": max_tokens,
+            },
+        }
+        if forced is not None:
+            body["format"] = forced.get("input_schema") or {"type": "object"}
+        elif tools:
+            body["tools"] = to_ollama_tools(tools)
+        return body
+
+    def parse_response(
+        self, data: dict[str, Any], *, model: str, forced: dict[str, Any] | None
+    ) -> LLMResponse:
+        """``/api/chat`` JSON -> provider-neutral :class:`LLMResponse`."""
+        message = data.get("message") or {}
+        text = str(message.get("content") or "")
+        raw_calls = message.get("tool_calls") or []
+        done_reason = data.get("done_reason")
+        content: list[dict[str, Any]] = []
+        truncated = done_reason == "length"
+        if forced is not None:
+            payload: dict[str, Any] | None = None
+            if text.strip() and not truncated:
+                try:
+                    parsed = json.loads(text)
+                except json.JSONDecodeError:
+                    parsed = None
+                if isinstance(parsed, dict):
+                    payload = parsed
+            if payload is not None:
+                content.append(
+                    {
+                        "type": "tool_use",
+                        "id": self._call_id(),
+                        "name": forced["name"],
+                        "input": payload,
+                    }
+                )
+            elif text:
+                content.append({"type": "text", "text": text})
+        else:
+            if text:
+                content.append({"type": "text", "text": text})
+            for call in raw_calls:
+                function = call.get("function") or {}
+                content.append(
+                    {
+                        "type": "tool_use",
+                        "id": self._call_id(),
+                        "name": str(function.get("name", "")),
+                        "input": _parse_arguments(function.get("arguments")),
+                    }
+                )
+        has_tool_use = any(block["type"] == "tool_use" for block in content)
+        if truncated:
+            stop_reason = "max_tokens"
+        elif has_tool_use:
+            stop_reason = "tool_use"
+        else:
+            stop_reason = "end_turn"
+        usage = Usage(
+            input_tokens=int(data.get("prompt_eval_count") or 0),
+            output_tokens=int(data.get("eval_count") or 0),
+        )
+        return LLMResponse(
+            content=content,
+            stop_reason=stop_reason,
+            usage=usage,
+            model=str(data.get("model") or model),
+        )
+
+    def _error_for(self, model: str, response: httpx.Response) -> OllamaError | None:
+        """A user-facing error for a 4xx; ``None`` for anything retryable (5xx)."""
+        status = response.status_code
+        if status >= 500:
+            return None
+        try:
+            detail = str(response.json().get("error", "")).strip()
+        except (ValueError, AttributeError):
+            detail = response.text.strip()
+        if status == 404:
+            return OllamaError(
+                f"Ollama at {self.host} has no model {model!r}"
+                + (f" ({detail})" if detail else "")
+                + f"; run `ollama pull {model}` (or `ollama list` to see what is installed)"
+            )
+        return OllamaError(f"Ollama at {self.host} rejected the request ({status}): {detail}")
+
+    async def complete(
+        self,
+        *,
+        model: str,
+        system: str,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        tool_choice: dict[str, Any] | None = None,
+        max_tokens: int = DEFAULT_MAX_TOKENS,
+    ) -> LLMResponse:
+        _, model_id = parse_model_spec(model)
+        forced = forced_tool(tools, tool_choice)
+        body = self.build_request(
+            model=model_id,
+            system=system,
+            messages=messages,
+            tools=tools,
+            tool_choice=tool_choice,
+            max_tokens=max_tokens,
+        )
+        url = f"{self.host}/api/chat"
+        attempt = 0
+        while True:
+            attempt += 1
+            self.calls += 1
+            try:
+                response = await self._client.post(url, json=body)
+                if response.status_code >= 400:
+                    error = self._error_for(model_id, response)
+                    if error is not None:
+                        raise error
+                    response.raise_for_status()
+            except OllamaError:
+                raise
+            except Exception as exc:
+                if attempt >= self._max_attempts or not is_retryable_ollama(exc):
+                    if isinstance(exc, httpx.TransportError):
+                        raise OllamaError(
+                            f"cannot reach Ollama at {self.host} ({type(exc).__name__}: {exc}); "
+                            f"is `ollama serve` running? ({OLLAMA_HOST_ENV} selects the server)"
+                        ) from exc
+                    if isinstance(exc, httpx.HTTPStatusError):
+                        raise OllamaError(
+                            f"Ollama at {self.host} failed with "
+                            f"{exc.response.status_code} after {attempt} attempt(s): "
+                            f"{exc.response.text.strip()[:300]}"
+                        ) from exc
+                    raise
+                self.retries += 1
+                await self._sleep(self._delay(attempt))
+                continue
+            data = response.json()
+            if not isinstance(data, dict):
+                raise OllamaError(f"Ollama at {self.host} returned a non-object reply: {data!r}")
+            result = self.parse_response(data, model=model_id, forced=forced)
+            self._record(model, result.usage)
+            return result
+
+
+# --- provider factory ---------------------------------------------------------------------------
+
+
+class RoutingLLM:
+    """Dispatches each call to the provider named by its ``model`` spec.
+
+    Used when one component talks to two providers at once (the agent under test and the
+    simulated user share one client in ``agent.run_path``).
+    """
+
+    def __init__(self, factory: Callable[[str], LLM] | None = None) -> None:
+        self._factory = factory or make_llm
+
+    async def complete(
+        self,
+        *,
+        model: str,
+        system: str,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        tool_choice: dict[str, Any] | None = None,
+        max_tokens: int = DEFAULT_MAX_TOKENS,
+    ) -> LLMResponse:
+        provider, _ = parse_model_spec(model)
+        return await self._factory(provider).complete(
+            model=model,
+            system=system,
+            messages=messages,
+            tools=tools,
+            tool_choice=tool_choice,
+            max_tokens=max_tokens,
+        )
+
+
+_CLIENTS: dict[str, LLM] = {}
+
+
+def clear_llm_cache() -> None:
+    """Forget cached provider clients (tests; or after changing ``OLLAMA_HOST``)."""
+    _CLIENTS.clear()
+
+
+def missing_api_key_message(purpose: str | None = None) -> str:
+    return (
+        f"{API_KEY_ENV} is not set; export it for a real run, use --dry-run (MCPSIM_DRY_RUN=1) "
+        "for the no-LLM smoke mode, or address the model as ollama:<model> to run locally"
+        + (f" (needed for the {purpose})" if purpose else "")
+    )
+
+
+def make_llm(provider: str, *, purpose: str | None = None) -> LLM:
+    """One cached client per provider: ``anthropic`` -> :class:`AnthropicLLM`, ``ollama`` ->
+    :class:`OllamaLLM`. ``purpose`` names the role for the error message.
+
+    Raises ``RuntimeError`` when ``anthropic`` is asked for without ``ANTHROPIC_API_KEY`` (the
+    key is checked on every call so a cache cannot hide a missing key) and ``ValueError`` for an
+    unknown provider.
+    """
+    key = provider.strip().lower()
+    if key == ANTHROPIC:
+        if not os.environ.get(API_KEY_ENV):
+            raise RuntimeError(missing_api_key_message(purpose))
+    elif key != OLLAMA:
+        raise ValueError(
+            f"unknown model provider {provider!r}; use one of "
+            + ", ".join(f"{p}:<model>" for p in PROVIDERS)
+        )
+    cached = _CLIENTS.get(key)
+    if cached is None:
+        cached = AnthropicLLM() if key == ANTHROPIC else OllamaLLM()
+        _CLIENTS[key] = cached
+    return cached
