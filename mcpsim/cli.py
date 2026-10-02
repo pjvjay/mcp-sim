@@ -1,24 +1,117 @@
 """``mcpsim`` command line (DESIGN §2 "CLI").
 
-Stage 1 ships the skeleton: ``catalog`` works end to end; ``plan``, ``run``, ``judge``,
-``report`` and ``suite`` are parsed but exit 2 with "not yet wired" until the runner lands.
+``catalog`` works on its own. ``plan``, ``run``, ``judge``, ``report`` and ``suite`` call into
+``mcpsim.runner``, which is imported lazily inside each subcommand so this module imports (and
+``mcpsim catalog`` works) before the runner exists; until it does, those subcommands print
+"not yet wired" and exit 2.
+
+Runner contract
+===============
+
+``mcpsim/runner.py`` must define exactly these **synchronous** functions (they may wrap
+``asyncio.run`` internally). The CLI calls them with keyword arguments for everything after
+the positional path(s), so keyword names are part of the contract::
+
+    def plan_scenario(
+        scenario_path: str | os.PathLike[str],
+        out_dir: str | os.PathLike[str],
+        *,
+        dry_run: bool = False,
+    ) -> pathlib.Path:
+        '''Load the scenario, discover the catalog, plan (LLM; or the one-path dry-run plan
+        when dry_run), write <out_dir>/<scenario.name>/<timestamp>/plan.json and return
+        that file's path.'''
+
+    def run_scenario(
+        scenario_path: str | os.PathLike[str],
+        out_dir: str | os.PathLike[str],
+        *,
+        plan_path: str | os.PathLike[str] | None = None,  # reuse this plan.json, do not plan
+        only_path: str | None = None,                      # run only this path id
+        repeat: int | None = None,                         # override scenario.repeat
+        mode: Literal["guided", "free"] | None = None,     # run only this mode
+        dry_run: bool = False,
+    ) -> pathlib.Path:
+        '''plan -> runs -> judge -> report. Returns the run directory
+        <out_dir>/<scenario.name>/<timestamp>/ holding plan.json, scenario.json (the validated
+        scenario, so judge_run_dir/report_run_dir need only the directory),
+        transcripts/<path>-<mode>-<i>.jsonl, verdicts/<same>.json, report.json and report.md
+        (mcpsim.report.aggregate / render_markdown). In dry run the LLM judge is skipped and
+        verdicts come from the matcher alone with judge_model "dry-run".'''
+
+    def judge_run_dir(
+        run_dir: str | os.PathLike[str],
+        *,
+        votes: int | None = None,                          # override scenario.judge_votes
+    ) -> list[pathlib.Path]:
+        '''Re-judge every transcripts/*.jsonl in the run directory (scenario and plan are read
+        from scenario.json and plan.json there), rewrite verdicts/*.json and report.json /
+        report.md, and return the verdict paths written.'''
+
+    def report_run_dir(
+        run_dir: str | os.PathLike[str],
+    ) -> tuple[pathlib.Path, pathlib.Path]:
+        '''Rebuild report.json and report.md from verdicts/ and transcripts/; return
+        (report.json path, report.md path).'''
+
+    def run_suite(
+        scenario_dir: str | os.PathLike[str],
+        out_dir: str | os.PathLike[str],
+        *,
+        threshold: float = 1.0,
+        dry_run: bool = False,
+    ) -> int:
+        '''Run every *.yaml / *.yml / *.json scenario in the directory (sorted by name) with
+        run_scenario, write <out_dir>/suite-<timestamp>/suite.json and suite.md
+        (mcpsim.report.aggregate_suite / render_suite_markdown), print one summary line per
+        scenario, and return mcpsim.report.exit_code(suite_report, threshold).'''
+
+Conventions the CLI relies on:
+
+* ``dry_run`` is resolved here from ``--dry-run`` or ``MCPSIM_DRY_RUN=1`` (also ``true`` /
+  ``yes``); the runner takes the argument and never reads the environment itself.
+* The runner raises ``ScenarioError`` / ``MCPClientError`` / ``ValueError`` / ``RuntimeError``
+  / ``KeyError`` / ``OSError`` for user-facing failures (bad scenario, server unreachable,
+  unknown ``--only-path``, planner gave up, ...). The CLI prints them as one line on stderr and
+  exits 1; set ``MCPSIM_DEBUG=1`` to get the traceback instead. Anything else propagates.
+* ``run``, ``judge`` and ``report`` take ``--threshold`` (default 1.0) and exit with
+  ``mcpsim.report.exit_code`` over the run directory's ``report.json``; ``suite`` returns the
+  runner's exit code.
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import importlib
 import json
+import os
 import sys
-from collections.abc import Sequence
+from collections.abc import Callable, Mapping, Sequence
+from pathlib import Path as FsPath
+from typing import Any
 
 from mcpsim import __version__
 from mcpsim.mcpclient import Catalog, MCPClientError, connect
+from mcpsim.report import Report, exit_code, render_markdown, summary_line
 from mcpsim.scenario import Scenario, ScenarioError, load_scenario
 
 EXIT_OK = 0
 EXIT_FAILURE = 1
 EXIT_USAGE = 2
+
+DRY_RUN_ENV = "MCPSIM_DRY_RUN"
+DEBUG_ENV = "MCPSIM_DEBUG"
+RUNNER_MODULE = "mcpsim.runner"
+
+_USER_ERRORS: tuple[type[Exception], ...] = (
+    ScenarioError,
+    MCPClientError,
+    OSError,
+    ValueError,
+    KeyError,
+    RuntimeError,
+)
 
 
 def render_catalog(catalog: Catalog) -> str:
@@ -75,15 +168,147 @@ def cmd_catalog(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
-def _not_yet_wired(args: argparse.Namespace) -> int:
-    print(f"mcpsim {args.command}: not yet wired", file=sys.stderr)
-    return EXIT_USAGE
+def dry_run_requested(flag: bool = False, env: Mapping[str, str] | None = None) -> bool:
+    """``--dry-run`` or ``MCPSIM_DRY_RUN`` set to 1/true/yes (case-insensitive)."""
+    source = os.environ if env is None else env
+    value = source.get(DRY_RUN_ENV, "").strip().lower()
+    return bool(flag) or value in {"1", "true", "yes"}
+
+
+def _load_runner(command: str) -> Any | None:
+    """Import ``mcpsim.runner`` lazily; ``None`` (after a message) when it does not exist yet."""
+    try:
+        return importlib.import_module(RUNNER_MODULE)
+    except ModuleNotFoundError as exc:
+        if exc.name == RUNNER_MODULE:
+            print(f"mcpsim {command}: not yet wired ({RUNNER_MODULE} is missing)", file=sys.stderr)
+            return None
+        raise
+
+
+def _guarded(command: str, body: Callable[[], int]) -> int:
+    """Run a subcommand body, turning user-facing errors into one stderr line and exit 1."""
+    try:
+        return body()
+    except _USER_ERRORS as exc:
+        if os.environ.get(DEBUG_ENV):
+            raise
+        message = exc.args[0] if isinstance(exc, KeyError) and exc.args else str(exc)
+        print(f"mcpsim {command}: {message}", file=sys.stderr)
+        return EXIT_FAILURE
+
+
+def _exit_from_report(run_dir: FsPath, threshold: float) -> int:
+    """Exit status for a run directory's ``report.json``; 0 when the runner wrote none."""
+    report_path = run_dir / "report.json"
+    if not report_path.is_file():
+        return EXIT_OK
+    report = Report.load(report_path)
+    print(summary_line(report))
+    print(f"report: {run_dir / 'report.md'}")
+    return exit_code(report, threshold)
+
+
+def cmd_plan(args: argparse.Namespace) -> int:
+    runner = _load_runner(args.command)
+    if runner is None:
+        return EXIT_USAGE
+
+    def body() -> int:
+        plan_path = runner.plan_scenario(
+            args.scenario, args.out, dry_run=dry_run_requested(args.dry_run)
+        )
+        print(str(plan_path))
+        return EXIT_OK
+
+    return _guarded(args.command, body)
+
+
+def cmd_run(args: argparse.Namespace) -> int:
+    runner = _load_runner(args.command)
+    if runner is None:
+        return EXIT_USAGE
+
+    def body() -> int:
+        run_dir = FsPath(
+            runner.run_scenario(
+                args.scenario,
+                args.out,
+                plan_path=args.plan,
+                only_path=args.only_path,
+                repeat=args.repeat,
+                mode=args.mode,
+                dry_run=dry_run_requested(args.dry_run),
+            )
+        )
+        print(f"run dir: {run_dir}")
+        return _exit_from_report(run_dir, args.threshold)
+
+    return _guarded(args.command, body)
+
+
+def cmd_judge(args: argparse.Namespace) -> int:
+    runner = _load_runner(args.command)
+    if runner is None:
+        return EXIT_USAGE
+
+    def body() -> int:
+        written = list(runner.judge_run_dir(args.run_dir, votes=args.votes))
+        print(f"judged {len(written)} transcript(s) in {args.run_dir}")
+        return _exit_from_report(FsPath(args.run_dir), args.threshold)
+
+    return _guarded(args.command, body)
+
+
+def cmd_report(args: argparse.Namespace) -> int:
+    runner = _load_runner(args.command)
+    if runner is None:
+        return EXIT_USAGE
+
+    def body() -> int:
+        json_path, md_path = runner.report_run_dir(args.run_dir)
+        report = Report.load(json_path)
+        if args.markdown:
+            print(render_markdown(report), end="")
+        else:
+            print(summary_line(report))
+        print(f"report: {md_path}")
+        return exit_code(report, args.threshold)
+
+    return _guarded(args.command, body)
+
+
+def cmd_suite(args: argparse.Namespace) -> int:
+    runner = _load_runner(args.command)
+    if runner is None:
+        return EXIT_USAGE
+
+    def body() -> int:
+        code = runner.run_suite(
+            args.scenario_dir,
+            args.out,
+            threshold=args.threshold,
+            dry_run=dry_run_requested(args.dry_run),
+        )
+        return int(code)
+
+    return _guarded(args.command, body)
+
+
+def _threshold_arg(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--threshold",
+        type=float,
+        default=1.0,
+        help="minimum overall pass rate (0-1) for exit code 0 (default: 1.0)",
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="mcpsim",
         description="LLM-as-a-judge simulations for MCP servers.",
+        epilog=f"Set {DRY_RUN_ENV}=1 for the no-LLM smoke mode (same as --dry-run).",
     )
     parser.add_argument("--version", action="version", version=f"mcpsim {__version__}")
     sub = parser.add_subparsers(dest="command", required=True, metavar="command")
@@ -93,37 +318,41 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--json", action="store_true", help="emit the catalog as JSON")
     p.set_defaults(func=cmd_catalog)
 
-    p = sub.add_parser("plan", help="plan paths for a scenario")
-    p.add_argument("scenario")
+    p = sub.add_parser("plan", help="plan paths for a scenario and save plan.json")
+    p.add_argument("scenario", help="scenario YAML/JSON file")
     p.add_argument("--out", default="runs", help="output root (default: runs)")
     p.add_argument("--dry-run", action="store_true", help="no LLM; one happy path from catalog")
-    p.set_defaults(func=_not_yet_wired)
+    p.set_defaults(func=cmd_plan)
 
     p = sub.add_parser("run", help="plan, run, judge and report a scenario")
-    p.add_argument("scenario")
-    p.add_argument("--out", default="runs")
-    p.add_argument("--plan", help="reuse an existing plan.json")
+    p.add_argument("scenario", help="scenario YAML/JSON file")
+    p.add_argument("--out", default="runs", help="output root (default: runs)")
+    p.add_argument("--plan", help="reuse an existing plan.json instead of planning")
     p.add_argument("--only-path", help="run only this path id")
     p.add_argument("--repeat", type=int, help="override the scenario's repeat count")
     p.add_argument("--mode", choices=["guided", "free"], help="run only this mode")
-    p.add_argument("--dry-run", action="store_true")
-    p.set_defaults(func=_not_yet_wired)
+    p.add_argument("--dry-run", action="store_true", help="no LLM; call planned tools, match")
+    _threshold_arg(p)
+    p.set_defaults(func=cmd_run)
 
     p = sub.add_parser("judge", help="re-judge the transcripts in a run directory")
-    p.add_argument("run_dir")
+    p.add_argument("run_dir", help="a run directory written by `mcpsim run`")
     p.add_argument("--votes", type=int, help="override judge_votes")
-    p.set_defaults(func=_not_yet_wired)
+    _threshold_arg(p)
+    p.set_defaults(func=cmd_judge)
 
     p = sub.add_parser("report", help="rebuild report.json/report.md for a run directory")
-    p.add_argument("run_dir")
-    p.set_defaults(func=_not_yet_wired)
+    p.add_argument("run_dir", help="a run directory written by `mcpsim run`")
+    p.add_argument("--markdown", action="store_true", help="print report.md to stdout")
+    _threshold_arg(p)
+    p.set_defaults(func=cmd_report)
 
     p = sub.add_parser("suite", help="run every scenario in a directory")
-    p.add_argument("scenario_dir")
-    p.add_argument("--out", default="runs")
-    p.add_argument("--threshold", type=float, default=1.0, help="min overall pass rate")
-    p.add_argument("--dry-run", action="store_true")
-    p.set_defaults(func=_not_yet_wired)
+    p.add_argument("scenario_dir", help="directory of scenario files")
+    p.add_argument("--out", default="runs", help="output root (default: runs)")
+    _threshold_arg(p)
+    p.add_argument("--dry-run", action="store_true", help="no LLM; see `run --dry-run`")
+    p.set_defaults(func=cmd_suite)
     return parser
 
 

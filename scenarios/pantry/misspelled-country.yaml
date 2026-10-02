@@ -1,0 +1,41 @@
+# Scenario 2 (DESIGN §7): the goal names "Amerca". The server rejects the spelling and suggests
+# "United States"; the agent must take the suggestion, not guess and not silently drop the
+# exclusion. Recovery IS the happy path here.
+name: misspelled-country
+role: >
+  A shopper in Toronto who types fast and spells badly, wants nothing from "Amerca" in the
+  basket, and will not notice a typo unless the assistant points it out.
+goal: >
+  Plan the "tomato_penne" recipe excluding anything from Amerca, and tell me what the plan
+  actually excluded.
+instructions:
+  - Pass the exclusion to the server (plan_recipe exclude_origin); do not filter products by
+    hand.
+  - When the server rejects a country name, use the first suggestion it returns and say which
+    spelling was used; never guess a different country and never drop the exclusion.
+  - Do not call plan_recipe a second time with the same rejected spelling.
+  - Never describe the basket as clean or free of a country unless origin_status is "verified".
+  - Report origin_status and coverage.spend_fraction exactly as returned.
+expected_outcome:
+  text: >
+    The agent recovers from the rejected country name by using the server's suggestion ("United
+    States"), tells the shopper that "Amerca" was read as "United States", and delivers the plan
+    with its origin_status and coverage reported honestly.
+  json:
+    recipe_slug: tomato_penne
+    requested_country: Amerca
+    excluded_country: United States
+    total_cost: { $gt: 0 }
+    origin_status: { $in: [verified, unverified] }
+    "coverage.spend_fraction": { $type: number }
+    "lines[*].origin_country": { $ne: United States }
+server:
+  stdio:
+    command: /Users/paulvijayakumar/Documents/workspace/pantry-platform/pantry-api/.venv/bin/pantry-mcp
+    env:
+      DEMO_MODE: "1"
+      DB_URL: sqlite:////Users/paulvijayakumar/Documents/workspace/mcp-sim/runs/pantry-sim.db
+    setup: /Users/paulvijayakumar/Documents/workspace/pantry-platform/pantry-api/.venv/bin/python -m pantry_planner.db seed
+repeat: 3
+judge_votes: 3
+budgets: { max_turns: 12, max_tool_calls: 20, max_cost_usd: 1.00 }

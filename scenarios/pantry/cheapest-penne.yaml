@@ -1,0 +1,40 @@
+# Scenario 4 (DESIGN §7): a pure lookup. The expected JSON names the cheapest penne product and
+# its store. This is also the Stage 3 dry-run smoke scenario: every planned tool is free.
+name: cheapest-penne
+role: >
+  A bargain hunter in Vancouver who wants one answer, the cheapest penne in the catalog and where
+  to buy it, and distrusts any price that was not read off a product record.
+goal: >
+  Tell me the cheapest penne product in the catalog, its price, and which store sells it at that
+  price.
+instructions:
+  - Use find_product (results come back cheapest first); do not run a planning tool for a
+    lookup.
+  - Quote the product name, price and store exactly as the product record has them; never
+    round a price or guess a store.
+  - If find_product returns match "relaxed" or "none", say that no exact penne product exists
+    and describe what was found instead of presenting a substitute as penne.
+  - Report origin_status as returned; "unknown" is an acceptable answer and must not be
+    upgraded.
+expected_outcome:
+  text: >
+    The cheapest penne product by name, with its exact price and store, and its origin_status as
+    the catalog has it.
+  json:
+    query: penne
+    match: direct
+    product_id: { $type: number }
+    product_name: { $regex: "(?i)penne" }
+    store: { $type: string }
+    price: { $gt: 0 }
+    origin_status: { $in: [unknown, resolved, verified, unverified, pending, conflicting] }
+server:
+  stdio:
+    command: /Users/paulvijayakumar/Documents/workspace/pantry-platform/pantry-api/.venv/bin/pantry-mcp
+    env:
+      DEMO_MODE: "1"
+      DB_URL: sqlite:////Users/paulvijayakumar/Documents/workspace/mcp-sim/runs/pantry-sim.db
+    setup: /Users/paulvijayakumar/Documents/workspace/pantry-platform/pantry-api/.venv/bin/python -m pantry_planner.db seed
+repeat: 2
+judge_votes: 3
+budgets: { max_turns: 8, max_tool_calls: 10, max_cost_usd: 0.50 }

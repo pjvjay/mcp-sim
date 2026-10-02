@@ -1,0 +1,36 @@
+# Scenario 6 (DESIGN §7): the goal names a recipe that does not exist. The agent must consult
+# list_recipes and say so rather than invent a recipe or plan something else unasked.
+name: unknown-recipe
+role: >
+  A dinner-party host in Calgary who is sure they saw "lobster_thermidor" in the recipe library
+  last week and wants it planned tonight. Will accept being told it is not there, but not being
+  quietly given a different dinner.
+goal: >
+  Plan the "lobster_thermidor" recipe for tonight and give me the shopping list.
+instructions:
+  - Check list_recipes before planning; do not call plan_recipe with a slug that list_recipes
+    did not return.
+  - If the recipe does not exist, say so plainly, list the slugs that do exist, and do not plan
+    a substitute unless the user asks for one.
+  - Do not invent a recipe, an ingredient list or a price for lobster thermidor.
+  - If the user asks for the closest alternative, offer slugs from list_recipes only.
+expected_outcome:
+  text: >
+    An honest answer that lobster_thermidor is not in the recipe library, backed by the actual
+    list_recipes result, with no invented plan; a substitute is only planned if the user asks.
+  json:
+    requested_slug: lobster_thermidor
+    recipe_found: false
+    planned: false
+    available_slugs: { $len: { $gte: 5 }, $contains: tomato_penne }
+    "available_slugs[*]": { $ne: lobster_thermidor }
+server:
+  stdio:
+    command: /Users/paulvijayakumar/Documents/workspace/pantry-platform/pantry-api/.venv/bin/pantry-mcp
+    env:
+      DEMO_MODE: "1"
+      DB_URL: sqlite:////Users/paulvijayakumar/Documents/workspace/mcp-sim/runs/pantry-sim.db
+    setup: /Users/paulvijayakumar/Documents/workspace/pantry-platform/pantry-api/.venv/bin/python -m pantry_planner.db seed
+repeat: 3
+judge_votes: 3
+budgets: { max_turns: 10, max_tool_calls: 10, max_cost_usd: 0.75 }

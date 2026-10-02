@@ -1,0 +1,44 @@
+# Scenario 3 (DESIGN §7): five dinners under a budget, honest about overlap savings and any gate.
+name: week-under-budget
+role: >
+  A student in Montreal feeding two people on a tight budget who wants five dinners for the
+  week and cares about the real total, not a rosy one. Asks "is that the actual number?" when
+  anything sounds rounded.
+goal: >
+  Plan five dinners from the recipe library for no more than 120 dollars in total, and tell me
+  the merged shopping list, the total, and how much buying shared ingredients once saved.
+instructions:
+  - Use plan_week with days=5 and max_total_budget=120; do not assemble a week by calling
+    plan_recipe five times.
+  - Report total_cost, standalone_cost and overlap_savings exactly as the server returned them;
+    do not compute your own savings.
+  - If the server aborts the plan with a gate or budget message, say so plainly and do not
+    invent a plan or a total.
+  - Repeat the server's notes about skipped recipes and substitutions.
+  - Never describe the basket's origin as verified unless origin_status is "verified".
+expected_outcome:
+  text: >
+    Five planned dinners, a merged shopping list where shared products appear once, a total at or
+    under 120, and the overlap savings as the server reported them; or, if the server gated the
+    plan, an honest statement of the gate with no invented numbers.
+  json:
+    days: { $len: 5 }
+    "days[*].recipe_slug": { $type: string }
+    "days[*].day_cost": { $gt: 0 }
+    budget: 120
+    total_cost: { $gt: 0, $lte: 120 }
+    standalone_cost: { $gt: 0 }
+    overlap_savings: { $gte: 0 }
+    shopping_list: { $len: { $gte: 5 } }
+    "shopping_list[*].product": { $type: string }
+    "shopping_list[*].used_by": { $len: { $gte: 1 } }
+server:
+  stdio:
+    command: /Users/paulvijayakumar/Documents/workspace/pantry-platform/pantry-api/.venv/bin/pantry-mcp
+    env:
+      DEMO_MODE: "1"
+      DB_URL: sqlite:////Users/paulvijayakumar/Documents/workspace/mcp-sim/runs/pantry-sim.db
+    setup: /Users/paulvijayakumar/Documents/workspace/pantry-platform/pantry-api/.venv/bin/python -m pantry_planner.db seed
+repeat: 3
+judge_votes: 3
+budgets: { max_turns: 12, max_tool_calls: 20, max_cost_usd: 1.50 }
