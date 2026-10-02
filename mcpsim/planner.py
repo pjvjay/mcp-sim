@@ -10,9 +10,13 @@ schema, ``$from_step`` references, recovery paths (at least one ``expect_error``
 ``<where>: <condition>`` shape of checkpoints. A draft that fails is re-asked **once** with every
 problem listed, then :class:`PlanError` is raised.
 
-``dry_run=True`` needs no LLM: it emits a one-path happy plan whose steps call every catalog tool
-whose required arguments can all be defaulted from the schema, skipping tools whose description
-says they cost money or credits, and says so in the path's rationale.
+``dry_run=True`` needs no LLM: it emits a one-path happy plan over the allowed tools that share
+vocabulary with the scenario (:mod:`mcpsim.scoping`), most relevant first and at most
+``budgets.max_tool_calls`` of them, skipping tools whose description says they cost money or
+credits and write tools unless the scenario asks for a write. An argument named by a top-level
+``expected_outcome.json`` key with a plain value takes that value (``find_product(query="penne")``);
+other required arguments are defaulted from the schema. The rationale names everything skipped
+and why.
 """
 
 from __future__ import annotations
@@ -36,11 +40,21 @@ from mcpsim.plan import (
     parse_reference,
 )
 from mcpsim.scenario import Scenario
+from mcpsim.scoping import (
+    is_write_tool,
+    plain_expected_value,
+    rank_tools,
+    scenario_terms,
+    write_intent,
+)
 
 PLAN_TOOL_NAME = "emit_execution_plan"
 PLAN_MAX_TOKENS = 8192
 MAX_PLAN_ATTEMPTS = 2  # the first ask plus one re-ask with the validation error
 DRY_RUN_PATH_ID = "happy-dry-run"
+# When no tool shares a word with the scenario, the dry run still calls this many (catalog
+# order) so the smoke proves the server answers.
+DRY_RUN_FALLBACK = 3
 
 # Tools a dry-run plan must not call (DESIGN §6 build spec): descriptions mentioning spend.
 # A tool is skipped by the dry run only when its description CLAIMS a cost.
@@ -802,38 +816,164 @@ def is_expensive(tool: ToolInfo) -> bool:
     return EXPENSIVE_PATTERN.search(desc) is not None and FREE_PATTERN.search(desc) is None
 
 
+def _accepts_literal(prop_schema: dict[str, Any], root: dict[str, Any], value: Any) -> bool:
+    """Would :func:`validate_arguments` accept ``value`` for this property (type and enum)?"""
+    if not type_accepts(schema_types(prop_schema, root), json_type_of(value)):
+        return False
+    enum = enum_members(prop_schema, root)
+    return enum is None or value in enum
+
+
+def dry_run_arguments(
+    tool: ToolInfo, spec: dict[str, Any] | None
+) -> tuple[dict[str, Any] | None, list[str], list[str]]:
+    """Sketch arguments for a dry-run step: expected-outcome values first, then placeholders.
+
+    Every property whose name is a top-level ``expected_outcome.json`` key with a plain
+    string/number value that the schema accepts takes that value (``query: penne`` →
+    ``query="penne"``), required or not; the other required properties take
+    :func:`default_for` placeholders. Returns ``(arguments, undefaultable, from_expected)``;
+    ``arguments`` is ``None`` when a required argument has neither.
+    """
+    schema = tool.input_schema or {}
+    properties = schema.get("properties")
+    if not isinstance(properties, dict):
+        properties = {}
+    required_raw = schema.get("required")
+    required = [str(n) for n in required_raw] if isinstance(required_raw, list) else []
+    arguments: dict[str, Any] = {}
+    undefaultable: list[str] = []
+    from_expected: list[str] = []
+    for name, prop in properties.items():
+        prop_schema = prop if isinstance(prop, dict) else {}
+        found, value = plain_expected_value(spec, str(name))
+        if found and _accepts_literal(prop_schema, schema, value):
+            arguments[str(name)] = value
+            from_expected.append(str(name))
+            continue
+        if name not in required:
+            continue
+        ok, default = default_for(prop_schema)
+        if ok:
+            arguments[str(name)] = default
+        else:
+            undefaultable.append(str(name))
+    undefaultable.extend(name for name in required if name not in properties)
+    if undefaultable:
+        return None, undefaultable, from_expected
+    return arguments, [], from_expected
+
+
 def dry_run_plan(scenario: Scenario, catalog: Catalog) -> ExecutionPlan:
-    """A one-path happy plan from the catalog alone: no LLM (DESIGN §6 ``MCPSIM_DRY_RUN``)."""
-    steps: list[Step] = []
+    """A one-path happy plan over the goal-relevant tools: no LLM (DESIGN §6 ``MCPSIM_DRY_RUN``).
+
+    Candidates are the allowed tools that do not claim a cost and are not write tools (unless
+    :func:`mcpsim.scoping.write_intent`), ranked by relevance to the scenario; tools that share
+    no vocabulary with it are skipped (when none does, the first :data:`DRY_RUN_FALLBACK` in
+    catalog order are called so the smoke still reaches the server), and at most
+    ``budgets.max_tool_calls`` steps are planned, so the budget is never what ends a dry run.
+    Arguments come from :func:`dry_run_arguments`. The rationale names every skipped tool and
+    why: expensive, write, irrelevant, beyond the budget, or undefaultable.
+    """
+    budget = scenario.budgets.max_tool_calls
+    spec = scenario.expected_outcome.json
+    intent = write_intent(scenario)
     skipped_expensive: list[str] = []
-    skipped_undefaultable: list[tuple[str, list[str]]] = []
+    skipped_write: list[str] = []
+    candidates: list[ToolInfo] = []
     for tool in catalog.tools:
         if is_expensive(tool):
             skipped_expensive.append(tool.name)
+        elif not intent and is_write_tool(tool):
+            skipped_write.append(tool.name)
+        else:
+            candidates.append(tool)
+    ranked = rank_tools(scenario_terms(scenario), candidates)
+    relevant = [tool for tool, score in ranked if score > 0]
+    skipped_irrelevant = [tool.name for tool, score in ranked if score <= 0]
+    fallback = False
+    if not relevant and candidates:
+        fallback = True
+        relevant = candidates[: min(DRY_RUN_FALLBACK, budget)]
+        skipped_irrelevant = [t.name for t in candidates if t not in relevant]
+
+    steps: list[Step] = []
+    skipped_beyond: list[str] = []
+    skipped_undefaultable: list[tuple[str, list[str]]] = []
+    filled: list[str] = []
+    for tool in relevant:
+        if len(steps) >= budget:
+            skipped_beyond.append(tool.name)
             continue
-        arguments, undefaultable = default_arguments(tool)
+        arguments, undefaultable, from_expected = dry_run_arguments(tool, spec)
         if arguments is None:
             skipped_undefaultable.append((tool.name, undefaultable))
             continue
+        filled.extend(f"{tool.name}({k}={_compact_json(arguments[k])})" for k in from_expected)
+        if from_expected:
+            source = "arguments from the expected outcome"
+            answer = ", ".join(f"{k}={_compact_json(arguments[k])}" for k in from_expected)
+            success = (
+                f"{tool.name} returns a result for {answer} (an error result still counts as "
+                "the server answering)"
+            )
+        else:
+            source = "placeholder arguments"
+            success = (
+                f"{tool.name} returns a result (an error result still counts as the server "
+                "answering)"
+            )
         steps.append(
             Step(
-                intent=f"Call {tool.name} with placeholder arguments to prove it answers",
+                intent=f"Call {tool.name} with {source} to prove it answers",
                 tool=tool.name,
                 arguments_sketch=arguments,
-                success_looks_like=(
-                    f"{tool.name} returns a result (an error result still counts as the "
-                    "server answering)"
-                ),
+                success_looks_like=success,
             )
         )
+    called = [s.tool for s in steps if s.tool is not None]
+
     rationale_parts = [
-        "Dry run: no LLM was used. One happy path that calls every catalog tool whose required "
-        "arguments can be defaulted from its schema, in catalog order."
+        "Dry run: no LLM was used. One happy path over the allowed tools that share vocabulary "
+        f"with the scenario, most relevant first, at most max_tool_calls={budget}: "
+        + (", ".join(called) if called else "(none)")
+        + "."
     ]
+    if fallback:
+        rationale_parts.append(
+            "No tool shares vocabulary with the scenario, so the first "
+            f"{len(relevant)} candidate(s) in catalog order are called instead."
+        )
+    if filled:
+        rationale_parts.append(
+            "Arguments named by a top-level expected_outcome.json key with a plain value take "
+            "that value: " + ", ".join(filled) + "; other required arguments take schema "
+            "placeholders."
+        )
+    elif called:
+        rationale_parts.append("Required arguments take schema placeholders.")
     if skipped_expensive:
         rationale_parts.append(
             "Skipped because the description says they cost money/credits or are slow: "
             + ", ".join(skipped_expensive)
+            + "."
+        )
+    if skipped_write:
+        rationale_parts.append(
+            "Skipped as write tools (neither the goal nor an instruction asks for a write): "
+            + ", ".join(skipped_write)
+            + "."
+        )
+    if skipped_irrelevant:
+        rationale_parts.append(
+            "Skipped as irrelevant (no shared vocabulary with the scenario): "
+            + ", ".join(skipped_irrelevant)
+            + "."
+        )
+    if skipped_beyond:
+        rationale_parts.append(
+            f"Skipped as least relevant beyond max_tool_calls={budget}: "
+            + ", ".join(skipped_beyond)
             + "."
         )
     if skipped_undefaultable:
@@ -844,7 +984,6 @@ def dry_run_plan(scenario: Scenario, catalog: Catalog) -> ExecutionPlan:
         )
     if not steps:
         rationale_parts.append("No tool qualified, so the path has no steps.")
-    called = [s.tool for s in steps if s.tool is not None]
     checkpoints = [f"transcript: contains a tool_call for {name}" for name in called]
     checkpoints.append(
         "final_result: equals the structured content of the last successful tool result, or "
@@ -853,14 +992,14 @@ def dry_run_plan(scenario: Scenario, catalog: Catalog) -> ExecutionPlan:
     path = Path(
         id=DRY_RUN_PATH_ID,
         kind="happy",
-        title=f"Dry run over {len(called)} catalog tool(s)",
+        title=f"Dry run over {len(called)} goal-relevant tool(s)",
         rationale=" ".join(rationale_parts),
         steps=steps,
         checkpoints=checkpoints,
     )
     # The dry-run plan must satisfy the same rules an LLM plan does.
     problems = validate_draft(PlanDraft(paths=[path]), catalog)
-    if problems:  # pragma: no cover - would be a bug in default_arguments
+    if problems:  # pragma: no cover - would be a bug in dry_run_arguments
         raise PlanError("dry-run plan failed its own validation:\n" + "\n".join(problems))
     return ExecutionPlan(scenario=scenario.name, catalog_digest=catalog.digest(), paths=[path])
 

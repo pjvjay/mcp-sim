@@ -16,6 +16,7 @@ from mcpsim.planner import (
     build_system_prompt,
     default_arguments,
     default_for,
+    dry_run_arguments,
     dry_run_plan,
     example_step,
     extract_draft,
@@ -33,7 +34,8 @@ from mcpsim.planner import (
 from mcpsim.scenario import Scenario, parse_scenario
 from tests.conftest import open_session
 from tests.fake_llm import ScriptedLLM, structured_response, text_response
-from tests.fake_server import EXPENSIVE_TOOL_NAMES, FREE_TOOL_NAMES, TOOL_NAMES, build_server
+from tests.fake_server import EXPENSIVE_TOOL_NAMES, TOOL_NAMES, build_server
+from tests.test_scoping import cheapest_penne_like, pantry_catalog, pantry_scenario
 
 
 @pytest.fixture
@@ -670,7 +672,9 @@ async def test_system_prompt_states_the_six_rules_and_a_real_example_step() -> N
 # --- dry run ----------------------------------------------------------------------------------
 
 
-async def test_dry_run_plan_covers_exactly_the_free_tools(scenario: Scenario) -> None:
+async def test_dry_run_plans_the_relevant_tool_with_arguments_from_the_expected_outcome(
+    scenario: Scenario,
+) -> None:
     catalog = await fake_catalog()
     llm = ScriptedLLM()  # nothing queued: any LLM call would raise
 
@@ -682,28 +686,80 @@ async def test_dry_run_plan_covers_exactly_the_free_tools(scenario: Scenario) ->
     assert len(result.paths) == 1
     only = result.paths[0]
     assert only.id == DRY_RUN_PATH_ID and only.kind == "happy"
-    assert [s.tool for s in only.steps] == list(FREE_TOOL_NAMES)
-    assert sorted(result.tools_used()) == sorted(FREE_TOOL_NAMES)
+    # lookup is the one tool that shares vocabulary with "find the price and store of penne"
+    # (its name is in the instructions; price, store, slug and origin_status are its output
+    # keys); the expected outcome pins slug to "penne", so that is the argument, not "".
+    assert [(s.tool, s.arguments_sketch) for s in only.steps] == [("lookup", {"slug": "penne"})]
+    assert only.title == "Dry run over 1 goal-relevant tool(s)"
+    assert "Call lookup with arguments from the expected outcome" in only.steps[0].intent
+    assert only.steps[0].success_looks_like.startswith('lookup returns a result for slug="penne"')
     for name in EXPENSIVE_TOOL_NAMES:
         assert name not in result.tools_used()
         assert name in only.rationale
     assert "cost" in only.rationale
-    assert only.checkpoints
+    assert "irrelevant (no shared vocabulary with the scenario): fail, list_items, echo." in (
+        only.rationale
+    )
+    assert 'take that value: lookup(slug="penne")' in only.rationale
+    assert only.checkpoints == [
+        "transcript: contains a tool_call for lookup",
+        "final_result: equals the structured content of the last successful tool result, or "
+        "is null when no step returned structured content",
+    ]
 
 
-async def test_dry_run_sketch_arguments_default_required_fields_only(scenario: Scenario) -> None:
+async def test_dry_run_arguments_prefer_expected_values_then_schema_defaults() -> None:
+    server = build_server()
+
+    @server.tool()
+    def search(query: str, limit: int = 2, verbose: bool = False, slug: str = "") -> dict[str, Any]:
+        """Search by query."""
+        return {"query": query, "limit": limit, "verbose": verbose, "slug": slug}
+
+    async with open_session(server) as session:
+        catalog = await session.catalog()
+    tool = catalog.tool("search")
+
+    spec = {"query": "penne", "limit": 5, "verbose": True, "slug": 7, "price": {"$gt": 0}}
+    # A plain string/number of the right type fills required and optional arguments alike; a
+    # boolean is not plain; a number for a string property is ignored.
+    assert dry_run_arguments(tool, spec) == (
+        {"query": "penne", "limit": 5},
+        [],
+        ["query", "limit"],
+    )
+    assert dry_run_arguments(tool, {"price": {"$gt": 0}}) == ({"query": ""}, [], []), (
+        "no expected value: required arguments take placeholders, optional ones are left out"
+    )
+    assert dry_run_arguments(tool, None) == ({"query": ""}, [], [])
+    assert dry_run_arguments(catalog.tool("lookup"), {"slug": "penne"}) == (
+        {"slug": "penne"},
+        [],
+        ["slug"],
+    )
+    assert dry_run_arguments(catalog.tool("fail"), {"reason": "x"}) == (
+        {"reason": "x"},
+        [],
+        ["reason"],
+    )
+
+
+async def test_dry_run_sketch_defaults_required_fields_when_the_outcome_says_nothing(
+    scenario_data: dict[str, Any],
+) -> None:
+    scenario = parse_scenario(
+        {**scenario_data, "expected_outcome": {"json": {"price": {"$gt": 0}}}}, source="test"
+    )
     catalog = await fake_catalog()
     result = await plan(scenario, catalog, None, dry_run=True)
-    sketches = {s.tool: s.arguments_sketch for s in result.paths[0].steps}
-    assert sketches == {
-        "lookup": {"slug": ""},
-        "fail": {},
-        "list_items": {},
-        "echo": {"text": ""},
-    }
+    assert [s.arguments_sketch for s in result.paths[0].steps] == [{"slug": ""}]
+    assert "Required arguments take schema placeholders." in result.paths[0].rationale
+    assert "Call lookup with placeholder arguments" in result.paths[0].steps[0].intent
 
 
-async def test_dry_run_skips_tools_with_undefaultable_required_args(scenario: Scenario) -> None:
+async def test_dry_run_skips_tools_with_undefaultable_required_args(
+    scenario_data: dict[str, Any],
+) -> None:
     server = build_server()
 
     @server.tool()
@@ -718,15 +774,128 @@ async def test_dry_run_skips_tools_with_undefaultable_required_args(scenario: Sc
 
     async with open_session(server) as session:
         catalog = await session.catalog()
+    scenario = parse_scenario(
+        {
+            **scenario_data,
+            "goal": "Use by_filter and flagged to check the names.",
+            "instructions": [],
+            "expected_outcome": {"text": "The flagged names."},
+        },
+        source="test",
+    )
 
     result = dry_run_plan(scenario, catalog)
     only = result.paths[0]
     tools = [s.tool for s in only.steps]
     assert "by_filter" not in tools
-    assert "flagged" in tools
-    assert "by_filter" in only.rationale and "filter" in only.rationale
+    assert tools == ["flagged"], "the only relevant tool whose arguments can be defaulted"
+    assert "by_filter (filter)" in only.rationale
     flagged_step = next(s for s in only.steps if s.tool == "flagged")
     assert flagged_step.arguments_sketch == {"on": False, "names": [], "n": 1}
+
+
+async def test_dry_run_falls_back_to_catalog_order_when_nothing_is_relevant(
+    scenario_data: dict[str, Any],
+) -> None:
+    scenario = parse_scenario(
+        {**scenario_data, "goal": "Zzz.", "instructions": [], "expected_outcome": {"text": "zzz"}},
+        source="test",
+    )
+    catalog = await fake_catalog()
+    result = dry_run_plan(scenario, catalog)
+    only = result.paths[0]
+    assert [s.tool for s in only.steps] == ["lookup", "fail", "list_items"], (
+        "the first three non-expensive candidates in catalog order"
+    )
+    assert "No tool shares vocabulary with the scenario" in only.rationale
+    assert "irrelevant (no shared vocabulary with the scenario): echo." in only.rationale
+    assert "expensive_report" in only.rationale
+
+
+async def test_dry_run_never_plans_more_steps_than_the_tool_budget(
+    scenario_data: dict[str, Any],
+) -> None:
+    scenario = parse_scenario(
+        {
+            **scenario_data,
+            "goal": "Zzz.",
+            "instructions": [],
+            "expected_outcome": {"text": "zzz"},
+            "budgets": {"max_tool_calls": 2},
+        },
+        source="test",
+    )
+    catalog = await fake_catalog()
+    only = dry_run_plan(scenario, catalog).paths[0]
+    assert [s.tool for s in only.steps] == ["lookup", "fail"]
+
+
+# --- dry run against the pantry catalog fixture (what the real suite will plan) ---------------
+
+
+def test_pantry_dry_run_plans_find_product_penne_first_and_no_write_tool(
+    scenario_data: dict[str, Any],
+) -> None:
+    catalog = pantry_catalog()
+    scenario = cheapest_penne_like(scenario_data["server"])
+    only = dry_run_plan(scenario, catalog).paths[0]
+
+    assert only.steps[0].tool == "find_product"
+    assert only.steps[0].arguments_sketch == {"query": "penne"}
+    used = only.tools_used()
+    assert "submit_origin_evidence" not in used and "review_origin_submission" not in used
+    assert not any(name.startswith("plan_") for name in used), "the costly planners"
+    assert len(only.steps) <= scenario.budgets.max_tool_calls
+    assert used[:3] == ["find_product", "get_product", "get_product_origins"]
+    assert only.steps[1].arguments_sketch == {"product_id": 1}, "schema placeholder"
+    assert (
+        "Skipped as write tools (neither the goal nor an instruction asks for a write): "
+        "submit_origin_evidence, review_origin_submission."
+    ) in only.rationale
+    assert "plan_recipe, plan_from_text, plan_week" in only.rationale
+
+
+def test_pantry_dry_run_respects_the_scenario_budget(scenario_data: dict[str, Any]) -> None:
+    catalog = pantry_catalog()
+    scenario = cheapest_penne_like(scenario_data["server"])
+    scenario = scenario.model_copy(
+        update={"budgets": scenario.budgets.model_copy(update={"max_tool_calls": 3})}
+    )
+    only = dry_run_plan(scenario, catalog).paths[0]
+    assert only.tools_used() == ["find_product", "get_product", "get_product_origins"]
+    assert "Skipped as least relevant beyond max_tool_calls=3: " in only.rationale
+
+    committed = pantry_scenario("cheapest-penne")
+    only = dry_run_plan(committed, catalog.filtered(["*"], ["submit_*", "review_*"])).paths[0]
+    assert only.steps[0].tool == "find_product"
+    assert only.steps[0].arguments_sketch == {"query": "penne"}
+    assert len(only.steps) <= committed.budgets.max_tool_calls
+
+
+def test_pantry_dry_run_with_write_intent_fills_the_submission_from_the_expected_outcome() -> None:
+    catalog = pantry_catalog().filtered(
+        [
+            "find_product",
+            "get_product",
+            "list_products",
+            "submit_origin_evidence",
+            "list_origin_submissions",
+            "pipeline_status",
+        ],
+        [],
+    )
+    label = pantry_scenario("label-submission")
+    only = dry_run_plan(label, catalog).paths[0]
+    assert only.steps[0].tool == "submit_origin_evidence"
+    assert only.steps[0].arguments_sketch == {
+        "claim_type": "product-of",
+        "confidence": "high",
+        "country": "Italy",
+        "product_id": 1,
+        "verbatim": "Product of Italy",
+    }, "plain expected values fill the optional confidence too; product_id is an operator"
+    assert "review_origin_submission" not in only.tools_used(), "not in the allowed catalog"
+    assert "Skipped as write tools" not in only.rationale
 
 
 async def test_catalog_digest_changes_when_the_catalog_changes(scenario: Scenario) -> None:
@@ -735,7 +904,7 @@ async def test_catalog_digest_changes_when_the_catalog_changes(scenario: Scenari
 
     @bigger.tool()
     def extra(x: int) -> dict[str, int]:
-        """An extra tool."""
+        """An extra tool that knows the price of penne."""
         return {"x": x}
 
     async with open_session(bigger) as session:

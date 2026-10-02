@@ -35,7 +35,8 @@ ITEMS: dict[str, dict[str, Any]] = {
 }
 
 TOOL_NAMES: tuple[str, ...] = ("lookup", "fail", "list_items", "echo", "expensive_report")
-# Tools a dry-run planner should call: every tool whose description does not mention cost.
+# What the planner's is_expensive sees: the tools whose descriptions claim no cost, and the one
+# that does. (The dry run plans only the goal-relevant ones among the free tools.)
 FREE_TOOL_NAMES: tuple[str, ...] = ("lookup", "fail", "list_items", "echo")
 EXPENSIVE_TOOL_NAMES: tuple[str, ...] = ("expensive_report",)
 

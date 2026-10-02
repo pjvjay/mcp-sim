@@ -38,7 +38,6 @@ from mcpsim.transcript import (
 )
 from mcpsim.verdict import Verdict
 from tests.fake_llm import ScriptedLLM, structured_response
-from tests.fake_server import FREE_TOOL_NAMES
 
 PENNE: dict[str, Any] = {
     "slug": "penne",
@@ -92,32 +91,33 @@ def test_dry_run_writes_every_artefact(quick_path: FsPath, out_dir: FsPath) -> N
     plan = ExecutionPlan.load(run_dir / "plan.json")
     assert plan.scenario == "fake-lookup"
     assert [p.id for p in plan.paths] == [DRY_RUN_PATH_ID]
-    assert plan.paths[0].tools_used() == list(FREE_TOOL_NAMES)
+    # The dry run plans the one goal-relevant tool with the expected outcome's slug.
+    assert [(s.tool, s.arguments_sketch) for s in plan.paths[0].steps] == [
+        ("lookup", {"slug": "penne"})
+    ]
 
     # The transcript's tool_result events came from the real (subprocess) server.
     transcript = Transcript.read_jsonl(run_dir / "transcripts" / f"{stems[1]}.jsonl")
     assert transcript.outcome == "completed"
+    assert transcript.kinds()[:3] == ["system", "tools_offered", "user"]
+    assert transcript.tools_offered() == ["lookup"]
     results = transcript.tool_results()
-    assert [r.name for r in results] == list(FREE_TOOL_NAMES)
-    by_name = {r.name: r for r in results}
-    assert by_name["lookup"].is_error and "unknown slug ''" in by_name["lookup"].text
-    assert by_name["fail"].is_error
-    assert isinstance(by_name["list_items"].structured, dict)
-    assert by_name["list_items"].structured["total"] == 5
-    assert by_name["echo"].structured is None and not by_name["echo"].is_error
-    assert transcript.final_result == by_name["list_items"].structured
+    assert [(r.name, r.is_error) for r in results] == [("lookup", False)]
+    assert results[0].structured == PENNE
+    assert transcript.final_result == PENNE
 
-    # Verdicts come from the matcher alone.
+    # Verdicts come from the matcher alone, and a right answer passes it.
     verdict = Verdict.load(run_dir / "verdicts" / f"{stems[1]}.json")
     assert verdict.judge_model == DRY_RUN_JUDGE_MODEL
     assert verdict.votes == 0
-    assert verdict.passed is False
+    assert verdict.passed is True
     assert verdict.checklist == []
-    assert any(r.startswith("deterministic: slug $eq") for r in verdict.failure_reasons)
+    assert verdict.failure_reasons == []
     assert {m.path for m in verdict.matches} == {"slug", "price", "origin_status"}
+    assert all(m.passed for m in verdict.matches)
 
     report = Report.load(run_dir / "report.json")
-    assert (report.scenario, report.runs, report.passed) == ("fake-lookup", 2, 0)
+    assert (report.scenario, report.runs, report.passed) == ("fake-lookup", 2, 2)
     assert report.judge_models == [DRY_RUN_JUDGE_MODEL]
     assert report.run_dir == str(run_dir)
     assert sorted((c.path_id, c.mode) for c in report.cells) == [
@@ -126,8 +126,8 @@ def test_dry_run_writes_every_artefact(quick_path: FsPath, out_dir: FsPath) -> N
     ]
     md = (run_dir / "report.md").read_text(encoding="utf-8")
     assert md.startswith("# mcp-sim report: fake-lookup\n")
-    assert f"| {DRY_RUN_PATH_ID} | guided | 1 | 0 |" in md
-    assert "deterministic: slug $eq" in md
+    assert f"| {DRY_RUN_PATH_ID} | guided | 1 | 1 |" in md
+    assert "deterministic:" not in md
 
 
 def test_two_runs_in_the_same_second_get_distinct_directories(
@@ -329,13 +329,13 @@ def test_deny_globs_scope_the_plan_the_runs_and_the_digest(
     run_dir = runner.run_scenario(path, out_dir, dry_run=True, repeat=1, mode="guided")
 
     plan = ExecutionPlan.load(run_dir / "plan.json")
-    assert plan.paths[0].tools_used() == ["lookup", "list_items", "echo"]
+    assert plan.paths[0].tools_used() == ["lookup"]
     full = asyncio.run(_fake_catalog())
     assert plan.catalog_digest == full.filtered(["*"], ["fail", "expensive_*"]).digest()
     assert plan.catalog_digest != full.digest()
     stem = f"{DRY_RUN_PATH_ID}-guided-0"
     transcript = Transcript.read_jsonl(run_dir / "transcripts" / f"{stem}.jsonl")
-    assert [c.name for c in transcript.tool_calls()] == ["lookup", "list_items", "echo"]
+    assert [c.name for c in transcript.tool_calls()] == ["lookup"]
     err = capsys.readouterr().err
     assert "warning: tools.deny glob 'nope_*' matches no tool of this server" in err
     assert "glob 'fail'" not in err and "glob 'expensive_*'" not in err
@@ -382,7 +382,7 @@ def test_plan_scenario_writes_plan_and_scenario_json(quick_path: FsPath, out_dir
     assert not (plan_path.parent / "transcripts").exists()
     plan = ExecutionPlan.load(plan_path)
     assert plan.paths[0].id == DRY_RUN_PATH_ID
-    assert plan.paths[0].tools_used() == list(FREE_TOOL_NAMES)
+    assert plan.paths[0].tools_used() == ["lookup"]
     assert len(plan.catalog_digest) == 64
 
 
@@ -469,6 +469,10 @@ def _suite_dir(tmp_path: FsPath, quick_data: dict[str, Any]) -> FsPath:
     folder.mkdir()
     for name in ("fake-b", "fake-a"):
         data = {**quick_data, "name": name}
+        if name == "fake-b":
+            # fake-b expects an origin_status the server never returns, so its dry run fails
+            # the matcher while fake-a's (lookup(slug="penne")) passes it.
+            data["expected_outcome"] = {"json": {"slug": "penne", "origin_status": "unverified"}}
         (folder / f"{name}.yaml").write_text(
             yaml.safe_dump(data, sort_keys=False), encoding="utf-8"
         )
@@ -486,24 +490,25 @@ def test_run_suite_returns_the_threshold_exit_code(
 
     assert runner.run_suite(folder, out_dir, threshold=1.0, dry_run=True) == 1
     out = capsys.readouterr().out
-    assert out.index("fake-a: 0/2 runs passed") < out.index("fake-b: 0/2 runs passed")
-    assert "suite: 0/4 runs passed (0.0%)" in out
+    assert out.index("fake-a: 2/2 runs passed") < out.index("fake-b: 0/2 runs passed")
+    assert "suite: 2/4 runs passed (50.0%)" in out
 
     suite_dirs = sorted(out_dir.glob("suite-*"))
     assert len(suite_dirs) == 1
     suite = SuiteReport.load(suite_dirs[0] / "suite.json")
     assert [s.scenario for s in suite.scenarios] == ["fake-a", "fake-b"]
-    assert (suite.runs, suite.passed, suite.pass_rate) == (4, 0, 0.0)
+    assert (suite.runs, suite.passed, suite.pass_rate) == (4, 2, 0.5)
     assert all(FsPath(s.run_dir).is_dir() for s in suite.scenarios)
     md = (suite_dirs[0] / "suite.md").read_text(encoding="utf-8")
-    assert md.startswith("# mcp-sim suite report\n") and "| fake-a | 2 | 0 |" in md
+    assert md.startswith("# mcp-sim suite report\n") and "| fake-a | 2 | 2 |" in md
+    assert "| fake-b | 2 | 0 |" in md
     assert sorted(p.name for p in out_dir.iterdir() if not p.name.startswith("suite-")) == [
         "fake-a",
         "fake-b",
     ]
 
-    # Nothing passes in dry run, so only a zero threshold yields exit 0.
-    assert runner.run_suite(folder, out_dir, threshold=0.0, dry_run=True) == 0
+    # Half the runs pass, so a threshold at or below the pass rate yields exit 0.
+    assert runner.run_suite(folder, out_dir, threshold=0.5, dry_run=True) == 0
     assert len(sorted(out_dir.glob("suite-*"))) == 2
 
 

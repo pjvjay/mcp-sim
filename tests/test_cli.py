@@ -112,8 +112,9 @@ def test_dry_run_through_the_cli(
         ]
     )
     captured = capsys.readouterr().out
-    assert code == EXIT_FAILURE  # the matcher fails in dry run; the artefacts are the point
-    assert "run dir: " in captured and "0/1 runs passed (0.0%)" in captured
+    # The dry run plans lookup(slug="penne") from the expected outcome, so the matcher passes.
+    assert code == EXIT_OK
+    assert "run dir: " in captured and "1/1 runs passed (100.0%)" in captured
     run_dir = Path(captured.split("run dir: ", 1)[1].splitlines()[0])
     assert (run_dir / "report.md").is_file()
     assert main(["report", str(run_dir), "--threshold", "0"]) == EXIT_OK
