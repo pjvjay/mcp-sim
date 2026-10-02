@@ -47,6 +47,9 @@ class Verdict(BaseModel):
     matches: list[Match] = Field(default_factory=list)
     checklist: list[ChecklistItem] = Field(default_factory=list)
     failure_reasons: list[str] = Field(default_factory=list)
+    # Observer ``flag`` effects on the run (DESIGN §2b); a flag that did not ``fail`` is kept
+    # here and joins ``failure_reasons`` only when the LLM votes fail.
+    flags: list[str] = Field(default_factory=list)
     votes: int = Field(ge=0)
     judge_model: str
 

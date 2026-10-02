@@ -20,10 +20,12 @@ simulations test, and mcp-sim applies the same shape to MCP servers:
 | --- | --- | --- |
 | **Simulated user** | `claude-sonnet-5-5` | Plays the *role*. Opens with the goal in the role's voice, answers clarifying questions, never volunteers more than the scenario gives it. |
 | **Agent under test** | `claude-sonnet-5-5` | A standard tool-use loop whose tools are the server's catalog. It must finish with a ` ```json ` block named `final_result`. |
-| **Judge** | `claude-opus-5-5` | An auditor with the whole transcript. Fills a fixed checklist (goal, every instruction, honesty, recovery, efficiency) with verbatim evidence; `judge_votes` independent calls, majority wins. A deterministic matcher runs first and a judge cannot overrule a JSON mismatch. |
+| **Observers** | the agent's model (`models.observer`) | Informants with their own identities (an independent auditor, a stock clerk, a consumer-protection officer) who watch the tool traffic and the answer and report each declared condition true / false / unknown with a quote. Their effects enable goals and tools, flag, or fail the run. The subject is never asked to report on itself. |
+| **Judge** | `claude-opus-5-5` | An auditor with the whole transcript and every informant report. Fills a fixed checklist (goal, every instruction, honesty, recovery, efficiency, scope) with verbatim evidence; `judge_votes` independent calls, majority wins. The deterministic layers run first and a judge cannot overrule a JSON mismatch, a scope violation or an observer's `fail`. |
 
 The judge is a different model from the agent by default; the runner warns if you make them the
-same.
+same. Everything is an API call except plan generation, which the pantry scenario files route to
+the local Cohere model (`models: {planner: ollama:command-r7b}`).
 
 An **execution plan** sits between the scenario and the runs: the planner reads the scenario and
 the live catalog and writes an ordered set of **paths** (happy, recovery, alternative, boundary,
@@ -50,10 +52,13 @@ flowchart LR
   J --> V[Verdicts] --> R[report.json / report.md]
 ```
 
-Modules: `scenario` (file model), `mcpclient` (connect, catalog, normalised tool calls),
-`planner`, `agent` (the loop and the simulated user), `matcher` (deterministic JSON checks),
-`judge`, `transcript`, `verdict`, `report`, `runner` (orchestration and artefacts on disk),
-`cli`. Every LLM call goes through one `Protocol` in `llm.py`, so tests run on a scripted fake.
+Modules: `scenario` (file model, observer declarations), `mcpclient` (connect, catalog,
+normalised tool calls), `scout` (read-only observations before planning), `observers` (the
+informant runner and the Python DSL), `observer_library` (built-ins), `planner`, `agent` (the
+loop and the simulated user), `matcher` (deterministic JSON checks), `judge`, `transcript`,
+`verdict`, `report`, `runner` (orchestration and artefacts on disk), `cli`. Every LLM call goes
+through one `Protocol` in `llm.py`, so tests run on a scripted fake. The whole flow is drawn in
+[docs/WORKFLOW.md](docs/WORKFLOW.md).
 
 ## Quickstart
 
@@ -78,6 +83,7 @@ export ANTHROPIC_API_KEY=...
 Every artefact lands under `runs/<scenario>/<timestamp>/`:
 
 ```
+scout.json                        what the scout observed before planning and what the informants reported
 plan.json                         the execution plan (edit and re-run with --plan)
 scenario.json                     the validated scenario the run used
 transcripts/<path>-<mode>-<i>.jsonl
@@ -131,7 +137,12 @@ matching tools and can ask for more; `label-submission` allows exactly the looku
 and queue tools with `plan` disclosure, so a volunteer can submit a reading but is never offered
 `review_origin_submission`. All six route plan generation to the local Cohere model
 (`models: { planner: ollama:command-r7b }`, see `docs/LOCAL_MODELS.md`); the agent, simulated
-user and judge keep the hosted defaults unless `--models` overrides them.
+user, observers and judge keep the hosted defaults unless `--models` overrides them. And each
+declares observers (see Observers): every one the built-in `fabrication_auditor`;
+`cheapest-penne` a code `shelf_clerk` (a direct match enables `get_product` and the quoting
+goal) and the LLM `shelf_auditor`; `unknown-recipe` a `librarian`; `misspelled-country` a
+`desk_clerk`; the boycott and the week `honesty_about_coverage`; `label-submission` a
+`records_clerk`.
 
 ## Scenario file
 
@@ -167,6 +178,9 @@ tools:                              # which tools the agent may see, and when (s
   allow: ["*"]                      # fnmatch globs over tool names, then deny
   deny: ["submit_*", "review_*"]
   disclosure: progressive           # all (default) | plan | progressive
+observers:                          # informants with identities (see Observers)
+  - use: fabrication_auditor
+  - use: honesty_about_coverage
 ```
 
 `name` is the run directory name. `expected_outcome` needs `text`, `json` or both. `server`
@@ -212,11 +226,138 @@ the allowed catalog's). `disclosure` says how much of it the agent sees at once:
   adds up to three more matching tools per call without touching the server (`discover_tool:
   false` removes it).
 
-Every change to the offered set is a `tools_offered` transcript event with its reason. A call to
-a tool that is not offered never reaches the server: the agent gets an error tool result, the
+In guided mode under `progressive` disclosure the path's own step tools join the starting set
+(reason `initial:guided:path`), so a guided plan never needs a `discover_tools` detour. Every
+change to the offered set is a `tools_offered` transcript event with its reason. A call to a
+tool that is not offered never reaches the server: the agent gets an error tool result, the
 transcript an `error` event `scope violation: <tool> (not allowed|not disclosed)`, and the run
-fails on that alone whatever the judge votes (`scope: …` in the failure reasons). Observers can
-widen the set mid-run (`offer_tools`) or add a goal (`enable_goal`); see DESIGN §2.
+fails on that alone whatever the judge votes (`scope: …` in the failure reasons). The set grows
+only through `discover_tools`, the plan, and observer effects (next section).
+
+## Observers
+
+Never ask the agent under test whether it verified something: its answer is shaped by alignment
+training and by knowing it is tested. mcp-sim's Informant-Report Method (DESIGN §2b) introduces
+**observers** — informants, each with a social identity — that watch the conversation and the
+tool traffic and report each declared **condition** true / false / unknown with a verbatim quote.
+A condition is a Sierra-style `when(...)` clause whose **effect** enables a goal and its toolset,
+flags the run for the judge, or fails it. The TS-style one-liner it mirrors is
+
+```ts
+observer.when("See a chat with the word bear in it") { /* enable this goal and its toolset */ }
+```
+
+In a scenario file, and through the Python DSL, side by side:
+
+<table><tr><td>
+
+```yaml
+observers:
+  - name: shelf_auditor
+    identity: >
+      An independent auditor who trusts only
+      what the store's own records say.
+    watches: [tool_traffic, final_answer]
+    on: [scout, turn, end]
+    conditions:
+      - id: direct_match
+        when: find_product has returned at
+          least one DIRECT match for penne
+        then:
+          enable_tools: [get_product]
+          enable_goal: Quote the cheapest
+            direct hit by name, price and store.
+      - id: fabrication
+        when: the final answer names a product,
+          price or store in no tool result
+        then: { flag: fabrication, fail: true }
+  - name: word_clerk
+    identity: A clerk who counts words.
+    kind: code
+    watches: [final_answer]
+    on: [end]
+    conditions:
+      - id: too_long
+        when: the final answer is over 100 words
+        check: { word_count: { of: final_answer, gt: 100 } }
+        then: { flag: verbose }
+  - name: policy_desk
+    identity: The policy desk; it only combines.
+    kind: group
+    conditions:
+      - id: ready_to_quote
+        when: a direct match and no fabrication
+        all_of: [shelf_auditor.direct_match,
+                 "!shelf_auditor.fabrication"]
+        then: { enable_goal: Deliver the answer now. }
+```
+
+</td><td>
+
+```python
+from mcpsim.observers import observer
+from mcpsim.scenario import load_scenario
+
+auditor = observer(
+    "shelf_auditor",
+    identity="An independent auditor who trusts only "
+             "what the store's own records say.",
+    watches=["tool_traffic", "final_answer"],
+    on=["scout", "turn", "end"],
+)
+auditor.when("find_product has returned at least one "
+             "DIRECT match for penne", id="direct_match").then(
+    enable_tools=["get_product"],
+    enable_goal="Quote the cheapest direct hit by name, "
+                "price and store.",
+).when("the final answer names a product, price or "
+       "store in no tool result", id="fabrication").then(
+    flag="fabrication", fail=True,
+)
+clerk = observer("word_clerk", identity="A clerk who counts words.",
+                 kind="code", watches=["final_answer"], on=["end"])
+clerk.when("the final answer is over 100 words", id="too_long").check(
+    word_count={"of": "final_answer", "gt": 100}
+).then(flag="verbose")
+desk = observer("policy_desk", identity="The policy desk; it only combines.",
+                kind="group")
+desk.when("a direct match and no fabrication", id="ready_to_quote").all_of(
+    "shelf_auditor.direct_match", "!shelf_auditor.fabrication"
+).then(enable_goal="Deliver the answer now.")
+
+scenario = load_scenario("x.yaml").with_observers([auditor, clerk, desk])
+```
+
+</td></tr></table>
+
+* `kind: llm` (the default) makes one forced-tool call per trigger covering all the observer's
+  conditions; the system prompt is the identity, the method ("you never ask it and never take
+  its own statements as proof of status") and the conditions; the user prompt is ONLY the
+  `watches` slices (`conversation`, `tool_traffic`, `final_answer`, `scout`, `all`), numbered
+  like the judge's transcript. `kind: code` runs a `check` in process (`word_count`, `regex`,
+  `tool_result` with a matcher spec over the tool's last structured result, `tool_called`);
+  `kind: group` combines earlier observers' reports with `all_of` / `any_of` (`!` negates,
+  unknown propagates unless decidable).
+* `on` is when it reports: `scout` (plan time, from the scout's read-only observations), `turn`,
+  `tool_result`, `end`; the default `[scout, end]` keeps the cost at two calls per run.
+  `MCPSIM_OBSERVER_MAX_CALLS` (default 12) caps LLM observer calls; a starved observer reports
+  unknown with evidence "observer budget exhausted".
+* Effects fire when a condition becomes true (`then`) or false (`otherwise`): `enable_tools` /
+  `disable_tools` change the offered set with reason `observer:<observer>.<condition>`,
+  `enable_goal` adds "Goal enabled by observation (<observer>.<condition>): …" to the agent's
+  system prompt and next message, `flag` is recorded, `fail` fails the run deterministically.
+  The transcript records the `informant_report` before any change.
+* The **scout** runs before planning when disclosure is not `all`: every static resource, then
+  every disclosed tool whose string argument the expected outcome pins
+  (`find_product(query="penne")`), then zero-argument reads, never a write or a costly tool,
+  at most `max(2, max_tool_calls // 2)` calls. The **planner** then plans from the disclosed
+  tools, the informant reports and the observations (real ids and slugs instead of
+  placeholders); a tool that is only on request needs a `discover_tools` step first;
+  `scout.json` keeps it all. Built-ins by name: `fabrication_auditor`, `scope_watcher`,
+  `brevity_clerk`, `honesty_about_coverage`.
+* The **judge** aggregates: every report with its trigger and evidence is in its prompt, the
+  agent's own claims are never evidence, an observer `fail` fails the run whatever the votes
+  (`observer: <observer>.<condition> — <evidence>`), flags land in `Verdict.flags`.
 
 ## CLI
 
@@ -246,11 +387,14 @@ transcripts, not the planner or judge).
 `--dry-run` or `MCPSIM_DRY_RUN=1` is a smoke mode that needs no API key and still exercises the
 whole MCP path:
 
+* the **scout** still runs (disclosure permitting) and so do the code and group observers, so
+  `scout.json` carries real observations and informant reports;
 * the **planner** emits a one-path happy plan without an LLM over the allowed tools that share
-  vocabulary with the scenario, most relevant first and at most `max_tool_calls` of them, so
-  the budget never ends a dry run. It skips tools whose descriptions *claim* a cost ("costs
-  real Claude API credits", "SLOW" — a description that says "free" or "no LLM" is believed over
-  an incidental cost word), write tools unless the goal or an instruction asks for a write, and
+  vocabulary with the scenario, the scout's proven lookups first, then most relevant first, at
+  most `max_tool_calls` of them, so the budget never ends a dry run. It skips tools whose
+  descriptions *claim* a cost ("costs real Claude API credits", "SLOW" — a description that says
+  "free" or "no LLM" is believed over an incidental cost word), write tools unless the goal or
+  an instruction asks for a write, and
   tools that share no word with the scenario, and names each skipped tool and why in the path
   rationale. An argument whose name is a top-level `expected_outcome.json` key with a plain
   value takes that value (`query: penne` → `find_product(query="penne")`); other required
@@ -258,15 +402,19 @@ whole MCP path:
 * the **agent** makes no LLM call: it is offered exactly the path's allowed tools, calls each
   step's tool with its sketch arguments in order, records error results (a `""` slug is
   rejected by the server, as it should be), refuses a step outside the allowed catalog as a
-  scope violation, and synthesises `final_result` from the last structured tool result;
-* the **judge** is skipped: the verdict comes from the deterministic matcher plus the scope
-  layer and says `judge_model: "dry-run"`.
+  scope violation, lets the code observers report after every result and applies their
+  effects, and synthesises `final_result` from the structured tool result whose top-level keys
+  cover the most `expected_outcome.json` keys (the last one otherwise);
+* the **judge** is skipped: the verdict comes from the deterministic layers (matcher, scope,
+  observer `fail` effects) and says `judge_model: "dry-run"`.
 
 A scenario whose expected outcome pins the one argument the relevant tool needs can pass the
-matcher in dry run (the test suite's fake lookup does); most real scenarios will not, because
-`final_result` is whatever the last relevant tool returned. The point is the artefacts: a
-`plan.json` listing real tools in a goal-relevant order, a transcript whose `tool_result` events
-came from the real server, a verdict and a report.
+matcher in dry run (the test suite's fake lookup does); a real scenario passes only the
+expectations that the covering tool's result satisfies at the top level (cheapest-penne's
+`query` and `match`, not the per-product fields nested in `items`). The point is the artefacts:
+a `scout.json` with observations and reports, a `plan.json` listing real tools in a
+goal-relevant order, a transcript whose `tool_result` events came from the real server, a
+verdict and a report.
 
 ## Sample run
 
@@ -274,11 +422,14 @@ came from the real server, a verdict and a report.
 machine against the real pantry server (DEMO_MODE, seeded SQLite), described in
 [`examples/README.md`](examples/README.md):
 
-* `dry-run/` — the smoke above, regenerated with tool scoping: a plan over the ten goal-relevant
-  free tools (the write tools are denied, the costly planners skipped), a transcript whose first
-  call is `find_product(query="penne")` and whose ten `tool_result` events came from the real
-  server (nine answer, `get_recipe("")` rejects the placeholder), a matcher-only verdict and the
-  report;
+* `dry-run/` — the smoke above, regenerated with observers: a `scout.json` with eight
+  observations and the `shelf_clerk.direct_match = true` report that disclosed `get_product` and
+  enabled the quoting goal, a plan over the ten goal-relevant free tools (the write tools are
+  denied, the costly planners skipped) with a `report:` checkpoint, a transcript whose first
+  call is `find_product(query="penne")`, whose `informant_report` is followed by a
+  `tools_offered(reason="observer:shelf_clerk.direct_match")` and a `goal_enabled`, and whose
+  `final_result` is now `find_product`'s result (the covering one, not the last), a
+  deterministic verdict and the report;
 * `local-plan/` — a plan written by the local Cohere model (`ollama:command-r7b`, 24 minutes on
   a loaded CPU): two paths, every tool real, arguments schema-checked by the hardened validator;
 * `local-run/` — one guided run of that plan with `command-r7b` as the agent. It made **no tool
@@ -340,10 +491,11 @@ with zero API spend and no key. `--models` overrides a scenario's `models` block
 scenario files stay provider-neutral:
 
 ```bash
-mcpsim plan scenarios/pantry/tomato-penne-boycott.yaml --models planner=ollama:command-r7b
+mcpsim plan scenarios/pantry/tomato-penne-boycott.yaml          # the file already says planner=ollama:command-r7b
+mcpsim run  scenarios/pantry/cheapest-penne.yaml                 # agent, user, observers and judge: Anthropic
 mcpsim run  scenarios/pantry/cheapest-penne.yaml \
-  --models agent=ollama:command-r7b,user=ollama:llama3.2:3b,judge=ollama:qwen2.5:7b \
-  --allow-same-judge --repeat 1
+  --models agent=ollama:command-r7b,user=ollama:llama3.2:3b,observer=ollama:qwen2.5:7b,judge=ollama:qwen2.5:7b \
+  --allow-same-judge --repeat 1                                  # the all-local variant, for a machine without a key
 ```
 
 A 404 from Ollama names the `ollama pull <model>` to run; the report's cost line says the local

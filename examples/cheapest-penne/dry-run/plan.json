@@ -6,7 +6,7 @@
       "id": "happy-dry-run",
       "kind": "happy",
       "title": "Dry run over 10 goal-relevant tool(s)",
-      "rationale": "Dry run: no LLM was used. One happy path over the allowed tools that share vocabulary with the scenario, most relevant first, at most max_tool_calls=10: find_product, get_product, get_product_origins, origin_triage, list_products, rank_products_by_origin, list_origin_submissions, pipeline_status, list_recipes, get_recipe. Arguments named by a top-level expected_outcome.json key with a plain value take that value: find_product(query=\"penne\"); other required arguments take schema placeholders. Skipped because the description says they cost money/credits or are slow: plan_recipe, plan_from_text, plan_week.",
+      "rationale": "Dry run: no LLM was used. One happy path over the allowed tools that share vocabulary with the scenario, most relevant first, at most max_tool_calls=10: find_product, get_product, get_product_origins, origin_triage, list_products, rank_products_by_origin, list_origin_submissions, pipeline_status, list_recipes, get_recipe. The scout already proved these expected-outcome lookups answer, so they come first: find_product. Arguments named by a top-level expected_outcome.json key with a plain value take that value: find_product(query=\"penne\"); other required arguments take schema placeholders. Skipped because the description says they cost money/credits or are slow: plan_recipe, plan_from_text, plan_week.",
       "steps": [
         {
           "intent": "Call find_product with arguments from the expected outcome to prove it answers",
@@ -96,7 +96,8 @@
         "transcript: contains a tool_call for pipeline_status",
         "transcript: contains a tool_call for list_recipes",
         "transcript: contains a tool_call for get_recipe",
-        "final_result: equals the structured content of the last successful tool result, or is null when no step returned structured content"
+        "final_result: equals the structured content of the successful tool result that covers the most expected_outcome.json keys (the last one otherwise), or is null when no step returned structured content",
+        "report: shelf_clerk.direct_match is true"
       ]
     }
   ]

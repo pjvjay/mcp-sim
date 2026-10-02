@@ -1229,9 +1229,7 @@ async def test_tool_result_observer_enables_a_tool_and_a_goal_for_the_next_turn(
         "assistant",
         "tool_call",
         "tool_result",
-        "informant_report",  # the clerk reports again (still true; nothing new to add)
-        "tools_offered",
-        "goal_enabled",
+        "informant_report",  # the clerk reports again: still true, so no effect fires again
         "assistant",
         "final_result",
         "usage",
@@ -1240,7 +1238,6 @@ async def test_tool_result_observer_enables_a_tool_and_a_goal_for_the_next_turn(
     assert offered_events(t) == [
         (["lookup"], "initial:free:progressive"),
         (["echo"], "observer:clerk.found"),
-        ([], "observer:clerk.found"),
     ]
     [first, second] = report_events(t)
     assert first.trigger == "tool_result" and second.trigger == "tool_result"
@@ -1251,6 +1248,7 @@ async def test_tool_result_observer_enables_a_tool_and_a_goal_for_the_next_turn(
     assert first.notes == ["clerk.found: the clerk saw penne"]
     assert first.flags == [] and first.failures == []
     goals = [e for e in t.events if isinstance(e, GoalEnabledEvent)]
+    assert len(goals) == 1, "a condition that stays true enables its goal once"
     assert (goals[0].text, goals[0].reason, goals[0].observer, goals[0].condition) == (
         "Echo the store name back to the person.",
         "observer:clerk.found",
@@ -1462,9 +1460,7 @@ async def test_dry_run_runs_code_observers_and_applies_their_effects(
         "goal_enabled",
         "tool_call",
         "tool_result",
-        "informant_report",
-        "tools_offered",
-        "goal_enabled",
+        "informant_report",  # still true after list_items: reported, no effect re-applied
         "final_result",
         "usage",
         "end",
@@ -1472,7 +1468,6 @@ async def test_dry_run_runs_code_observers_and_applies_their_effects(
     assert offered_events(t) == [
         (["lookup", "list_items"], "initial:guided:dry-run"),
         (["echo"], "observer:clerk.found"),
-        ([], "observer:clerk.found"),
     ]
     assert t.tools_offered() == ["lookup", "list_items", "echo"]
     assert report_events(t)[0].reports[0].evidence == "lookup.slug == 'penne'"

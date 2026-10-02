@@ -109,6 +109,24 @@ too; the local model is simply where their absence shows first.
   servers (Ollama serialises requests anyway); `llama3.2:3b` is the fast option when the task is
   simple, `qwen2.5:7b` a middle ground.
 
+## Observers on local models
+
+Observers (DESIGN §2b) are API calls by default: an LLM observer runs on `models.observer`,
+which falls back to the agent's model, and a per-observer `model` can send one informant to a
+local model (`model: ollama:qwen2.5:7b`) while the rest stay hosted. Cost control is built into
+the design rather than the provider: `on` defaults to `[scout, end]` — one report at plan time
+and one after the final answer — so a scenario with two LLM observers costs two observer calls
+per run unless it asks for `turn` or `tool_result`; `MCPSIM_OBSERVER_MAX_CALLS` (default 12)
+caps the calls per run and the informant then reports `unknown` with evidence "observer budget
+exhausted" rather than being skipped; code and group observers never call a model and are the
+ones that drive the dry run. On a CPU-only local model an observer call at every `tool_result`
+costs as much as an agent turn (minutes), so keep local informants on `[end]`, keep their
+`watches` narrow (a `tool_traffic`-only observer's prompt is a few hundred tokens), and prefer
+a `code` observer with a `tool_result` check whenever the condition is a field in a structured
+result. The scout's planner prompt is bounded by `MCPSIM_PLANNER_PROMPT_BUDGET` (12,000
+characters, about 3k tokens) for the same 8k-window reason as the catalog digest: the pantry
+cheapest-penne prompt with its eight observations and the informant report measures 11,461.
+
 ## Smoke sequence on this machine
 
 ```bash

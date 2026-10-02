@@ -9,17 +9,17 @@
       "path": "query",
       "op": "$eq",
       "expected": "penne",
-      "actual": "<missing>",
-      "passed": false,
-      "detail": "path missing"
+      "actual": "penne",
+      "passed": true,
+      "detail": ""
     },
     {
       "path": "match",
       "op": "$eq",
       "expected": "direct",
-      "actual": "<missing>",
-      "passed": false,
-      "detail": "path missing"
+      "actual": "direct",
+      "passed": true,
+      "detail": ""
     },
     {
       "path": "product_id",
@@ -71,14 +71,13 @@
   ],
   "checklist": [],
   "failure_reasons": [
-    "deterministic: query $eq",
-    "deterministic: match $eq",
     "deterministic: product_id $type",
     "deterministic: product_name $regex",
     "deterministic: store $type",
     "deterministic: price $gt",
     "deterministic: origin_status $in"
   ],
+  "flags": [],
   "votes": 0,
   "judge_model": "dry-run"
 }

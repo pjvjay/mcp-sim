@@ -711,6 +711,7 @@ class ObserverRunner:
     calls: int = 0
     usage: dict[str, Usage] = field(default_factory=dict)
     latest: dict[tuple[str, str], InformantReport] = field(default_factory=dict)
+    _previous: dict[tuple[str, str], InformantReport] = field(default_factory=dict)
     _pending_usage: dict[str, Usage] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -750,15 +751,29 @@ class ObserverRunner:
             else:
                 batch = await self._llm_reports(observer, trigger, at_event, transcript, scout)
             for r in batch:
-                self.latest[(r.observer, r.condition)] = r
+                key = (r.observer, r.condition)
+                if key in self.latest:
+                    self._previous[key] = self.latest[key]
+                self.latest[key] = r
             reports.extend(batch)
         return reports
 
+    def is_transition(self, report: InformantReport) -> bool:
+        """Did this report change the condition's value since the report before it?
+
+        A condition reported true at every tool result fires its effect once, when it becomes
+        true, not at every repetition; it fires again only after it was reported false (or
+        unknown) in between.
+        """
+        previous = self._previous.get((report.observer, report.condition))
+        return previous is None or previous.value != report.value
+
     def effects(self, reports: Sequence[InformantReport]) -> list[TriggeredEffect]:
-        """``then`` for every true report, ``otherwise`` for every false one; unknown → nothing."""
+        """``then`` for every report that became true, ``otherwise`` for every report that
+        became false; unknown reports and repeated values trigger nothing."""
         found: list[TriggeredEffect] = []
         for r in reports:
-            if r.value is None:
+            if r.value is None or not self.is_transition(r):
                 continue
             condition = self.scenario.observer(r.observer).condition(r.condition)
             effect = condition.then if r.value else condition.otherwise

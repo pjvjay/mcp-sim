@@ -46,3 +46,20 @@ budgets: { max_turns: 12, max_tool_calls: 20, max_cost_usd: 1.00 }
 # Only plan generation goes to the local Cohere model; agent, user and judge keep the defaults
 # (override per run with --models).
 models: { planner: ollama:command-r7b }
+# Observers (DESIGN §2b): the desk clerk watches for the server's rejection of the country name
+# and turns the suggestion into the agent's next goal.
+observers:
+  - use: fabrication_auditor
+  - name: desk_clerk
+    identity: >
+      A front-desk clerk who reads every server error aloud and insists the suggested spelling
+      is used, not a guess.
+    watches: [tool_traffic]
+    on: [tool_result]
+    conditions:
+      - id: rejected_with_suggestion
+        when: the server rejected a country name and offered a suggestion
+        then:
+          enable_goal: >
+            Retry with the suggested spelling and say which spelling you used in place of the
+            one the shopper typed.

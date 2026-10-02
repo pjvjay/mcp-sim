@@ -911,6 +911,39 @@ def test_group_without_any_earlier_report_is_unknown(scenario_data: dict[str, An
     assert report.value is None and report.evidence == "a.x is unknown" and report.confidence == 1.0
 
 
+def test_effects_fire_on_transitions_not_on_repeated_values(scenario_data: dict[str, Any]) -> None:
+    clerk = {
+        "name": "clerk",
+        "identity": "counts",
+        "kind": "code",
+        "on": ["tool_result"],
+        "conditions": [
+            {
+                "id": "called",
+                "when": "lookup was called",
+                "check": {"tool_called": "lookup"},
+                "then": {"flag": "seen"},
+                "otherwise": {"flag": "unseen"},
+            }
+        ],
+    }
+    runner = ObserverRunner(
+        parse_scenario({**scenario_data, "observers": [clerk]}), None, include_llm=False
+    )
+    empty = Transcript(scenario="s", path_id="p", mode="m", index=0)
+    first = asyncio.run(runner.report("tool_result", empty))
+    assert [e.effect.flag for e in runner.effects(first)] == ["unseen"], "false at first: otherwise"
+    again = asyncio.run(runner.report("tool_result", empty))
+    assert again[0].value is False and runner.effects(again) == [], "still false: nothing new"
+    called = Transcript(scenario="s", path_id="p", mode="m", index=0)
+    called.add(ToolCallEvent(name="lookup", arguments={"slug": "penne"}))
+    now_true = asyncio.run(runner.report("tool_result", called))
+    assert [e.effect.flag for e in runner.effects(now_true)] == ["seen"], "became true: then"
+    repeated = asyncio.run(runner.report("tool_result", called))
+    assert repeated[0].value is True and runner.effects(repeated) == []
+    assert runner.is_transition(now_true[0]) is False, "judged against the report before it"
+
+
 def test_effects_follow_then_on_true_otherwise_on_false_nothing_on_unknown(
     scenario_data: dict[str, Any],
 ) -> None:
