@@ -185,3 +185,47 @@ async def test_backoff_is_capped() -> None:
 def test_max_attempts_must_be_positive() -> None:
     with pytest.raises(ValueError):
         AnthropicLLM(_StubClient([]), max_attempts=0)  # type: ignore[arg-type]
+
+
+# --- forced tool choice -> auto + instruction (Claude 5.5 / Fable 5.1 reject "tool"/"any") ----
+
+
+def test_translate_tool_choice_table() -> None:
+    from mcpsim.llm import translate_tool_choice
+
+    choice, note = translate_tool_choice({"type": "tool", "name": "emit_execution_plan"})
+    assert choice == {"type": "auto"}
+    assert note is not None and "`emit_execution_plan`" in note and "exactly once" in note
+    choice, note = translate_tool_choice({"type": "any"})
+    assert choice == {"type": "auto"}
+    assert note is not None and "exactly one of the provided tools" in note
+    assert translate_tool_choice({"type": "auto"}) == ({"type": "auto"}, None)
+    assert translate_tool_choice({"type": "none"}) == ({"type": "none"}, None)
+
+
+@pytest.mark.asyncio
+async def test_forced_tool_choice_is_sent_as_auto_with_the_instruction() -> None:
+    llm, _, client = _llm([_message(tool=True)])
+    await llm.complete(
+        model="claude-opus-5-5", system="You plan.", messages=[{"role": "user", "content": "go"}],
+        tools=[{"name": "emit", "description": "d", "input_schema": {"type": "object"}}],
+        tool_choice={"type": "tool", "name": "emit"},
+    )
+    sent = client.messages.kwargs[0]
+    assert sent["tool_choice"] == {"type": "auto"}
+    assert sent["system"].startswith("You plan.")
+    assert "Respond ONLY by calling the tool named `emit` exactly once" in sent["system"]
+    assert llm.forced_choice_translations == 1
+
+
+@pytest.mark.asyncio
+async def test_auto_tool_choice_is_passed_through_unchanged() -> None:
+    llm, _, client = _llm([_message("ok")])
+    await llm.complete(
+        model="claude-sonnet-5-5", system="S", messages=[{"role": "user", "content": "go"}],
+        tools=[{"name": "emit", "description": "d", "input_schema": {"type": "object"}}],
+        tool_choice={"type": "auto"},
+    )
+    sent = client.messages.kwargs[0]
+    assert sent["tool_choice"] == {"type": "auto"} and sent["system"] == "S"
+    assert llm.forced_choice_translations == 0

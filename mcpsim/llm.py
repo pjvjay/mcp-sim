@@ -173,6 +173,34 @@ def is_retryable(exc: BaseException) -> bool:
     return isinstance(exc, anthropic.APIConnectionError)
 
 
+FORCED_CHOICE_TYPES = ("tool", "any")
+
+
+def translate_tool_choice(tool_choice: dict[str, Any]) -> tuple[dict[str, Any], str | None]:
+    """Turn a forced tool choice into ``auto`` plus an instruction the model follows.
+
+    Claude Sonnet 5.5, Opus 5.5 and Fable 5.1 answer ``tool_choice`` ``{"type": "tool"}`` and
+    ``{"type": "any"}`` with a 400 (``tool_choice: type "tool" and "any" are not supported for
+    this model``); the supported pattern is ``auto`` with an explicit instruction naming the tool,
+    the caller validating that the call happened. Planner, judge and observers already validate
+    and re-ask, so the translation is applied to every Anthropic model (Haiku 4.5 still accepts
+    forced choice, but one code path is better than two). ``auto``/``none`` pass through.
+    """
+    kind = tool_choice.get("type")
+    if kind == "tool" and tool_choice.get("name"):
+        name = tool_choice["name"]
+        return {"type": "auto"}, (
+            f"Respond ONLY by calling the tool named `{name}` exactly once, with every "
+            "required argument filled in. Do not write any other text."
+        )
+    if kind == "any":
+        return {"type": "auto"}, (
+            "Respond ONLY by calling exactly one of the provided tools, with every required "
+            "argument filled in. Do not write any other text."
+        )
+    return tool_choice, None
+
+
 class AnthropicLLM:
     """Anthropic Messages API behind the :class:`LLM` protocol."""
 
@@ -199,6 +227,7 @@ class AnthropicLLM:
         self.usage: dict[str, Usage] = {}
         self.calls = 0
         self.retries = 0
+        self.forced_choice_translations = 0
 
     def _record(self, model: str, usage: Usage) -> None:
         self.usage[model] = self.usage.get(model, Usage()) + usage
@@ -230,7 +259,11 @@ class AnthropicLLM:
         if tools:
             kwargs["tools"] = tools
         if tool_choice is not None:
-            kwargs["tool_choice"] = tool_choice
+            choice, note = translate_tool_choice(tool_choice)
+            kwargs["tool_choice"] = choice
+            if note:
+                kwargs["system"] = f"{system.rstrip()}\n\n{note}"
+                self.forced_choice_translations += 1
 
         attempt = 0
         while True:
