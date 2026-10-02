@@ -289,6 +289,17 @@ machine against the real pantry server (DEMO_MODE, seeded SQLite), described in
 
 ## Pointing at the live pantry `/mcp`
 
+### Through a gateway
+
+Any MCP endpoint works as a `server.http` target, including an MCP gateway that federates several
+servers behind one URL. The pantry platform's gateway (IBM ContextForge) lives in its own
+repository, [pantry-gateway](https://github.com/pjvjay/pantry-gateway), with the registration
+scripts and the notes; gateways typically prefix federated tool names (`find_product` →
+`pantry-find-product`), which is why issue #5 proposes a `server.tool_names` mapping so one
+scenario file can run direct or through a gateway. The end-to-end flow is drawn in
+[docs/WORKFLOW.md](docs/WORKFLOW.md).
+
+
 The pantry API mounts the same MCP server at `/mcp` over Streamable HTTP (public:
 `https://<host>/pantry/api/mcp`). Replace the `stdio` section with `http`, name the environment
 variable that holds the bearer token, and export it; the token itself never goes in a file:
