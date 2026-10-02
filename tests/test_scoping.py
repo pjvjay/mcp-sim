@@ -319,6 +319,32 @@ def test_initial_tools_forces_in_tools_whose_output_covers_an_expected_key(
     assert "pipeline_status" in chosen
     assert chosen[0] == "pipeline_status", "the only tool with any relevance ranks first"
 
+    # The rule has to bite when the covering tool is NOT in the top-k: a recipe goal ranks
+    # list_recipes first (8) and pipeline_status second (6); with k=1 only the force-in rule
+    # keeps pipeline_status, and the floor of three pads with get_recipe (5).
+    recipes = parse_scenario(
+        {
+            **scenario_data,
+            "goal": "List the recipes and open the recipe for pbj.",
+            "instructions": [],
+            "expected_outcome": {"json": {"routing_strategy": {"$type": "string"}}},
+        },
+        source="t",
+    )
+    assert [t.name for t in initial_tools(recipes, catalog, k=1)] == [
+        "list_recipes",
+        "pipeline_status",
+        "get_recipe",
+    ]
+    without_key = recipes.model_copy(
+        update={"expected_outcome": recipes.expected_outcome.model_copy(update={"json": None})}
+    )
+    assert [t.name for t in initial_tools(without_key, catalog, k=1)] == [
+        "list_recipes",
+        "get_recipe",
+        "list_products",
+    ], "no expected key to cover: top-1 plus catalog-order padding, pipeline_status absent"
+
 
 def test_initial_tools_includes_write_tools_only_with_write_intent(catalog: Catalog) -> None:
     label = pantry_scenario("label-submission")
