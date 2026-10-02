@@ -198,7 +198,30 @@ def plan_input_schema(catalog: Catalog, view: PlannerView | None = None) -> dict
     if not isinstance(step_schema, dict):  # pragma: no cover - pydantic always nests Step
         raise PlanError("PlanDraft schema has no $defs.Step to constrain")
     step_schema["properties"]["tool"] = tool_schema
-    return schema
+    return strict_structured_schema(schema)
+
+
+def strict_structured_schema(schema: Any) -> Any:
+    """Every property of every structured object required, no extra keys, no defaults.
+
+    Pydantic marks a field with a default as optional, and a grammar-constrained decoder
+    (Ollama ``format``) only forces what the schema requires: command-r7b, handed the plain
+    model schema, emitted steps with no ``tool`` and no ``success_looks_like`` and named the
+    tool only in prose. Requiring every key (nullable ones stay nullable) makes the decoder
+    produce a ``tool`` slot on every step. Free-form objects (no ``properties``, e.g.
+    ``arguments_sketch``) are left open. Titles and defaults are dropped as decoding noise.
+    """
+    if isinstance(schema, list):
+        return [strict_structured_schema(item) for item in schema]
+    if not isinstance(schema, dict):
+        return schema
+    out = {k: strict_structured_schema(v) for k, v in schema.items()
+           if k not in ("default", "title")}
+    props = out.get("properties")
+    if isinstance(props, dict) and props:
+        out["required"] = list(props)
+        out["additionalProperties"] = False
+    return out
 
 
 def plan_tool_definition(catalog: Catalog, view: PlannerView | None = None) -> dict[str, Any]:

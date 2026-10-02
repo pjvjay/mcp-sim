@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from typing import Any
 
 import pytest
@@ -288,11 +289,13 @@ def test_plan_tool_definition_shape() -> None:
     step_tool = tool["input_schema"]["$defs"]["Step"]["properties"]["tool"]
     assert step_tool["anyOf"] == [{"type": "string", "enum": ["a", "b"]}, {"type": "null"}]
     assert tool_name_enum(catalog) == ["a", "b"]
-    # Path.kind is an enum too, and expect_error is a boolean that defaults to false.
+    # Path.kind is an enum too; expect_error is a required boolean in the strict schema (the
+    # model default still applies when validating, but a constrained decoder must emit it).
     kind = tool["input_schema"]["$defs"]["Path"]["properties"]["kind"]
     assert set(kind["enum"]) == {"happy", "recovery", "alternative", "boundary", "policy"}
     expect = tool["input_schema"]["$defs"]["Step"]["properties"]["expect_error"]
-    assert expect == {"default": False, "title": "Expect Error", "type": "boolean"}
+    assert expect == {"type": "boolean"}
+    assert "expect_error" in tool["input_schema"]["$defs"]["Step"]["required"]
     # An empty catalog leaves only the no-tool step (an empty enum is not a valid schema).
     empty = plan_input_schema(Catalog())["$defs"]["Step"]["properties"]["tool"]
     assert empty["anyOf"] == [{"type": "null"}]
@@ -976,3 +979,25 @@ def test_system_prompt_lists_resources_templates_and_prompts() -> None:
     assert "TOOLS (1)" in text and "RESOURCES (0)" in text
     assert "RESOURCE TEMPLATES (0)" in text and "PROMPTS (0)" in text
     assert PLAN_TOOL_NAME in text
+
+
+def test_plan_schema_requires_every_step_field_for_constrained_decoders() -> None:
+    """command-r7b under Ollama ``format`` skipped ``tool`` because the schema left it optional."""
+    from mcpsim.mcpclient import Catalog, ToolInfo
+    from mcpsim.planner import plan_input_schema
+
+    catalog = Catalog(tools=[ToolInfo(name="find_product", input_schema={"type": "object"})])
+    schema = plan_input_schema(catalog)
+    step = schema["$defs"]["Step"]
+    assert step["required"] == ["intent", "tool", "arguments_sketch", "success_looks_like",
+                                "expect_error"]
+    assert step["additionalProperties"] is False
+    assert step["properties"]["tool"]["anyOf"] == [
+        {"type": "string", "enum": ["find_product"]}, {"type": "null"}]
+    path = schema["$defs"]["Path"]
+    assert set(path["required"]) == set(path["properties"])
+    assert schema["required"] == ["paths"]
+    # free-form arguments stay open; nothing carries a default or a title any more
+    assert "required" not in step["properties"]["arguments_sketch"]
+    text = json.dumps(schema)
+    assert '"default"' not in text and '"title"' not in text
