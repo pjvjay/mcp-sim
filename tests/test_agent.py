@@ -23,17 +23,21 @@ from mcpsim.agent import (
 from mcpsim.judge import scope_violations
 from mcpsim.llm import Usage, estimate_cost_usd
 from mcpsim.mcpclient import ToolResult
+from mcpsim.observers import REPORT_TOOL
 from mcpsim.plan import Mode, Path, Step, StepReference
 from mcpsim.scenario import Scenario, parse_scenario
 from mcpsim.transcript import (
+    AssistantEvent,
     ErrorEvent,
+    FinalResultEvent,
     GoalEnabledEvent,
+    InformantReportEvent,
     ToolsOfferedEvent,
     Transcript,
     UserEvent,
 )
 from tests.conftest import open_session
-from tests.fake_llm import ScriptedLLM, text_response, tool_use_response
+from tests.fake_llm import ScriptedLLM, structured_response, text_response, tool_use_response
 
 HAPPY_SEQUENCE = [
     "system",
@@ -453,8 +457,9 @@ async def test_dry_run_calls_every_step_and_synthesises_final_result(scenario: S
     ]
     assert [c.name for c in t.tool_calls()] == ["lookup", "fail", "echo", "list_items"]
     assert [r.is_error for r in t.tool_results()] == [False, True, False, False]
-    assert t.final_result == t.tool_results()[-1].structured
-    assert isinstance(t.final_result, dict) and t.final_result["total"] == 5
+    # lookup's result covers slug, price and origin_status of the expected outcome; the
+    # list_items page that came last covers none of them.
+    assert t.final_result == t.tool_results()[0].structured == PENNE
     assert t.events[2].text == scenario.goal.strip()
     assert t.events[0].models == {"agent": "dry-run", "user": "dry-run"}
     assert t.usage == {} and t.cost_usd == 0.0
@@ -548,7 +553,7 @@ async def test_dry_run_skips_a_step_whose_reference_cannot_be_resolved(
     assert "step 9 has not run" in errors[2]
     assert "step 6 called no tool" in errors[3]
     assert "4 step(s) skipped over unresolved references" in t.reason
-    assert isinstance(t.final_result, dict) and t.final_result["total"] == 5
+    assert t.final_result == PENNE, "lookup's result covers the expected keys; the page does not"
 
 
 async def test_dry_run_treats_an_expected_error_as_the_planned_outcome(
@@ -865,9 +870,16 @@ async def test_progressive_initial_globs_replace_the_scoring_and_discover_tool_c
         scenario_data, disclosure="progressive", initial=["echo", "list_*"], discover_tool=False
     )
     llm = ScriptedLLM([opening(), text_response(FINAL_TEXT)])
-    t = await run(explicit, llm)
+    t = await run(explicit, llm, mode="free")
     assert offered_to(llm, 1) == ["list_items", "echo"], "glob matches in catalog order"
-    assert offered_events(t) == [(["list_items", "echo"], "initial:guided:progressive")]
+    assert offered_events(t) == [(["list_items", "echo"], "initial:free:progressive")]
+    llm = ScriptedLLM([opening(), text_response(FINAL_TEXT)])
+    t = await run(explicit, llm, mode="guided")
+    assert offered_to(llm, 1) == ["list_items", "echo", "lookup"], "plus the path's lookup"
+    assert offered_events(t) == [
+        (["list_items", "echo"], "initial:guided:progressive"),
+        (["lookup"], "initial:guided:path"),
+    ]
 
 
 async def test_discover_tools_adds_the_matching_tool_for_the_next_turn_without_a_server_call(
@@ -884,14 +896,16 @@ async def test_discover_tools_adds_the_matching_tool_for_the_next_turn_without_a
         ]
     )
     async with open_session() as session:
-        t = await run_path(progressive, two_tool_path(), "guided", 0, session, llm)
+        # free mode: in guided mode the path's own tools would already be offered (see
+        # test_guided_progressive_offers_the_paths_tools_too below)
+        t = await run_path(progressive, two_tool_path(), "free", 0, session, llm)
         assert session.tool_calls == 1, "discover_tools never reached the server; list_items did"
 
     assert t.outcome == "completed", t.reason  # max_tool_calls=1 was not spent on discovery
     assert offered_to(llm, 1) == ["lookup", DISCOVER_TOOL_NAME]
     assert offered_to(llm, 2) == ["lookup", "list_items", DISCOVER_TOOL_NAME]
     assert offered_events(t) == [
-        (["lookup"], "initial:guided:progressive"),
+        (["lookup"], "initial:free:progressive"),
         (["list_items"], "discover_tools:items"),
     ]
     assert t.kinds() == [
@@ -936,8 +950,8 @@ async def test_discover_tools_with_no_match_offers_nothing_and_says_so(
             text_response(FINAL_TEXT),
         ]
     )
-    t = await run(progressive, llm)
-    assert offered_events(t) == [(["lookup"], "initial:guided:progressive")]
+    t = await run(progressive, llm, mode="free")
+    assert offered_events(t) == [(["lookup"], "initial:free:progressive")]
     no_match, no_query = t.tool_results()
     assert no_match.is_error is False
     assert no_match.text.startswith("No further tool matches 'zzz'; 4 undisclosed tool(s)")
@@ -958,7 +972,7 @@ async def test_tool_use_for_an_undisclosed_tool_is_refused_without_reaching_the_
         ]
     )
     async with open_session() as session:
-        t = await run_path(progressive, two_tool_path(), "guided", 0, session, llm)
+        t = await run_path(progressive, two_tool_path(), "free", 0, session, llm)
         assert session.tool_calls == 1, "only lookup reached the server"
 
     assert t.outcome == "completed" and t.final_result == PENNE
@@ -1047,15 +1061,13 @@ async def test_observer_hooks_offer_tools_and_enable_goal(scenario_data: dict[st
         ]
     )
     async with open_session() as session:
-        t = await run_path(
-            progressive, two_tool_path(), "guided", 0, session, llm, on_start=on_start
-        )
+        t = await run_path(progressive, two_tool_path(), "free", 0, session, llm, on_start=on_start)
 
     assert t.outcome == "completed"
     assert offered_to(llm, 1) == ["lookup", "echo", DISCOVER_TOOL_NAME]
     assert offered_to(llm, 2) == ["lookup", "echo", "list_items", DISCOVER_TOOL_NAME]
     assert offered_events(t) == [
-        (["lookup"], "initial:guided:progressive"),
+        (["lookup"], "initial:free:progressive"),
         (["echo"], "observer:needs echo"),
         (["list_items"], "observer:page"),
     ]
@@ -1071,11 +1083,18 @@ async def test_observer_hooks_offer_tools_and_enable_goal(scenario_data: dict[st
     first = llm.calls[1]["messages"][0]["content"]
     assert first[0] == {"type": "text", "text": opening_text}
     assert first[1]["type"] == "text" and first[1]["text"].startswith("## Additional goal")
-    assert "opening hours" in first[1]["text"]
+    assert (
+        "- Goal enabled by observation (observer:hours): Also tell me the store's opening hours."
+    ) in first[1]["text"]
     second = llm.calls[2]["messages"][-1]["content"]
     assert second[0]["type"] == "tool_result" and second[0]["tool_use_id"] == "toolu_1"
     assert second[1]["type"] == "text" and "total number of products" in second[1]["text"]
     assert "opening hours" not in second[1]["text"]
+    # Both goals also persist in the system prompt of every later turn.
+    assert "## Goals enabled by observation" not in llm.calls[0]["system"]
+    assert "Goal enabled by observation (observer:hours)" in llm.calls[1]["system"]
+    assert "(observer:total): And the total number of products." in llm.calls[2]["system"]
+    assert "(observer:total)" not in llm.calls[1]["system"]
 
 
 async def test_dry_run_refuses_a_step_whose_tool_the_scenario_denies(
@@ -1115,3 +1134,378 @@ async def test_dry_run_refuses_a_step_whose_tool_the_scenario_denies(
     assert [c.name for c in t.tool_calls()] == ["lookup", "list_items"]
     assert error_messages(t) == ["scope violation: fail (not allowed)"]
     assert scope_violations(t) == ["fail (not allowed)"]
+
+
+# ------------------------------------------------------------------------------------------
+# guided + progressive: the path's tools are offered too (no discover_tools detour)
+
+
+async def test_guided_progressive_offers_the_paths_tools_too(scenario_data: dict[str, Any]) -> None:
+    progressive = scoped(scenario_data, disclosure="progressive", initial=["lookup"])
+    llm = ScriptedLLM([opening(), text_response(FINAL_TEXT)])
+    t = await run(progressive, llm, mode="guided")
+    assert offered_to(llm, 1) == ["lookup", "list_items", DISCOVER_TOOL_NAME]
+    assert offered_events(t) == [
+        (["lookup"], "initial:guided:progressive"),
+        (["list_items"], "initial:guided:path"),
+    ]
+    assert t.kinds()[:4] == ["system", "tools_offered", "tools_offered", "user"]
+    # Already-offered path tools add no second event; free mode never unions the path.
+    llm = ScriptedLLM([opening(), text_response(FINAL_TEXT)])
+    t = await run(scoped(scenario_data, disclosure="progressive"), llm, mode="guided")
+    assert offered_events(t) == [(["lookup", "fail", "list_items"], "initial:guided:progressive")]
+    llm = ScriptedLLM([opening(), text_response(FINAL_TEXT)])
+    t = await run(progressive, llm, mode="free")
+    assert offered_events(t) == [(["lookup"], "initial:free:progressive")]
+    # Not under plan disclosure either (guided already offers exactly the path's tools).
+    llm = ScriptedLLM([opening(), text_response(FINAL_TEXT)])
+    t = await run(scoped(scenario_data, disclosure="plan"), llm, mode="guided")
+    assert offered_events(t) == [(["lookup", "list_items"], "initial:guided:plan")]
+
+
+# ------------------------------------------------------------------------------------------
+# observers in the loop: reports, then effects, before the next LLM call
+
+
+def observed(scenario_data: dict[str, Any], *observers: dict[str, Any], **tools: Any) -> Scenario:
+    data: dict[str, Any] = {**scenario_data, "observers": list(observers)}
+    if tools:
+        data["tools"] = tools
+    return parse_scenario(data, source="fixture")
+
+
+CLERK: dict[str, Any] = {
+    "name": "clerk",
+    "identity": "A stock clerk who reads the lookup result and nothing else.",
+    "kind": "code",
+    "watches": ["tool_traffic"],
+    "on": ["tool_result"],
+    "conditions": [
+        {
+            "id": "found",
+            "when": "lookup returned the penne record",
+            "check": {"tool_result": {"tool": "lookup", "where": {"slug": "penne"}}},
+            "then": {
+                "enable_tools": ["echo"],
+                "enable_goal": "Echo the store name back to the person.",
+                "note": "the clerk saw penne",
+            },
+        }
+    ],
+}
+
+
+def report_events(t: Transcript) -> list[InformantReportEvent]:
+    return [e for e in t.events if isinstance(e, InformantReportEvent)]
+
+
+async def test_tool_result_observer_enables_a_tool_and_a_goal_for_the_next_turn(
+    scenario_data: dict[str, Any],
+) -> None:
+    scenario = observed(scenario_data, CLERK, disclosure="progressive", initial=["lookup"])
+    llm = ScriptedLLM(
+        [
+            opening(),
+            tool_use_response("lookup", {"slug": "penne"}, tool_use_id="toolu_1"),
+            tool_use_response("echo", {"text": "Fake Mart"}, tool_use_id="toolu_2"),
+            text_response(FINAL_TEXT),
+        ]
+    )
+    t = await run(scenario, llm, mode="free")
+
+    assert t.outcome == "completed", t.reason
+    assert offered_to(llm, 1) == ["lookup", DISCOVER_TOOL_NAME], "echo is not offered yet"
+    assert offered_to(llm, 2) == ["lookup", "echo", DISCOVER_TOOL_NAME], "enabled by the report"
+    assert t.kinds() == [
+        "system",
+        "tools_offered",
+        "user",
+        "assistant",
+        "tool_call",
+        "tool_result",
+        "informant_report",  # the report is recorded BEFORE anything changes
+        "tools_offered",
+        "goal_enabled",
+        "assistant",
+        "tool_call",
+        "tool_result",
+        "informant_report",  # the clerk reports again (still true; nothing new to add)
+        "tools_offered",
+        "goal_enabled",
+        "assistant",
+        "final_result",
+        "usage",
+        "end",
+    ]
+    assert offered_events(t) == [
+        (["lookup"], "initial:free:progressive"),
+        (["echo"], "observer:clerk.found"),
+        ([], "observer:clerk.found"),
+    ]
+    [first, second] = report_events(t)
+    assert first.trigger == "tool_result" and second.trigger == "tool_result"
+    [report] = first.reports
+    assert (report.observer, report.condition, report.value) == ("clerk", "found", True)
+    assert report.evidence == "lookup.slug == 'penne'"
+    assert report.confidence == 1.0 and report.at_event == 5, "the tool_result event's index"
+    assert first.notes == ["clerk.found: the clerk saw penne"]
+    assert first.flags == [] and first.failures == []
+    goals = [e for e in t.events if isinstance(e, GoalEnabledEvent)]
+    assert (goals[0].text, goals[0].reason, goals[0].observer, goals[0].condition) == (
+        "Echo the store name back to the person.",
+        "observer:clerk.found",
+        "clerk",
+        "found",
+    )
+    goal_line = "Goal enabled by observation (clerk.found): Echo the store name back to the person."
+    assert goal_line not in llm.calls[1]["system"]
+    assert "## Goals enabled by observation\n- " + goal_line in llm.calls[2]["system"]
+    note = llm.calls[2]["messages"][-1]["content"]
+    assert note[0]["type"] == "tool_result" and note[1]["text"].startswith("## Additional goal")
+    assert goal_line in note[1]["text"]
+    assert t.flags == [] and t.hard_failures == []
+    assert t.usage == {scenario.models.agent: Usage(input_tokens=40, output_tokens=20)}, (
+        "code observers cost nothing"
+    )
+
+
+async def test_turn_observer_reports_after_every_assistant_turn(
+    scenario_data: dict[str, Any],
+) -> None:
+    counter = {
+        "name": "counter",
+        "identity": "counts turns",
+        "kind": "code",
+        "on": ["turn"],
+        "conditions": [
+            {
+                "id": "spoke",
+                "when": "the assistant said something",
+                "check": {"regex": {"of": "last_assistant", "pattern": "."}},
+            }
+        ],
+    }
+    scenario = observed(scenario_data, counter)
+    llm = ScriptedLLM(
+        [
+            opening(),
+            tool_use_response("lookup", {"slug": "penne"}, tool_use_id="toolu_1", text="Looking."),
+            text_response(FINAL_TEXT),
+        ]
+    )
+    t = await run(scenario, llm)
+    events = report_events(t)
+    assert [e.trigger for e in events] == ["turn", "turn"]
+    assistant_indexes = [i for i, e in enumerate(t.events) if isinstance(e, AssistantEvent)]
+    assert [e.reports[0].at_event for e in events] == assistant_indexes
+    assert [e.reports[0].value for e in events] == [True, True]
+    assert t.kinds()[3:5] == ["assistant", "informant_report"]
+
+
+async def test_fail_effect_marks_the_transcript_and_flags_are_kept(
+    scenario_data: dict[str, Any],
+) -> None:
+    watcher = {
+        "name": "scope_watcher",
+        "identity": "A gatekeeper who only reads the error log.",
+        "kind": "code",
+        "watches": ["all"],
+        "on": ["end"],
+        "conditions": [
+            {
+                "id": "violation",
+                "when": "a tool outside the offered set was called",
+                "check": {"regex": {"of": "errors", "pattern": "^scope violation: "}},
+                "then": {"flag": "out_of_scope", "fail": True},
+            },
+            {
+                "id": "brief",
+                "when": "the final answer is under 150 words",
+                "check": {"word_count": {"of": "final_answer", "lt": 150}},
+                "otherwise": {"flag": "verbose"},
+            },
+        ],
+    }
+    scenario = observed(scenario_data, watcher, disclosure="progressive", initial=["lookup"])
+    llm = ScriptedLLM(
+        [
+            opening(),
+            tool_use_response("list_items", {"cursor": 0}, tool_use_id="toolu_x"),
+            tool_use_response("lookup", {"slug": "penne"}, tool_use_id="toolu_1"),
+            text_response(FINAL_TEXT),
+        ]
+    )
+    t = await run(scenario, llm, mode="free")
+    assert t.outcome == "completed"
+    [event] = report_events(t)
+    assert event.trigger == "end"
+    assert [(r.condition, r.value) for r in event.reports] == [("violation", True), ("brief", True)]
+    assert event.flags == ["out_of_scope"]
+    assert event.failures == [
+        "scope_watcher.violation — matched '^scope violation: ' in error: scope violation: "
+        "list_items (not disclosed)"
+    ]
+    assert t.flags == ["out_of_scope"] and t.hard_failures == event.failures
+    assert t.kinds()[-4:] == ["final_result", "informant_report", "usage", "end"]
+    saved = Transcript.from_events(list(t.events))
+    assert saved.hard_failures == t.hard_failures and saved.flags == t.flags
+
+
+async def test_llm_observer_usage_is_charged_to_the_run(scenario_data: dict[str, Any]) -> None:
+    auditor = {
+        "name": "auditor",
+        "identity": "An independent auditor.",
+        "watches": ["final_answer"],
+        "on": ["end"],
+        "model": "claude-haiku-4-5-20251001",
+        "conditions": [
+            {"id": "ok", "when": "the answer quotes a price", "then": {"flag": "priced"}}
+        ],
+    }
+    scenario = observed(scenario_data, auditor)
+    agent_llm = ScriptedLLM([opening(), text_response(FINAL_TEXT)])
+    observer_llm = ScriptedLLM(
+        [
+            structured_response(
+                REPORT_TOOL,
+                {"reports": [{"condition_id": "ok", "value": True, "evidence": "[4] $2.49"}]},
+            )
+        ]
+    )
+    async with open_session() as session:
+        t = await run_path(
+            scenario, two_tool_path(), "guided", 0, session, agent_llm, observer_llm=observer_llm
+        )
+    assert t.outcome == "completed"
+    assert len(observer_llm.calls) == 1 and observer_llm.calls[0]["model"] == auditor["model"]
+    assert "## Final answer" in observer_llm.calls[0]["messages"][0]["content"]
+    assert "An independent auditor." in observer_llm.calls[0]["system"]
+    assert t.usage == {
+        scenario.models.agent: Usage(input_tokens=20, output_tokens=10),
+        "claude-haiku-4-5-20251001": Usage(input_tokens=10, output_tokens=5),
+    }
+    assert t.flags == ["priced"] and t.hard_failures == []
+    [event] = report_events(t)
+    assert event.reports[0].evidence == "[4] $2.49" and event.reports[0].trigger == "end"
+    # Without observer_llm the agent's LLM serves the observers (and gets the call).
+    both = ScriptedLLM(
+        [
+            opening(),
+            text_response(FINAL_TEXT),
+            structured_response(REPORT_TOOL, {"reports": [{"condition_id": "ok", "value": False}]}),
+        ]
+    )
+    t = await run(scenario, both)
+    assert both.calls[2]["model"] == auditor["model"]
+    assert report_events(t)[0].reports[0].value is False and t.flags == []
+
+
+async def test_observer_cost_counts_against_the_cost_budget(scenario_data: dict[str, Any]) -> None:
+    auditor = {
+        "name": "auditor",
+        "identity": "An independent auditor.",
+        "on": ["turn"],
+        "conditions": [{"id": "ok", "when": "fine"}],
+    }
+    scenario = with_budgets(observed(scenario_data, auditor), max_cost_usd=0.001)
+    heavy = Usage(input_tokens=100_000, output_tokens=1)
+    agent_llm = ScriptedLLM([opening(), text_response(FINAL_TEXT)])
+    observer_llm = ScriptedLLM(
+        [
+            structured_response(REPORT_TOOL, {"reports": []}, model="x").model_copy(
+                update={"usage": heavy}
+            )
+        ]
+    )
+    async with open_session() as session:
+        t = await run_path(
+            scenario, two_tool_path(), "guided", 0, session, agent_llm, observer_llm=observer_llm
+        )
+    assert t.outcome == "budget_exceeded" and t.reason.startswith("max_cost_usd=0.001 exceeded")
+    assert t.usage[scenario.models.agent].input_tokens == 100_020, "user + agent + observer"
+    assert t.kinds()[-3:] == ["informant_report", "usage", "end"]
+
+
+# ------------------------------------------------------------------------------------------
+# dry run: code observers, their effects, and the covering final_result
+
+
+async def test_dry_run_runs_code_observers_and_applies_their_effects(
+    scenario_data: dict[str, Any],
+) -> None:
+    llm_observer = {
+        "name": "auditor",
+        "identity": "needs a model",
+        "on": ["tool_result", "end"],
+        "conditions": [{"id": "x", "when": "x", "then": {"fail": True}}],
+    }
+    scenario = observed(scenario_data, CLERK, llm_observer)
+    path = Path(
+        id="dry",
+        kind="happy",
+        title="dry",
+        steps=[
+            Step(intent="look", tool="lookup", arguments_sketch={"slug": "penne"}),
+            Step(intent="page", tool="list_items", arguments_sketch={"cursor": 0, "limit": 2}),
+        ],
+    )
+    t = await run(scenario, None, path=path, dry_run=True)
+    assert t.outcome == "completed", t.reason
+    assert t.kinds() == [
+        "system",
+        "tools_offered",
+        "user",
+        "tool_call",
+        "tool_result",
+        "informant_report",
+        "tools_offered",
+        "goal_enabled",
+        "tool_call",
+        "tool_result",
+        "informant_report",
+        "tools_offered",
+        "goal_enabled",
+        "final_result",
+        "usage",
+        "end",
+    ], "no LLM observer report anywhere: the dry run runs code and group observers only"
+    assert offered_events(t) == [
+        (["lookup", "list_items"], "initial:guided:dry-run"),
+        (["echo"], "observer:clerk.found"),
+        ([], "observer:clerk.found"),
+    ]
+    assert t.tools_offered() == ["lookup", "list_items", "echo"]
+    assert report_events(t)[0].reports[0].evidence == "lookup.slug == 'penne'"
+    assert t.hard_failures == [] and t.flags == []
+    assert t.final_result == PENNE, "lookup's result covers slug, price and origin_status"
+
+
+def test_best_final_result_prefers_the_result_covering_the_most_expected_keys() -> None:
+    from mcpsim.agent import best_final_result
+
+    page = {"items": [PENNE], "next_cursor": None, "total": 5}
+    assert best_final_result([PENNE, page], ["slug", "price", "origin_status"]) == PENNE
+    assert best_final_result([page, PENNE], ["slug", "price", "origin_status"]) == PENNE
+    assert best_final_result([PENNE, page], ["items", "total"]) == page
+    assert best_final_result([PENNE, page], ["nothing"]) == page, "no coverage: the last one"
+    assert best_final_result([PENNE, {"slug": "x"}], ["slug"]) == {"slug": "x"}, "tie: the last"
+    assert best_final_result([[1, 2], PENNE], ["result"]) == {"result": [1, 2]}
+    assert best_final_result([], ["slug"]) is None
+
+
+async def test_dry_run_final_result_is_the_covering_result_not_the_last(
+    scenario: Scenario,
+) -> None:
+    path = Path(
+        id="dry",
+        kind="happy",
+        title="dry",
+        steps=[
+            Step(intent="look", tool="lookup", arguments_sketch={"slug": "penne"}),
+            Step(intent="page", tool="list_items", arguments_sketch={"cursor": 0, "limit": 2}),
+        ],
+    )
+    t = await run(scenario, None, path=path, dry_run=True)
+    assert t.final_result == PENNE
+    final = next(e for e in t.events if isinstance(e, FinalResultEvent))
+    assert final.raw == json.dumps(PENNE, ensure_ascii=False)

@@ -229,6 +229,50 @@ def test_make_llm_for_picks_the_provider_per_role(
     assert runner.API_KEY_ENV == API_KEY_ENV
 
 
+def test_make_llm_for_observers_follows_each_observers_model(
+    scenario: Scenario, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def obs(name: str, **fields: Any) -> dict[str, Any]:
+        return {"name": name, "identity": "i", "conditions": [{"id": "c", "when": "w"}], **fields}
+
+    monkeypatch.delenv(API_KEY_ENV, raising=False)
+    # No LLM observer: the default observer model (the agent's) decides the provider.
+    local = scenario.model_copy(update={"models": Models(agent="ollama:command-r7b")})
+    assert runner.llm_observers(local) == [] and runner.observer_providers(local) == []
+    assert isinstance(runner.make_llm_for(local, "observer"), OllamaLLM)
+    # models.observer overrides the agent's; a per-observer model overrides that.
+    hosted = local.model_copy(
+        update={"models": Models(agent="ollama:command-r7b", observer="claude-sonnet-5-5")}
+    ).with_observers([obs("a")])
+    assert runner.observer_providers(hosted) == ["anthropic"]
+    with pytest.raises(RuntimeError, match="needed for the observer"):
+        runner.make_llm_for(hosted, "observer")
+    own = hosted.with_observers([obs("a", model="ollama:qwen2.5:7b")], replace=True)
+    assert runner.observer_providers(own) == ["ollama"]
+    assert isinstance(runner.make_llm_for(own, "observer"), OllamaLLM)
+    # A code observer needs no model; two providers among the LLM observers route per call.
+    mixed = hosted.with_observers(
+        [
+            obs("a", model="ollama:qwen2.5:7b"),
+            obs("b"),
+            {
+                "name": "c",
+                "identity": "i",
+                "kind": "code",
+                "conditions": [{"id": "c", "when": "w", "check": {"tool_called": "x"}}],
+            },
+        ],
+        replace=True,
+    )
+    assert [o.name for o in runner.llm_observers(mixed)] == ["a", "b"]
+    assert runner.observer_providers(mixed) == ["ollama", "anthropic"]
+    with pytest.raises(RuntimeError, match="needed for the observer"):
+        runner.make_llm_for(mixed, "observer")
+    monkeypatch.setenv(API_KEY_ENV, "not-a-real-key")
+    assert isinstance(runner.make_llm_for(mixed, "observer"), RoutingLLM)
+    assert isinstance(runner.make_llm_for(hosted, "observer"), AnthropicLLM)
+
+
 def test_apply_model_overrides(scenario: Scenario) -> None:
     assert runner.apply_model_overrides(scenario, None) is scenario
     assert runner.apply_model_overrides(scenario, {}) is scenario

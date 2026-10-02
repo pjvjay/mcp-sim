@@ -547,14 +547,20 @@ class Scenario(_Strict):
         raise KeyError(f"scenario {self.name!r} has no observer {name!r}")
 
     def with_observers(
-        self, observers: Sequence[Observer | ObserverLike], *, replace: bool = False
+        self,
+        observers: Sequence[Observer | ObserverLike | dict[str, Any]],
+        *,
+        replace: bool = False,
     ) -> Scenario:
         """A copy with ``observers`` appended (or, with ``replace``, substituted); validated.
 
-        Accepts :class:`Observer` models and DSL builders (anything with a ``build()`` that
-        returns one, see :mod:`mcpsim.observers`).
+        Accepts :class:`Observer` models, DSL builders (anything with a ``build()`` that returns
+        one, see :mod:`mcpsim.observers`) and plain declarations as a scenario file holds them
+        (``{use: <name>}`` included).
         """
-        built = [o if isinstance(o, Observer) else o.build() for o in observers]
+        built: list[Observer | dict[str, Any]] = [
+            o if isinstance(o, Observer | dict) else o.build() for o in observers
+        ]
         merged = built if replace else [*self.observers, *built]
         return Scenario.model_validate({**self.model_dump(mode="python"), "observers": merged})
 

@@ -186,6 +186,7 @@ class InformantReportEvent(_EventBase):
     reports: list[InformantReport] = Field(default_factory=list)
     flags: list[str] = Field(default_factory=list)
     failures: list[str] = Field(default_factory=list)
+    notes: list[str] = Field(default_factory=list)
 
 
 class EndEvent(_EventBase):
@@ -263,13 +264,15 @@ class Transcript(BaseModel):
         *,
         flags: list[str] | None = None,
         failures: list[str] | None = None,
+        notes: list[str] | None = None,
     ) -> InformantReportEvent:
-        """Record a batch of reports and the flag / fail effects they triggered."""
+        """Record a batch of reports and the flag / fail / note effects they triggered."""
         event = InformantReportEvent(
             trigger=trigger,
             reports=list(reports),
             flags=list(flags or []),
             failures=list(failures or []),
+            notes=list(notes or []),
         )
         self.add(event)
         for flag in event.flags:

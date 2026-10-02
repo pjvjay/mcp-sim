@@ -26,8 +26,8 @@ EXIT_PASS = 0
 EXIT_FAIL = 1
 DEFAULT_MAX_FAILURES = 10
 COST_NOTE = (
-    "estimate from the rate table; covers the agent and simulated-user calls recorded in "
-    "transcripts, not the planner or judge"
+    "estimate from the rate table; covers the agent, simulated-user and observer calls recorded "
+    "in transcripts, not the planner or judge"
 )
 
 

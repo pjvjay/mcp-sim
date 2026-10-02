@@ -238,7 +238,7 @@ exit 1; set `MCPSIM_DEBUG=1` for the traceback.
 
 `report.md` is hand-rendered Markdown: a pass-rate table per path × mode, the worst failures
 with their reasons and transcript paths, and token usage with an estimated cost (from a rate
-table; the report says "estimate", and it covers the agent and simulated-user calls recorded in
+table; the report says "estimate", and it covers the agent, simulated-user and observer calls recorded in
 transcripts, not the planner or judge).
 
 ## Dry run

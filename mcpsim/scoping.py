@@ -34,6 +34,8 @@ INPUT_WEIGHT = 2.0
 DESCRIPTION_WEIGHT = 1.0
 INITIAL_K = 5
 INITIAL_FLOOR = 3
+DISCOVER_TOOL_NAME = "discover_tools"
+DISCOVER_LIMIT = 3
 
 _WORD = re.compile(r"[a-z0-9]+")
 _FIRST_SENTENCE = re.compile(r"^(.*?[.!?])(?:\s|$)")
@@ -77,6 +79,31 @@ _IMPERATIVE_LEAD: frozenset[str] = frozenset(
     always go still after before finally next
     """.split()
 )
+
+
+def discover_tool_definition() -> dict[str, Any]:
+    """The framework's ``discover_tools`` meta-tool, offered in ``progressive`` disclosure.
+
+    The agent loop answers it (``ToolScope.discover``), it is never sent to the MCP server and
+    does not count against ``max_tool_calls`` (``max_turns`` bounds it); the planner may plan it
+    as a step before a tool that is only available on request.
+    """
+    return {
+        "name": DISCOVER_TOOL_NAME,
+        "description": (
+            "Ask for more tools. Not every tool of this server is offered at first: describe "
+            "in a few words what you need to do (for example 'list items', 'submit a label "
+            f"reading') and up to {DISCOVER_LIMIT} matching tools are added to the ones you can "
+            "call and listed in the reply."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "What you need a tool for."}
+            },
+            "required": ["query"],
+        },
+    }
 
 
 # --- tokens -----------------------------------------------------------------------------------

@@ -348,6 +348,73 @@ async def _fake_catalog() -> Any:
         return await session.catalog()
 
 
+# --- observers: the runner wires them into every run and warns about dead globs --------------
+
+
+def test_dry_run_records_code_observer_reports_and_warns_about_unmatched_effect_globs(
+    tmp_path: FsPath,
+    quick_data: dict[str, Any],
+    out_dir: FsPath,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    quick_data["observers"] = [
+        {
+            "name": "clerk",
+            "identity": "reads the lookup result",
+            "kind": "code",
+            "on": ["tool_result"],
+            "conditions": [
+                {
+                    "id": "found",
+                    "when": "lookup returned penne",
+                    "check": {"tool_result": {"tool": "lookup", "where": {"slug": "penne"}}},
+                    "then": {"enable_tools": ["echo", "nope_*"], "flag": "found"},
+                    "otherwise": {"disable_tools": ["zzz_*"]},
+                }
+            ],
+        },
+        {
+            "name": "auditor",
+            "identity": "needs a model, so the dry run skips it",
+            "on": ["end"],
+            "conditions": [{"id": "x", "when": "x", "then": {"fail": True}}],
+        },
+    ]
+    path = tmp_path / "observed.yaml"
+    path.write_text(yaml.safe_dump(quick_data, sort_keys=False), encoding="utf-8")
+
+    run_dir = runner.run_scenario(path, out_dir, dry_run=True, repeat=1, mode="guided")
+
+    stem = f"{DRY_RUN_PATH_ID}-guided-0"
+    transcript = Transcript.read_jsonl(run_dir / "transcripts" / f"{stem}.jsonl")
+    assert transcript.kinds()[:7] == [
+        "system",
+        "tools_offered",
+        "user",
+        "tool_call",
+        "tool_result",
+        "informant_report",
+        "tools_offered",
+    ]
+    reports = transcript.informant_reports()
+    assert [(r.observer, r.condition, r.value, r.trigger) for r in reports] == [
+        ("clerk", "found", True, "tool_result")
+    ], "the LLM auditor is not consulted in dry run"
+    assert transcript.flags == ["found"] and transcript.hard_failures == []
+    offered = [e for e in transcript.events if e.kind == "tools_offered"]
+    assert (offered[1].added, offered[1].reason) == (["echo"], "observer:clerk.found")  # type: ignore[union-attr]
+    err = capsys.readouterr().err
+    assert (
+        "warning: observer clerk.found then.enable_tools glob 'nope_*' matches no allowed tool"
+    ) in err
+    assert (
+        "warning: observer clerk.found otherwise.disable_tools glob 'zzz_*' matches no allowed"
+    ) in err
+    assert "glob 'echo'" not in err
+    verdict = Verdict.load(run_dir / "verdicts" / f"{stem}.json")
+    assert verdict.passed is True, "lookup's result covers the expected keys; the matcher passes"
+
+
 def test_reused_plan_is_compared_against_the_allowed_catalog(
     tmp_path: FsPath,
     quick_data: dict[str, Any],

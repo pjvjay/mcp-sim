@@ -61,11 +61,11 @@ from mcpsim.report import (
     summary_line,
 )
 from mcpsim.report import exit_code as report_exit_code
-from mcpsim.scenario import MODEL_ROLES, Models, Scenario, load_scenario
+from mcpsim.scenario import MODEL_ROLES, Models, Observer, Scenario, load_scenario
 from mcpsim.transcript import EndEvent, SystemEvent, Transcript
 from mcpsim.verdict import Verdict
 
-Role = Literal["planner", "agent", "judge", "user"]
+Role = Literal["planner", "agent", "judge", "user", "observer"]
 
 SCENARIO_FILE = "scenario.json"
 PLAN_FILE = "plan.json"
@@ -84,14 +84,32 @@ __all__ = ["API_KEY_ENV"]  # re-exported for callers that check the key through 
 # --- LLM construction -------------------------------------------------------------------------
 
 
+def llm_observers(scenario: Scenario) -> list[Observer]:
+    """The observers that need a model (``kind: llm``)."""
+    return [o for o in scenario.observers if o.kind == "llm"]
+
+
+def observer_providers(scenario: Scenario) -> list[str]:
+    """Distinct providers the LLM observers use (each observer's own ``model``, else
+    ``models.observer``, else the agent's), in declaration order."""
+    providers: list[str] = []
+    for obs in llm_observers(scenario):
+        provider, _ = parse_model_spec(scenario.models.model_for_observer(obs))
+        if provider not in providers:
+            providers.append(provider)
+    return providers
+
+
 def make_llm_for(scenario: Scenario, role: Role) -> LLM:
-    """The one place an LLM client is built for a role (planner / agent / judge / user).
+    """The one place an LLM client is built for a role (planner / agent / judge / user /
+    observer).
 
     The provider comes from ``scenario.models.<role>`` (``provider:model``; a bare name is an
     Anthropic model) and :func:`mcpsim.llm.make_llm` returns that provider's cached client. The
     ``agent`` client also serves the simulated user (``agent.run_path`` takes one ``llm``), so
     when the user's provider differs from the agent's a :class:`~mcpsim.llm.RoutingLLM` is
-    returned that picks the provider per call.
+    returned that picks the provider per call; likewise ``observer`` routes when the LLM
+    observers' models span several providers.
     """
     provider, _ = parse_model_spec(scenario.models.for_role(role))
     if role == "agent":
@@ -101,6 +119,13 @@ def make_llm_for(scenario: Scenario, role: Role) -> LLM:
             make_llm(provider, purpose="agent")
             make_llm(user_provider, purpose="simulated user")
             return RoutingLLM()
+    if role == "observer":
+        providers = observer_providers(scenario) or [provider]
+        if len(providers) > 1:
+            for each in providers:
+                make_llm(each, purpose="observer")
+            return RoutingLLM()
+        return make_llm(providers[0], purpose="observer")
     return make_llm(provider, purpose=role)
 
 
@@ -233,6 +258,17 @@ def allowed_catalog(scenario: Scenario, catalog: Catalog) -> Catalog:
             f"warning: tools.allow/deny leave no tool for {scenario.name!r}; the agent will have "
             "nothing to call"
         )
+    for obs in scenario.observers:
+        for cond in obs.conditions:
+            for branch, effect in (("then", cond.then), ("otherwise", cond.otherwise)):
+                for field_name in ("enable_tools", "disable_tools"):
+                    globs: list[str] = getattr(effect, field_name)
+                    for pattern in allowed.unmatched_patterns(globs):
+                        _log(
+                            f"warning: observer {obs.name}.{cond.id} {branch}.{field_name} glob "
+                            f"{pattern!r} matches no allowed tool "
+                            f"(allowed: {', '.join(allowed.tool_names()) or '(none)'})"
+                        )
     return allowed
 
 
@@ -325,6 +361,7 @@ async def _one_run(
     catalog: Catalog,
     agent_llm: LLM | None,
     dry_run: bool,
+    observer_llm: LLM | None = None,
 ) -> Transcript:
     """One MCP session, one run of one path; never raises for run failures."""
     try:
@@ -338,6 +375,7 @@ async def _one_run(
                 agent_llm,
                 dry_run=dry_run,
                 catalog=catalog,
+                observer_llm=observer_llm,
             )
     except Exception as exc:  # noqa: BLE001 - a broken server is a failed run, not a crash
         return _connection_failure(scenario, path, mode, index, exc)
@@ -417,6 +455,9 @@ async def _run_scenario_async(
     )
     agent_llm = None if dry_run else make_llm_for(scenario, "agent")
     judge_llm = None if dry_run else make_llm_for(scenario, "judge")
+    observer_llm = (
+        make_llm_for(scenario, "observer") if not dry_run and llm_observers(scenario) else None
+    )
     semaphore = asyncio.Semaphore(scenario.concurrency)
     transcripts_dir = run_dir / TRANSCRIPTS_DIR
     verdicts_dir = run_dir / VERDICTS_DIR
@@ -425,7 +466,14 @@ async def _run_scenario_async(
     async def cell(path: Path, m: Mode, index: int) -> tuple[Transcript, Verdict]:
         async with semaphore:
             transcript = await _one_run(
-                scenario, path, m, index, catalog=catalog, agent_llm=agent_llm, dry_run=dry_run
+                scenario,
+                path,
+                m,
+                index,
+                catalog=catalog,
+                agent_llm=agent_llm,
+                dry_run=dry_run,
+                observer_llm=observer_llm,
             )
             transcript.write_jsonl(transcripts_dir / f"{transcript.stem}.jsonl")
             _log(f"{scenario.name}: {transcript.stem}: {transcript.outcome} ({transcript.reason})")

@@ -19,15 +19,28 @@ tools when guided, everything when free) or ``progressive`` (the explicit ``init
 adds up to three more per query without touching the server). Every change to the set is a
 ``tools_offered`` transcript event. A ``tool_use`` naming a tool that is not offered never
 reaches the server: the agent gets an error ``tool_result`` and the transcript an ``error``
-event ``scope violation: <tool> (not allowed|not disclosed)``. An observer holds a
-:class:`LiveRun` (``run_path(..., on_start=...)``) whose ``offer_tools`` and ``enable_goal``
-widen the set or add a goal mid-run.
+event ``scope violation: <tool> (not allowed|not disclosed)``. In guided mode under
+``progressive`` disclosure the path's step tools join the initial set (reason
+``initial:guided:path``), so a guided plan is executable without a ``discover_tools`` detour.
+
+Observers (DESIGN §2b, :mod:`mcpsim.observers`): after every assistant turn (``turn``), every
+batch of tool results (``tool_result``) and the final answer (``end``) the loop asks the
+scenario's observers for reports and applies their effects through :class:`LiveRun` before the
+next LLM call — the reports are recorded first (``informant_report``), then ``enable_tools`` /
+``disable_tools`` change the offered set (``tools_offered`` with reason
+``observer:<obs>.<cond>``), ``enable_goal`` records ``goal_enabled`` and the goal joins the
+system prompt ("Goal enabled by observation (<obs>.<cond>): …") and the next user message,
+and ``flag`` / ``fail`` land on ``Transcript.flags`` / ``hard_failures``. A hand-held
+:class:`LiveRun` (``run_path(..., on_start=...)``) can do the same from outside.
 
 Dry run (``dry_run=True``): no LLM at all. Each step's tool is called with its sketch arguments
-in order and ``final_result`` is synthesised from the last structured tool result, so the whole
-MCP path is exercised without an API key. ``{"$from_step": n, "path": ...}`` references in a
-sketch are resolved against step ``n``'s structured result (a reference that cannot be resolved
-records an ``error`` event and skips the step), and an error result on a step marked
+in order and ``final_result`` is synthesised from the structured tool result whose top-level
+keys cover the most ``expected_outcome.json`` keys (the last one on a tie; the last structured
+result when none covers any), so the whole MCP path is exercised without an API key. Code and
+group observers still run (LLM observers do not) and their effects are applied.
+``{"$from_step": n, "path": ...}`` references in a sketch are resolved against step ``n``'s
+structured result (a reference that cannot be resolved records an ``error`` event and skips the
+step), and an error result on a step marked
 ``expect_error`` is the planned outcome, not a failure. The dry run follows the plan, so it is
 offered exactly the path's allowed tools whatever the disclosure mode says; a step naming a
 tool outside the allowed catalog is refused the same way as in a live run.
@@ -45,15 +58,26 @@ from typing import Any
 from mcpsim.llm import DEFAULT_MAX_TOKENS, LLM, Usage, total_cost_usd
 from mcpsim.matcher import MISSING, resolve
 from mcpsim.mcpclient import Catalog, Session, ToolResult
+from mcpsim.observers import ObserverRunner
 from mcpsim.plan import Mode, Path, Step, StepReference, parse_reference
-from mcpsim.scenario import Scenario
-from mcpsim.scoping import first_sentence, initial_tools, rank_tools, tokens
+from mcpsim.scenario import Scenario, Trigger
+from mcpsim.scoping import (
+    DISCOVER_LIMIT,
+    DISCOVER_TOOL_NAME,
+    discover_tool_definition,
+    expected_top_level_keys,
+    first_sentence,
+    initial_tools,
+    rank_tools,
+    tokens,
+)
 from mcpsim.transcript import (
     AssistantEvent,
     EndEvent,
     ErrorEvent,
     FinalResultEvent,
     GoalEnabledEvent,
+    InformantReport,
     Outcome,
     SystemEvent,
     ToolCallEvent,
@@ -67,9 +91,9 @@ from mcpsim.transcript import (
 FINAL_RESULT_NAME = "final_result"
 USER_MAX_TOKENS = 512
 DRY_RUN_MODEL = "dry-run"
-DISCOVER_TOOL_NAME = "discover_tools"
-DISCOVER_LIMIT = 3
 NOW_AVAILABLE = "now available"
+GOAL_PREFIX = "Goal enabled by observation"
+__all__ = ["DISCOVER_LIMIT", "DISCOVER_TOOL_NAME", "discover_tool_definition"]  # re-exported
 NOT_AVAILABLE = "tool {name} is not available in this conversation"
 SCOPE_VIOLATION = "scope violation: {name} ({why})"
 
@@ -147,16 +171,6 @@ def extract_final_result(text: str) -> FinalResult:
 # prompts
 
 
-def _top_level_fields(spec: dict[str, Any] | None) -> list[str]:
-    """Top-level ``final_result`` field names from the dotted paths of ``expected_outcome.json``."""
-    names: list[str] = []
-    for key in spec or {}:
-        head = re.split(r"[.\[]", str(key), maxsplit=1)[0].strip()
-        if head and head not in names:
-            names.append(head)
-    return names
-
-
 def readable_sketch(step: Step) -> str:
     """The sketch as JSON with every ``$from_step`` reference shown as ``<from step n: path>``."""
     shown: dict[str, Any] = {}
@@ -204,7 +218,7 @@ def steps_section(path: Path) -> str:
 
 
 def answer_contract(scenario: Scenario) -> str:
-    fields = _top_level_fields(scenario.expected_outcome.json)
+    fields = expected_top_level_keys(scenario.expected_outcome.json)
     if fields:
         fields_line = "The object must include these fields: " + ", ".join(
             f"`{f}`" for f in fields
@@ -225,8 +239,18 @@ def answer_contract(scenario: Scenario) -> str:
     )
 
 
-def agent_prompt_sections(scenario: Scenario, path: Path, mode: Mode) -> list[str]:
-    """The agent's system prompt as sections; ``guided`` inserts exactly :func:`steps_section`."""
+def goals_section(goals: list[str]) -> str:
+    """The section the system prompt gains once observers have enabled goals (already prefixed
+    ``Goal enabled by observation (<observer>.<condition>): …`` by :class:`LiveRun`)."""
+    return "## Goals enabled by observation\n" + "\n".join(f"- {g}" for g in goals)
+
+
+def agent_prompt_sections(
+    scenario: Scenario, path: Path, mode: Mode, goals: list[str] | None = None
+) -> list[str]:
+    """The agent's system prompt as sections; ``guided`` inserts exactly :func:`steps_section`,
+    and ``goals`` (enabled by observers so far) add :func:`goals_section` after the
+    instructions."""
     instructions = (
         "\n".join(f"- {item.strip()}" for item in scenario.instructions)
         if scenario.instructions
@@ -242,14 +266,18 @@ def agent_prompt_sections(scenario: Scenario, path: Path, mode: Mode) -> list[st
         f"## Goal\n{scenario.goal.strip()}",
         f"## Instructions you must follow\n{instructions}",
     ]
+    if goals:
+        sections.append(goals_section(goals))
     if mode == "guided":
         sections.append(steps_section(path))
     sections.append(answer_contract(scenario))
     return sections
 
 
-def build_agent_system_prompt(scenario: Scenario, path: Path, mode: Mode) -> str:
-    return "\n\n".join(agent_prompt_sections(scenario, path, mode))
+def build_agent_system_prompt(
+    scenario: Scenario, path: Path, mode: Mode, goals: list[str] | None = None
+) -> str:
+    return "\n\n".join(agent_prompt_sections(scenario, path, mode, goals))
 
 
 def build_user_system_prompt(scenario: Scenario) -> str:
@@ -334,30 +362,6 @@ def tool_result_block(tool_use_id: str, result: ToolResult) -> dict[str, Any]:
 # tool disclosure
 
 
-def discover_tool_definition() -> dict[str, Any]:
-    """The framework's ``discover_tools`` meta-tool, offered in ``progressive`` disclosure.
-
-    It is answered by :meth:`ToolScope.discover`, never sent to the MCP server, and does not
-    count against ``max_tool_calls`` (``max_turns`` bounds it).
-    """
-    return {
-        "name": DISCOVER_TOOL_NAME,
-        "description": (
-            "Ask for more tools. Not every tool of this server is offered at first: describe "
-            "in a few words what you need to do (for example 'list items', 'submit a label "
-            f"reading') and up to {DISCOVER_LIMIT} matching tools are added to the ones you can "
-            "call and listed in the reply."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "query": {"type": "string", "description": "What you need a tool for."}
-            },
-            "required": ["query"],
-        },
-    }
-
-
 def goal_note(goals: list[str]) -> str:
     """The text block that carries goals an observer enabled mid-run to the agent."""
     bullets = "\n".join(f"- {g.strip()}" for g in goals)
@@ -405,7 +409,11 @@ class ToolScope:
             names = [t.name for t in self.allowed.select(self.policy.initial)]
         else:
             names = [t.name for t in initial_tools(self.scenario, self.allowed)]
-        return self.offer(names, f"initial:{mode}:{disclosure}", always_record=True)
+        added = self.offer(names, f"initial:{mode}:{disclosure}", always_record=True)
+        if disclosure == "progressive" and mode == "guided":
+            # A guided plan must be executable without a discover_tools detour.
+            added += self.offer(path.tools_used(), "initial:guided:path")
+        return added
 
     def offer(self, names: Iterable[str], reason: str, *, always_record: bool = False) -> list[str]:
         """Add the allowed tools among ``names`` that are not offered yet; returns the added."""
@@ -418,6 +426,17 @@ class ToolScope:
             self.offered.extend(added)
             self.transcript.add(ToolsOfferedEvent(added=added, reason=reason))
         return added
+
+    def withdraw(
+        self, names: Iterable[str], reason: str, *, always_record: bool = False
+    ) -> list[str]:
+        """Remove the offered tools among ``names`` (an observer's ``disable_tools``)."""
+        removed = [n for n in names if n in self.offered]
+        removed = list(dict.fromkeys(removed))
+        if removed or always_record:
+            self.offered = [n for n in self.offered if n not in removed]
+            self.transcript.add(ToolsOfferedEvent(removed=removed, reason=reason))
+        return removed
 
     def definitions(self) -> list[dict[str, Any]]:
         """The ``tools`` the LLM sees this turn: the offered tools, then ``discover_tools``."""
@@ -461,36 +480,94 @@ class ToolScope:
 
 
 class LiveRun:
-    """The handle an observer holds on a run in flight (``run_path(..., on_start=...)``).
+    """The handle on a run in flight: how observer effects reach the agent.
 
-    ``offer_tools`` widens the offered set (names or globs; only allowed tools are added, the
-    return value says which); ``enable_goal`` records a ``goal_enabled`` event and the text
-    reaches the agent in its next user message. Both are the effects the Informant-Report
-    observers apply; nothing here can offer a tool the scenario denies.
+    ``offer_tools`` / ``withdraw_tools`` change the offered set (names or globs; only allowed
+    tools, the return value says which); ``enable_goal`` records a ``goal_enabled`` event, adds
+    the goal to the system prompt for every later turn (``goals``) and to the next user message
+    (``take_goals``). :meth:`apply` records a batch of informant reports and then applies their
+    effects in that order. A hand-held handle (``run_path(..., on_start=...)``) can call the same
+    methods; nothing here can offer a tool the scenario denies.
     """
 
-    def __init__(self, scope: ToolScope, transcript: Transcript) -> None:
+    def __init__(
+        self, scope: ToolScope, transcript: Transcript, observers: ObserverRunner | None = None
+    ) -> None:
         self.scope = scope
         self.transcript = transcript
-        self._goals: list[str] = []
+        self.observers = observers
+        self.goals: list[str] = []
+        self._pending_goals: list[str] = []
 
     @property
     def offered(self) -> list[str]:
         return list(self.scope.offered)
 
-    def offer_tools(self, names: Iterable[str], reason: str) -> list[str]:
+    def offer_tools(
+        self, names: Iterable[str], reason: str, *, always_record: bool = False
+    ) -> list[str]:
         patterns = list(names)
         selected = [t.name for t in self.scope.allowed.select(patterns)]
-        return self.scope.offer(selected, reason)
+        return self.scope.offer(selected, reason, always_record=always_record)
 
-    def enable_goal(self, text: str, reason: str) -> None:
-        self.transcript.add(GoalEnabledEvent(text=text, reason=reason))
-        self._goals.append(text)
+    def withdraw_tools(
+        self, names: Iterable[str], reason: str, *, always_record: bool = False
+    ) -> list[str]:
+        patterns = list(names)
+        selected = [t.name for t in self.scope.allowed.select(patterns)]
+        return self.scope.withdraw(selected, reason, always_record=always_record)
+
+    def enable_goal(
+        self, text: str, reason: str, *, observer: str = "", condition: str = ""
+    ) -> str:
+        """Record the goal; returns the line the agent reads (prefixed with its provenance)."""
+        self.transcript.add(
+            GoalEnabledEvent(text=text, reason=reason, observer=observer, condition=condition)
+        )
+        source = f"{observer}.{condition}" if observer else reason
+        line = f"{GOAL_PREFIX} ({source}): {text.strip()}"
+        self.goals.append(line)
+        self._pending_goals.append(line)
+        return line
 
     def take_goals(self) -> list[str]:
         """The goals enabled since the last call (they go into the next user message)."""
-        goals, self._goals = self._goals, []
+        goals, self._pending_goals = self._pending_goals, []
         return goals
+
+    def apply(self, trigger: Trigger, reports: list[InformantReport]) -> None:
+        """Record ``reports`` (with the flags / failures / notes they trigger), THEN apply the
+        tool and goal effects, so the transcript always shows the report before the change."""
+        if self.observers is None or not reports:
+            return
+        effects = self.observers.effects(reports)
+        self.transcript.add_reports(
+            trigger,
+            reports,
+            flags=[e.effect.flag for e in effects if e.effect.flag],
+            failures=[e.failure for e in effects if e.effect.fail],
+            notes=[
+                f"{e.observer}.{e.condition}: {e.effect.note}" for e in effects if e.effect.note
+            ],
+        )
+        for e in effects:
+            if e.effect.enable_tools:
+                self.offer_tools(e.effect.enable_tools, e.reason, always_record=True)
+            if e.effect.disable_tools:
+                self.withdraw_tools(e.effect.disable_tools, e.reason, always_record=True)
+            if e.effect.enable_goal:
+                self.enable_goal(
+                    e.effect.enable_goal, e.reason, observer=e.observer, condition=e.condition
+                )
+
+    async def observe(self, trigger: Trigger) -> dict[str, Usage]:
+        """Ask the observers for reports at ``trigger`` and apply them; returns the LLM usage
+        the observers spent (the caller folds it into the run and checks the cost budget)."""
+        if self.observers is None or not self.observers.fires_at(trigger):
+            return {}
+        reports = await self.observers.report(trigger, self.transcript)
+        self.apply(trigger, reports)
+        return self.observers.take_usage()
 
 
 class _Run:
@@ -520,6 +597,13 @@ class _Run:
                 f"estimated cost so far ${self.cost_usd:.6f}"
             )
         return None
+
+    def record_usages(self, usages: dict[str, Usage]) -> str | None:
+        """Add several models' usage (observers); the first budget reason, if any."""
+        reason: str | None = None
+        for model, usage in usages.items():
+            reason = self.record_usage(model, usage) or reason
+        return reason
 
     def end(self, outcome: Outcome, reason: str) -> Transcript:
         t = self.transcript
@@ -658,6 +742,27 @@ def resolve_arguments(step: Step, results: dict[int, ToolResult | None]) -> dict
     return arguments
 
 
+def best_final_result(
+    structured_results: list[dict[str, Any] | list[Any]], expected_keys: list[str]
+) -> dict[str, Any] | None:
+    """The dry run's ``final_result``: the structured result whose top-level keys cover the
+    most ``expected_keys`` (the last on a tie), else the last structured result; a list is
+    wrapped as ``{"result": [...]}``; ``None`` when nothing structured came back."""
+    if not structured_results:
+        return None
+    wrapped: list[dict[str, Any]] = [
+        r if isinstance(r, dict) else {"result": r} for r in structured_results
+    ]
+    wanted = set(expected_keys)
+    best = wrapped[-1]
+    best_score = 0
+    for candidate in wrapped:
+        score = len(wanted & set(candidate))
+        if score >= best_score and score > 0:
+            best, best_score = candidate, score
+    return best
+
+
 async def _dry_run(
     run: _Run, path: Path, mode: Mode, session: Session, catalog: Catalog | None
 ) -> Transcript:
@@ -666,8 +771,9 @@ async def _dry_run(
     catalog = catalog.filtered(run.scenario.tools.allow, run.scenario.tools.deny)
     scope = ToolScope(run.scenario, catalog, run.transcript)
     scope.offer(path.tools_used(), f"initial:{mode}:dry-run", always_record=True)
+    live = LiveRun(scope, run.transcript, ObserverRunner(run.scenario, None, include_llm=False))
     run.transcript.add(UserEvent(text=run.scenario.goal.strip()))
-    last_structured: dict[str, Any] | list[Any] | None = None
+    structured_results: list[dict[str, Any] | list[Any]] = []
     results: dict[int, ToolResult | None] = {}
     skipped = 0
     refused = 0
@@ -714,21 +820,18 @@ async def _dry_run(
                 )
             )
         if not result.is_error and result.structured is not None:
-            last_structured = result.structured
-    final: dict[str, Any] | None
-    if isinstance(last_structured, dict):
-        final = last_structured
-    elif isinstance(last_structured, list):
-        final = {"result": last_structured}
-    else:
-        final = None
-    raw = json.dumps(last_structured, ensure_ascii=False) if last_structured is not None else ""
+            structured_results.append(result.structured)
+        await live.observe("tool_result")
+    expected_keys = expected_top_level_keys(run.scenario.expected_outcome.json)
+    final = best_final_result(structured_results, expected_keys)
+    raw = json.dumps(final, ensure_ascii=False) if final is not None else ""
     run.transcript.add(FinalResultEvent(parsed=final, raw=raw))
     if final is None:
         run.transcript.add(
             ErrorEvent(message="dry run: no step returned structured content; final_result is null")
         )
     run.transcript.final_result = final
+    await live.observe("end")
     reason = f"dry run: called {run.tool_calls} planned tool(s)"
     if expected_errors:
         reason += f"; {expected_errors} expected error(s) returned as planned"
@@ -752,6 +855,7 @@ async def run_path(
     dry_run: bool = False,
     catalog: Catalog | None = None,
     on_start: Callable[[LiveRun], None] | None = None,
+    observer_llm: LLM | None = None,
 ) -> Transcript:
     """Run ``path`` once in ``mode`` and return the transcript (never raises for run failures).
 
@@ -759,7 +863,9 @@ async def run_path(
     (the runner applies ``scenario.tools`` once); when not given it is discovered from the
     session and filtered here, so the agent never sees a tool the scenario denies. ``on_start``
     is called with the :class:`LiveRun` handle after the initial disclosure and before the
-    first turn; an observer keeps it to call ``offer_tools`` / ``enable_goal`` during the run.
+    first turn (a hand-held observer keeps it to call ``offer_tools`` / ``enable_goal``).
+    ``observer_llm`` serves the scenario's LLM observers (default: ``llm``); their usage counts
+    against ``max_cost_usd`` like the agent's.
     """
     if not dry_run and llm is None:
         raise ValueError("run_path needs an llm unless dry_run=True")
@@ -791,7 +897,8 @@ async def run_path(
         catalog = catalog.filtered(scenario.tools.allow, scenario.tools.deny)
         scope = ToolScope(scenario, catalog, run.transcript)
         scope.disclose_initial(path, mode)
-        live = LiveRun(scope, run.transcript)
+        observers = ObserverRunner(scenario, observer_llm if observer_llm is not None else llm)
+        live = LiveRun(scope, run.transcript, observers)
         if on_start is not None:
             on_start(live)
         user = SimulatedUser(scenario, llm, user_model)
@@ -811,7 +918,7 @@ async def run_path(
                 return run.end("budget_exceeded", reason)
             response = await llm.complete(
                 model=agent_model,
-                system=agent_system,
+                system=build_agent_system_prompt(scenario, path, mode, live.goals),
                 messages=list(messages),
                 tools=scope.definitions() or None,
                 max_tokens=DEFAULT_MAX_TOKENS,
@@ -826,6 +933,9 @@ async def run_path(
             if reason is not None:
                 return run.end("budget_exceeded", reason)
             messages.append({"role": "assistant", "content": list(response.content)})
+            reason = run.record_usages(await live.observe("turn"))
+            if reason is not None:
+                return run.end("budget_exceeded", reason)
 
             if tool_uses:
                 results: list[dict[str, Any]] = []
@@ -847,6 +957,9 @@ async def run_path(
                         return run.end("budget_exceeded", reason)
                     result = await run.call(session, name, arguments, tool_use_id)
                     results.append(tool_result_block(tool_use_id or "", result))
+                reason = run.record_usages(await live.observe("tool_result"))
+                if reason is not None:
+                    return run.end("budget_exceeded", reason)
                 messages.append(
                     {"role": "user", "content": user_content(results, live.take_goals())}
                 )
@@ -858,6 +971,8 @@ async def run_path(
                 run.transcript.final_result = final.parsed
                 if final.error is not None:
                     run.transcript.add(ErrorEvent(message=final.error))
+                run.record_usages(await live.observe("end"))
+                if final.error is not None:
                     return run.end("completed", f"final answer delivered but {final.error}")
                 return run.end("completed", "final answer delivered")
 
