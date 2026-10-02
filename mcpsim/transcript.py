@@ -15,8 +15,11 @@ from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
 
 from mcpsim.llm import Usage
 from mcpsim.mcpclient import ToolResult
+from mcpsim.scenario import Trigger
 
 Outcome = Literal["completed", "budget_exceeded", "error"]
+NO_EVIDENCE = "no evidence"
+EVIDENCE_LIMIT = 300
 
 
 def now_iso() -> str:
@@ -124,11 +127,65 @@ class ToolsOfferedEvent(_EventBase):
 
 
 class GoalEnabledEvent(_EventBase):
-    """An observer added a goal mid-run (``enable_goal``); the agent reads it next turn."""
+    """An observer added a goal mid-run (``enable_goal``); the agent reads it next turn.
+
+    ``observer`` / ``condition`` name the report that enabled it (empty for a goal enabled by
+    hand through :class:`~mcpsim.agent.LiveRun`); ``reason`` is ``observer:<obs>.<cond>``.
+    """
 
     kind: Literal["goal_enabled"] = "goal_enabled"
     text: str
     reason: str = ""
+    observer: str = ""
+    condition: str = ""
+
+
+class InformantReport(BaseModel):
+    """One observer's answer to one condition at one trigger (DESIGN §2b).
+
+    ``value`` is ``True`` / ``False`` / ``None`` (cannot tell from what it watches);
+    ``evidence`` is a verbatim quote (at most :data:`EVIDENCE_LIMIT` characters) or
+    ``"no evidence"``; ``confidence`` is 0–1 (code and group observers report 1.0);
+    ``at_event`` is the index of the transcript event that triggered the report.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    observer: str
+    condition: str
+    value: bool | None
+    evidence: str = NO_EVIDENCE
+    confidence: float = Field(default=1.0, ge=0.0, le=1.0)
+    trigger: Trigger
+    at_event: int = Field(default=-1, ge=-1)
+
+    @property
+    def key(self) -> str:
+        return f"{self.observer}.{self.condition}"
+
+    @property
+    def shown(self) -> str:
+        """``true`` / ``false`` / ``unknown``."""
+        return "unknown" if self.value is None else str(self.value).lower()
+
+    def line(self) -> str:
+        """``shelf_auditor.direct_match = true — "match": "direct" …`` (the planner's format)."""
+        return f"{self.key} = {self.shown} — {self.evidence}"
+
+
+class InformantReportEvent(_EventBase):
+    """A batch of informant reports at one trigger, recorded BEFORE any effect is applied.
+
+    ``flags`` and ``failures`` are the ``flag`` / ``fail`` effects these reports triggered
+    (``failures`` entries read ``<observer>.<condition> — <evidence>``), so a saved transcript
+    carries them and :meth:`Transcript.from_events` rebuilds ``flags`` / ``hard_failures``.
+    """
+
+    kind: Literal["informant_report"] = "informant_report"
+    trigger: Trigger
+    reports: list[InformantReport] = Field(default_factory=list)
+    flags: list[str] = Field(default_factory=list)
+    failures: list[str] = Field(default_factory=list)
 
 
 class EndEvent(_EventBase):
@@ -148,6 +205,7 @@ Event = Annotated[
     | ErrorEvent
     | ToolsOfferedEvent
     | GoalEnabledEvent
+    | InformantReportEvent
     | EndEvent,
     Field(discriminator="kind"),
 ]
@@ -172,6 +230,10 @@ class Transcript(BaseModel):
     reason: str = ""
     usage: dict[str, Usage] = Field(default_factory=dict)
     cost_usd: float = 0.0
+    # Observer effects (DESIGN §2b): ``flag`` names, and ``fail`` effects as
+    # ``<observer>.<condition> — <evidence>``; any hard failure fails the run in the judge.
+    flags: list[str] = Field(default_factory=list)
+    hard_failures: list[str] = Field(default_factory=list)
 
     @property
     def stem(self) -> str:
@@ -189,6 +251,34 @@ class Transcript(BaseModel):
 
     def tool_results(self) -> list[ToolResultEvent]:
         return [e for e in self.events if isinstance(e, ToolResultEvent)]
+
+    def informant_reports(self) -> list[InformantReport]:
+        """Every report in the order it was recorded (across all triggers)."""
+        return [r for e in self.events if isinstance(e, InformantReportEvent) for r in e.reports]
+
+    def add_reports(
+        self,
+        trigger: Trigger,
+        reports: list[InformantReport],
+        *,
+        flags: list[str] | None = None,
+        failures: list[str] | None = None,
+    ) -> InformantReportEvent:
+        """Record a batch of reports and the flag / fail effects they triggered."""
+        event = InformantReportEvent(
+            trigger=trigger,
+            reports=list(reports),
+            flags=list(flags or []),
+            failures=list(failures or []),
+        )
+        self.add(event)
+        for flag in event.flags:
+            if flag not in self.flags:
+                self.flags.append(flag)
+        for failure in event.failures:
+            if failure not in self.hard_failures:
+                self.hard_failures.append(failure)
+        return event
 
     def tools_offered(self) -> list[str]:
         """The tools offered at the end of the run, in the order they were offered."""
@@ -215,6 +305,12 @@ class Transcript(BaseModel):
         final = next((e for e in events if isinstance(e, FinalResultEvent)), None)
         usage = next((e for e in events if isinstance(e, UsageEvent)), None)
         end = next((e for e in events if isinstance(e, EndEvent)), None)
+        flags: list[str] = []
+        failures: list[str] = []
+        for e in events:
+            if isinstance(e, InformantReportEvent):
+                flags.extend(f for f in e.flags if f not in flags)
+                failures.extend(f for f in e.failures if f not in failures)
         return cls(
             scenario=system.scenario if system else "",
             path_id=system.path_id if system else "",
@@ -226,6 +322,8 @@ class Transcript(BaseModel):
             reason=end.reason if end else "transcript has no end event",
             usage=dict(usage.per_model) if usage else {},
             cost_usd=usage.cost_usd if usage else 0.0,
+            flags=flags,
+            hard_failures=failures,
         )
 
     @classmethod

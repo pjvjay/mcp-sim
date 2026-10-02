@@ -99,7 +99,7 @@ def test_models_defaults_and_new_fields() -> None:
     assert m.user is None and m.allow_same_judge is False
     assert m.user_model == m.agent
     assert m.for_role("user") == m.agent
-    assert MODEL_ROLES == ("planner", "agent", "judge", "user")
+    assert MODEL_ROLES == ("planner", "agent", "judge", "user", "observer")
     with_user = Models(user="ollama:llama3.2:3b", allow_same_judge=True)
     assert with_user.user_model == "ollama:llama3.2:3b"
     assert [with_user.for_role(r) for r in MODEL_ROLES] == [
@@ -107,6 +107,7 @@ def test_models_defaults_and_new_fields() -> None:
         DEFAULT_AGENT_MODEL,
         DEFAULT_JUDGE_MODEL,
         "ollama:llama3.2:3b",
+        DEFAULT_AGENT_MODEL,  # observers default to the agent model, not the user's
     ]
     with pytest.raises(KeyError, match="unknown model role"):
         with_user.for_role("critic")
