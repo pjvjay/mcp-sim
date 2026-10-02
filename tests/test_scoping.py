@@ -14,7 +14,13 @@ from typing import Any
 import pytest
 
 from mcpsim.mcpclient import Catalog, ToolInfo
-from mcpsim.scenario import Scenario, load_scenario, parse_scenario
+from mcpsim.scenario import (
+    DEFAULT_AGENT_MODEL,
+    DEFAULT_JUDGE_MODEL,
+    Scenario,
+    load_scenario,
+    parse_scenario,
+)
 from mcpsim.scoping import (
     covers_expected_key,
     expected_top_level_keys,
@@ -376,3 +382,47 @@ def test_initial_tools_for_the_rest_of_the_pantry_suite(catalog: Catalog) -> Non
         "unknown-recipe": "list_recipes",
         "week-under-budget": "plan_week",
     }
+
+
+# --- the committed pantry scenarios -----------------------------------------------------------
+
+
+def test_pantry_scenarios_scope_their_tools_and_route_planning_locally(catalog: Catalog) -> None:
+    read_only = (
+        "cheapest-penne",
+        "misspelled-country",
+        "tomato-penne-boycott",
+        "unknown-recipe",
+        "week-under-budget",
+    )
+    for name in read_only:
+        policy = pantry_scenario(name).tools
+        assert (policy.allow, policy.deny, policy.disclosure) == (
+            ["*"],
+            ["submit_*", "review_*"],
+            "progressive",
+        ), name
+        assert policy.initial is None and policy.discover_tool is True, name
+        assert catalog.unmatched_patterns(policy.deny) == [], "every glob names real tools"
+        allowed = catalog.filtered(policy.allow, policy.deny)
+        assert not any(is_write_tool(t) for t in allowed.tools), name
+
+    label = pantry_scenario("label-submission").tools
+    assert label.allow == [
+        "find_product",
+        "get_product",
+        "list_products",
+        "submit_origin_evidence",
+        "list_origin_submissions",
+        "pipeline_status",
+    ]
+    assert (label.deny, label.disclosure) == ([], "plan")
+    assert catalog.unmatched_patterns(label.allow) == []
+    allowed_names = catalog.filtered(label.allow, label.deny).tool_names()
+    assert "submit_origin_evidence" in allowed_names, "a volunteer may submit"
+    assert "review_origin_submission" not in allowed_names, "and must never approve"
+
+    for name in (*read_only, "label-submission"):
+        models = pantry_scenario(name).models
+        assert models.planner == "ollama:command-r7b", name
+        assert (models.agent, models.judge) == (DEFAULT_AGENT_MODEL, DEFAULT_JUDGE_MODEL), name

@@ -76,10 +76,13 @@ flowchart LR
      supported by a tool result in the transcript (the single most important item for the pantry
      server, where "this basket is clean" is only true if `origin_status == "verified"`);
      recovery — errors returned by the server were handled, not papered over; efficiency —
-     no tool calls that did nothing for the goal. It returns `Verdict` as structured output.
+     no tool calls that did nothing for the goal; scope — it stayed within the tools it was
+     offered. It returns `Verdict` as structured output.
      `judge_votes` (default 3) independent calls; `pass` is the majority; `score` the mean.
-     Any deterministic `matches` failure forces `pass = false` regardless of votes (a judge
-     cannot overrule a JSON mismatch), and the verdict says which layer failed.
+     Any deterministic `matches` failure or scope violation (an `error` event `scope
+     violation: …`, see below) forces `pass = false` regardless of votes (a judge cannot
+     overrule a JSON mismatch or a call outside the offered tools), and the verdict says which
+     layer failed.
 * **Runner** (`mcpsim/runner.py`). `plan → runs → judge → report`, with every artefact on disk under
   `runs/<scenario>/<timestamp>/`: `plan.json`, `transcripts/<path>-<mode>-<i>.jsonl`,
   `verdicts/<same>.json`, `report.json`, `report.md`. Re-running with `--plan` reuses a plan;
@@ -90,6 +93,51 @@ flowchart LR
   (re-judge saved transcripts, e.g. after a prompt change), `report`, `suite` (every scenario in a
   directory, aggregated, `--threshold` for the exit code), `catalog` (print what the server
   exposes — useful on its own).
+
+### Tool scoping and disclosure
+
+A scenario's `tools` block decides which of the server's tools the agent under test can see,
+and when (`mcpsim/scenario.py::ToolPolicy`, `mcpsim/scoping.py`, `mcpsim/agent.py::ToolScope`).
+Fifteen tool definitions in every prompt made the local 8B agent stop calling tools, and a
+read-only lookup must never be able to reach `submit_origin_evidence`.
+
+* **Allowed catalog.** `allow` (default `["*"]`) then `deny` are `fnmatch` globs over tool
+  names; what survives is the *allowed catalog* (`Catalog.filtered`; resources and prompts are
+  untouched). The runner applies it once per scenario, warns per glob that matches no tool, and
+  the planner, every run, the dry run and `plan.catalog_digest` work from it, never from the
+  server's full list.
+* **Disclosure.** The agent loop keeps an ordered `offered` list and sends only those tools'
+  definitions on every turn. `all` offers every allowed tool from turn one. `plan` offers the
+  path's step tools in guided mode and every allowed tool in free mode. `progressive` offers the
+  `initial` globs when given, else a relevance-scored starting set: `scoping.initial_tools`
+  scores each tool by the vocabulary it shares with the goal, the instructions, the expected
+  outcome's prose and the dotted keys and plain values of `expected_outcome.json` (a name token
+  counts 3, an output key or input property 2, a description word 1), takes the top five,
+  forces in every tool whose output keys cover a top-level expected key, leaves write tools
+  (`read_only_hint: false`, `destructive_hint: true`, or a `submit_`/`review_`/`approve_`/…
+  name) out unless `write_intent` finds an imperative submit/record/review/approve/reject/write/
+  register/add in the goal or an instruction, and never offers fewer than three. With
+  `discover_tool` (the default) the agent also gets the framework's `discover_tools(query)`
+  meta-tool: it ranks the unoffered allowed tools against the query with the same weights, adds
+  the top three (score above zero) and answers in text ("name: first sentence (now
+  available)"); it never reaches the server and does not count against `max_tool_calls`.
+  `initial` outside `progressive` is a scenario error.
+* **Growth and events.** The offered set grows through `discover_tools`, the plan, and
+  observer effects: `run_path(on_start=…)` hands the observer runner a `LiveRun` whose
+  `offer_tools(names, reason)` adds allowed tools (names or globs) and whose
+  `enable_goal(text, reason)` records a `goal_enabled` event and delivers the text to the agent
+  in its next user message. Every change to the set is a `tools_offered` event (`added`,
+  `removed`, `reason`: `initial:<mode>:<disclosure>`, `discover_tools:<query>`, or the
+  observer's reason), and the judge sees the running set as "tools now offered: …" lines.
+* **Scope violations.** A `tool_use` naming a tool that is allowed but not offered, or not
+  allowed at all, is not sent to the server: the agent gets an error `tool_result` ("tool X is
+  not available in this conversation"), the transcript an `error` event
+  `scope violation: <tool> (not allowed|not disclosed)`, and the loop continues. The judge's
+  deterministic layer (`scope_violations`) fails the run on any violation with the reason
+  `scope: <tool> (<why>)` whatever the votes say; the LLM checklist's "stayed within the tools
+  it was offered" item records the evidence quote. The dry run follows the plan, so it is
+  offered exactly the path's allowed tools and refuses a step outside the allowed catalog the
+  same way.
 
 ## 3. Scenario file
 
@@ -125,6 +173,7 @@ repeat: 3
 judge_votes: 3
 budgets: { max_turns: 12, max_tool_calls: 20, max_cost_usd: 1.00 }
 models: { agent: claude-sonnet-5-5, planner: claude-opus-5-5, judge: claude-opus-5-5 }
+tools: { deny: ["submit_*", "review_*"], disclosure: progressive }   # §2, optional
 ```
 
 `expected_outcome.json` keys are dotted paths into `final_result`; `[*]` means every element must

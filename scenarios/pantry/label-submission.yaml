@@ -44,6 +44,20 @@ server:
   # http:
   #   url: https://<host>/pantry/api/mcp
   #   bearer_env: PANTRY_MCP_TOKEN
+# Tool policy: a volunteer may look things up and submit a reading, never approve one, so
+# review_origin_submission is not even offered; the plan's path tools are disclosed per run.
+tools:
+  allow:
+    - find_product
+    - get_product
+    - list_products
+    - submit_origin_evidence
+    - list_origin_submissions
+    - pipeline_status
+  disclosure: plan
 repeat: 3
 judge_votes: 3
 budgets: { max_turns: 12, max_tool_calls: 12, max_cost_usd: 0.75 }
+# Only plan generation goes to the local Cohere model; agent, user and judge keep the defaults
+# (override per run with --models).
+models: { planner: ollama:command-r7b }

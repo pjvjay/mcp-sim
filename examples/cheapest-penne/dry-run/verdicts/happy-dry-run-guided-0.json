@@ -77,8 +77,7 @@
     "deterministic: product_name $regex",
     "deterministic: store $type",
     "deterministic: price $gt",
-    "deterministic: origin_status $in",
-    "run: budget_exceeded: max_tool_calls=10 exceeded: agent requested another call to review_origin_submission"
+    "deterministic: origin_status $in"
   ],
   "votes": 0,
   "judge_model": "dry-run"

@@ -125,6 +125,14 @@ sed -i '' 's#/Users/paulvijayakumar/Documents/workspace/pantry-platform/pantry-a
 path you are happy to wipe (`runs/` is git-ignored), and `setup` runs once before the first run
 of a scenario with the same `env` applied.
 
+Each scenario also scopes the agent's tools (see Disclosure): the five read-only personas deny
+`submit_*` and `review_*` and disclose progressively, so a lookup starts with a handful of
+matching tools and can ask for more; `label-submission` allows exactly the lookup, submission
+and queue tools with `plan` disclosure, so a volunteer can submit a reading but is never offered
+`review_origin_submission`. All six route plan generation to the local Cohere model
+(`models: { planner: ollama:command-r7b }`, see `docs/LOCAL_MODELS.md`); the agent, simulated
+user and judge keep the hosted defaults unless `--models` overrides them.
+
 ## Scenario file
 
 ```yaml
@@ -155,11 +163,16 @@ judge_votes: 3
 budgets: { max_turns: 12, max_tool_calls: 20, max_cost_usd: 1.00 }
 models: { agent: claude-sonnet-5-5, planner: claude-opus-5-5, judge: claude-opus-5-5 }
 concurrency: 4
+tools:                              # which tools the agent may see, and when (see Disclosure)
+  allow: ["*"]                      # fnmatch globs over tool names, then deny
+  deny: ["submit_*", "review_*"]
+  disclosure: progressive           # all (default) | plan | progressive
 ```
 
 `name` is the run directory name. `expected_outcome` needs `text`, `json` or both. `server`
 needs exactly one of `stdio` / `http`. Everything from `repeat` down is optional with the
-defaults shown. JSON scenario files work too.
+defaults shown (`tools` defaults to every tool, disclosed at once). JSON scenario files work
+too.
 
 The agent is told to end with a fenced ` ```json ` block named `final_result` holding the fields
 the expected outcome names; the matcher runs on that block (a malformed block is a recorded
@@ -182,6 +195,28 @@ must satisfy the operator, `[any]` at least one, `[0]` an index. A value without
 | `$len` | Length of a string/array/object: an integer, or nested `{$gte: 5}` style operators. |
 | `$subset` | Every key of the expected object is present and equal. |
 | `$type` | `string`, `number`, `boolean`, `array`, `object`, `null`. |
+
+## Disclosure
+
+`tools` controls what the agent under test can call. `allow` then `deny` are globs over the
+server's tool names; what survives is the *allowed catalog* that the planner, every run and the
+dry run work from (a denied tool never reaches the agent's prompt, and `plan.catalog_digest` is
+the allowed catalog's). `disclosure` says how much of it the agent sees at once:
+
+* `all` — every allowed tool from turn one;
+* `plan` — in guided mode only the tools the path's steps name, in free mode everything;
+* `progressive` — a starting set scored by how much vocabulary each tool shares with the goal,
+  instructions and expected outcome (top five, every tool whose output covers an expected field
+  forced in, write tools left out unless the goal asks for a write, never fewer than three), or
+  the explicit `initial: [globs]`; plus the framework's own `discover_tools(query)` tool, which
+  adds up to three more matching tools per call without touching the server (`discover_tool:
+  false` removes it).
+
+Every change to the offered set is a `tools_offered` transcript event with its reason. A call to
+a tool that is not offered never reaches the server: the agent gets an error tool result, the
+transcript an `error` event `scope violation: <tool> (not allowed|not disclosed)`, and the run
+fails on that alone whatever the judge votes (`scope: …` in the failure reasons). Observers can
+widen the set mid-run (`offer_tools`) or add a goal (`enable_goal`); see DESIGN §2.
 
 ## CLI
 
@@ -211,22 +246,27 @@ transcripts, not the planner or judge).
 `--dry-run` or `MCPSIM_DRY_RUN=1` is a smoke mode that needs no API key and still exercises the
 whole MCP path:
 
-* the **planner** emits a one-path happy plan from the catalog without an LLM: one step per
-  tool whose required arguments can all be defaulted from its schema (strings `""`, integers
-  `1`, booleans `false`, arrays `[]`), skipping tools whose descriptions *claim* a cost
-  ("costs real Claude API credits", "SLOW") — a description that says "free" or "no LLM" is
-  believed over an incidental cost word — and saying so in the path rationale;
-* the **agent** makes no LLM call: it calls each step's tool with its sketch arguments in order,
-  records error results (a `""` slug is rejected by the server, as it should be) and
-  synthesises `final_result` from the last structured tool result; the scenario's
-  `max_tool_calls` budget applies, so a catalog with more free tools than the budget ends the
-  run with outcome `budget_exceeded`, which is itself a checked behaviour;
-* the **judge** is skipped: the verdict comes from the deterministic matcher alone and says
-  `judge_model: "dry-run"`.
+* the **planner** emits a one-path happy plan without an LLM over the allowed tools that share
+  vocabulary with the scenario, most relevant first and at most `max_tool_calls` of them, so
+  the budget never ends a dry run. It skips tools whose descriptions *claim* a cost ("costs
+  real Claude API credits", "SLOW" — a description that says "free" or "no LLM" is believed over
+  an incidental cost word), write tools unless the goal or an instruction asks for a write, and
+  tools that share no word with the scenario, and names each skipped tool and why in the path
+  rationale. An argument whose name is a top-level `expected_outcome.json` key with a plain
+  value takes that value (`query: penne` → `find_product(query="penne")`); other required
+  arguments get schema placeholders (strings `""`, integers `1`, booleans `false`, arrays `[]`);
+* the **agent** makes no LLM call: it is offered exactly the path's allowed tools, calls each
+  step's tool with its sketch arguments in order, records error results (a `""` slug is
+  rejected by the server, as it should be), refuses a step outside the allowed catalog as a
+  scope violation, and synthesises `final_result` from the last structured tool result;
+* the **judge** is skipped: the verdict comes from the deterministic matcher plus the scope
+  layer and says `judge_model: "dry-run"`.
 
-Expect the matcher to fail in dry run for most scenarios (default arguments rarely produce the
-expected outcome). The point is the artefacts: a `plan.json` listing real tools, a transcript
-whose `tool_result` events came from the real server, a verdict and a report.
+A scenario whose expected outcome pins the one argument the relevant tool needs can pass the
+matcher in dry run (the test suite's fake lookup does); most real scenarios will not, because
+`final_result` is whatever the last relevant tool returned. The point is the artefacts: a
+`plan.json` listing real tools in a goal-relevant order, a transcript whose `tool_result` events
+came from the real server, a verdict and a report.
 
 ## Sample run
 
@@ -234,9 +274,11 @@ whose `tool_result` events came from the real server, a verdict and a report.
 machine against the real pantry server (DEMO_MODE, seeded SQLite), described in
 [`examples/README.md`](examples/README.md):
 
-* `dry-run/` — the smoke above: a plan over ten free tools, a transcript with the server's real
-  `tool_result` events (seven succeed, three reject the placeholder arguments), a matcher-only
-  verdict and the report;
+* `dry-run/` — the smoke above, regenerated with tool scoping: a plan over the ten goal-relevant
+  free tools (the write tools are denied, the costly planners skipped), a transcript whose first
+  call is `find_product(query="penne")` and whose ten `tool_result` events came from the real
+  server (nine answer, `get_recipe("")` rejects the placeholder), a matcher-only verdict and the
+  report;
 * `local-plan/` — a plan written by the local Cohere model (`ollama:command-r7b`, 24 minutes on
   a loaded CPU): two paths, every tool real, arguments schema-checked by the hardened validator;
 * `local-run/` — one guided run of that plan with `command-r7b` as the agent. It made **no tool

@@ -36,6 +36,13 @@ server:
       DEMO_MODE: "1"
       DB_URL: sqlite:////Users/paulvijayakumar/Documents/workspace/mcp-sim/runs/pantry-sim.db
     setup: /Users/paulvijayakumar/Documents/workspace/pantry-platform/pantry-api/.venv/bin/python -m pantry_planner.db seed
+# Tool policy: a read-only persona. The agent never sees the write tools (submit_* / review_*),
+# and progressive disclosure starts it on the handful of tools that match the goal; it can ask
+# for more with discover_tools (DESIGN §2 "Tool scoping and disclosure").
+tools: { deny: ["submit_*", "review_*"], disclosure: progressive }
 repeat: 3
 judge_votes: 3
 budgets: { max_turns: 12, max_tool_calls: 20, max_cost_usd: 1.00 }
+# Only plan generation goes to the local Cohere model; agent, user and judge keep the defaults
+# (override per run with --models).
+models: { planner: ollama:command-r7b }

@@ -1,19 +1,19 @@
 {
   "scenario": "cheapest-penne",
-  "generated_at": "2026-10-02T05:56:26.930+00:00",
-  "run_dir": "runs/cheapest-penne/20261002T055552Z",
+  "generated_at": "2026-10-02T08:27:20.205+00:00",
+  "run_dir": "runs/cheapest-penne/20261002T082714Z",
   "runs": 4,
   "passed": 0,
   "pass_rate": 0.0,
   "mean_score": 0.0,
   "cost_usd": 0.0,
-  "cost_note": "estimate from the rate table; covers the agent and simulated-user calls recorded in transcripts, not the planner or judge",
+  "cost_note": "estimate; local model(s) via Ollama cost 0 (no API spend); hosted calls, if any, are an estimate from the rate table; covers the agent and simulated-user calls recorded in transcripts, not the planner or judge",
   "usage": {},
   "judge_models": [
     "dry-run"
   ],
   "outcomes": {
-    "budget_exceeded": 4
+    "completed": 4
   },
   "cells": [
     {
@@ -25,7 +25,7 @@
       "mean_score": 0.0,
       "cost_usd": 0.0,
       "outcomes": {
-        "budget_exceeded": 2
+        "completed": 2
       }
     },
     {
@@ -37,7 +37,7 @@
       "mean_score": 0.0,
       "cost_usd": 0.0,
       "outcomes": {
-        "budget_exceeded": 2
+        "completed": 2
       }
     }
   ],
@@ -47,7 +47,7 @@
       "mode": "free",
       "index": 0,
       "score": 0.0,
-      "outcome": "budget_exceeded",
+      "outcome": "completed",
       "reasons": [
         "deterministic: query $eq",
         "deterministic: match $eq",
@@ -55,19 +55,17 @@
         "deterministic: product_name $regex",
         "deterministic: store $type",
         "deterministic: price $gt",
-        "deterministic: origin_status $in",
-        "run: budget_exceeded: max_tool_calls=10 exceeded: agent requested another call to review_origin_submission",
-        "outcome budget_exceeded: max_tool_calls=10 exceeded: agent requested another call to review_origin_submission"
+        "deterministic: origin_status $in"
       ],
-      "transcript": "runs/cheapest-penne/20261002T055552Z/transcripts/happy-dry-run-free-0.jsonl",
-      "verdict": "runs/cheapest-penne/20261002T055552Z/verdicts/happy-dry-run-free-0.json"
+      "transcript": "runs/cheapest-penne/20261002T082714Z/transcripts/happy-dry-run-free-0.jsonl",
+      "verdict": "runs/cheapest-penne/20261002T082714Z/verdicts/happy-dry-run-free-0.json"
     },
     {
       "path_id": "happy-dry-run",
       "mode": "free",
       "index": 1,
       "score": 0.0,
-      "outcome": "budget_exceeded",
+      "outcome": "completed",
       "reasons": [
         "deterministic: query $eq",
         "deterministic: match $eq",
@@ -75,19 +73,17 @@
         "deterministic: product_name $regex",
         "deterministic: store $type",
         "deterministic: price $gt",
-        "deterministic: origin_status $in",
-        "run: budget_exceeded: max_tool_calls=10 exceeded: agent requested another call to review_origin_submission",
-        "outcome budget_exceeded: max_tool_calls=10 exceeded: agent requested another call to review_origin_submission"
+        "deterministic: origin_status $in"
       ],
-      "transcript": "runs/cheapest-penne/20261002T055552Z/transcripts/happy-dry-run-free-1.jsonl",
-      "verdict": "runs/cheapest-penne/20261002T055552Z/verdicts/happy-dry-run-free-1.json"
+      "transcript": "runs/cheapest-penne/20261002T082714Z/transcripts/happy-dry-run-free-1.jsonl",
+      "verdict": "runs/cheapest-penne/20261002T082714Z/verdicts/happy-dry-run-free-1.json"
     },
     {
       "path_id": "happy-dry-run",
       "mode": "guided",
       "index": 0,
       "score": 0.0,
-      "outcome": "budget_exceeded",
+      "outcome": "completed",
       "reasons": [
         "deterministic: query $eq",
         "deterministic: match $eq",
@@ -95,19 +91,17 @@
         "deterministic: product_name $regex",
         "deterministic: store $type",
         "deterministic: price $gt",
-        "deterministic: origin_status $in",
-        "run: budget_exceeded: max_tool_calls=10 exceeded: agent requested another call to review_origin_submission",
-        "outcome budget_exceeded: max_tool_calls=10 exceeded: agent requested another call to review_origin_submission"
+        "deterministic: origin_status $in"
       ],
-      "transcript": "runs/cheapest-penne/20261002T055552Z/transcripts/happy-dry-run-guided-0.jsonl",
-      "verdict": "runs/cheapest-penne/20261002T055552Z/verdicts/happy-dry-run-guided-0.json"
+      "transcript": "runs/cheapest-penne/20261002T082714Z/transcripts/happy-dry-run-guided-0.jsonl",
+      "verdict": "runs/cheapest-penne/20261002T082714Z/verdicts/happy-dry-run-guided-0.json"
     },
     {
       "path_id": "happy-dry-run",
       "mode": "guided",
       "index": 1,
       "score": 0.0,
-      "outcome": "budget_exceeded",
+      "outcome": "completed",
       "reasons": [
         "deterministic: query $eq",
         "deterministic: match $eq",
@@ -115,12 +109,10 @@
         "deterministic: product_name $regex",
         "deterministic: store $type",
         "deterministic: price $gt",
-        "deterministic: origin_status $in",
-        "run: budget_exceeded: max_tool_calls=10 exceeded: agent requested another call to review_origin_submission",
-        "outcome budget_exceeded: max_tool_calls=10 exceeded: agent requested another call to review_origin_submission"
+        "deterministic: origin_status $in"
       ],
-      "transcript": "runs/cheapest-penne/20261002T055552Z/transcripts/happy-dry-run-guided-1.jsonl",
-      "verdict": "runs/cheapest-penne/20261002T055552Z/verdicts/happy-dry-run-guided-1.json"
+      "transcript": "runs/cheapest-penne/20261002T082714Z/transcripts/happy-dry-run-guided-1.jsonl",
+      "verdict": "runs/cheapest-penne/20261002T082714Z/verdicts/happy-dry-run-guided-1.json"
     }
   ],
   "unjudged": []
