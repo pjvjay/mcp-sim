@@ -170,6 +170,18 @@ async def test_two_tool_happy_path_produces_the_exact_event_sequence(scenario: S
     assert t.events[10].per_model == t.usage and t.events[10].estimate is True
 
 
+async def test_denied_tools_are_never_offered_even_when_the_agent_discovers_the_catalog(
+    scenario_data: dict[str, Any],
+) -> None:
+    scoped = parse_scenario(
+        {**scenario_data, "tools": {"deny": ["fail", "expensive_*"]}}, source="fixture"
+    )
+    llm = ScriptedLLM([opening(), text_response(FINAL_TEXT)])
+    t = await run(scoped, llm)  # no catalog passed: run_path discovers and filters it itself
+    assert t.outcome == "completed"
+    assert [tool["name"] for tool in llm.calls[1]["tools"]] == ["lookup", "list_items", "echo"]
+
+
 async def test_error_tool_result_is_passed_back_and_seen_next_turn(scenario: Scenario) -> None:
     llm = ScriptedLLM(
         [

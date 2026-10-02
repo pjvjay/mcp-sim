@@ -13,6 +13,7 @@ import os
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from fnmatch import fnmatchcase
 from typing import Any
 
 from mcp import types as mcp_types
@@ -38,6 +39,9 @@ class ToolInfo(BaseModel):
     description: str = ""
     input_schema: dict[str, Any] = Field(default_factory=dict)
     output_schema: dict[str, Any] | None = None
+    # The server's MCP tool annotations (``read_only_hint``, ``destructive_hint``, ...) as the
+    # SDK dumps them; ``None`` when the server sent none. Scoping reads the write hints.
+    annotations: dict[str, Any] | None = None
 
     def to_anthropic_tool(self) -> dict[str, Any]:
         """The Anthropic ``tools`` entry; the MCP input schema is already JSON Schema."""
@@ -100,11 +104,38 @@ class Catalog(BaseModel):
     def to_anthropic_tools(self) -> list[dict[str, Any]]:
         return [t.to_anthropic_tool() for t in self.tools]
 
+    def select(self, patterns: list[str]) -> list[ToolInfo]:
+        """The tools whose name matches any of the ``fnmatch`` globs, in catalog order."""
+        return [t for t in self.tools if matches_any(t.name, patterns)]
+
+    def filtered(self, allow: list[str], deny: list[str]) -> Catalog:
+        """The *allowed catalog*: tools matching an ``allow`` glob and no ``deny`` glob.
+
+        Resources, templates and prompts are untouched; order is the server's. Globs are
+        case-sensitive ``fnmatch`` patterns (``submit_*``, ``*_origin*``, ``*``).
+        """
+        kept = [
+            t
+            for t in self.tools
+            if matches_any(t.name, allow) and not matches_any(t.name, deny)
+        ]
+        return self.model_copy(update={"tools": kept})
+
+    def unmatched_patterns(self, patterns: list[str]) -> list[str]:
+        """The globs among ``patterns`` that match none of this catalog's tools."""
+        names = self.tool_names()
+        return [p for p in patterns if not any(fnmatchcase(n, p) for n in names)]
+
     def digest(self) -> str:
         """sha256 over the canonical JSON of everything that affects planning."""
         payload = self.model_dump(mode="json", exclude={"server_name"})
         canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def matches_any(name: str, patterns: list[str]) -> bool:
+    """Does ``name`` match at least one glob (``fnmatchcase``: case-sensitive, ``*``/``?``)?"""
+    return any(fnmatchcase(name, p) for p in patterns)
 
 
 class ToolResult(BaseModel):
@@ -194,12 +225,18 @@ class Session:
             params = mcp_types.PaginatedRequestParams(cursor=cursor) if cursor else None
             page = await self._session.list_tools(params=params)
             for t in page.tools:
+                annotations = getattr(t, "annotations", None)
                 tools.append(
                     ToolInfo(
                         name=t.name,
                         description=t.description or "",
                         input_schema=dict(t.input_schema or {}),
                         output_schema=dict(t.output_schema) if t.output_schema else None,
+                        annotations=(
+                            annotations.model_dump(mode="json", exclude_none=True)
+                            if annotations is not None
+                            else None
+                        ),
                     )
                 )
             cursor = page.next_cursor

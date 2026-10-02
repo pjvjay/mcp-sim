@@ -519,8 +519,9 @@ async def run_path(
 ) -> Transcript:
     """Run ``path`` once in ``mode`` and return the transcript (never raises for run failures).
 
-    ``llm`` may be ``None`` only when ``dry_run`` is true. ``catalog`` is discovered from the
-    session when not given (the agent's ``tools`` are its tool schemas).
+    ``llm`` may be ``None`` only when ``dry_run`` is true. ``catalog`` is the *allowed* catalog
+    (the runner applies ``scenario.tools`` once); when not given it is discovered from the
+    session and filtered here, so the agent never sees a tool the scenario denies.
     """
     if not dry_run and llm is None:
         raise ValueError("run_path needs an llm unless dry_run=True")
@@ -546,6 +547,7 @@ async def run_path(
     try:
         if catalog is None:
             catalog = await session.catalog()
+        catalog = catalog.filtered(scenario.tools.allow, scenario.tools.deny)
         tools = catalog.to_anthropic_tools()
         user = SimulatedUser(scenario, llm, user_model)
 

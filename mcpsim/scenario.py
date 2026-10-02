@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 import warnings
 from pathlib import Path as FsPath
-from typing import Any
+from typing import Any, Literal
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
@@ -114,6 +114,45 @@ class Models(_Strict):
         return self.user_model if role == "user" else str(getattr(self, role))
 
 
+Disclosure = Literal["all", "plan", "progressive"]
+DISCLOSURES: tuple[Disclosure, ...] = ("all", "plan", "progressive")
+
+
+class ToolPolicy(_Strict):
+    """Which of the server's tools the agent under test may see, and when (DESIGN §2).
+
+    ``allow`` then ``deny`` are ``fnmatch`` globs over tool names; what survives is the
+    *allowed catalog* that the planner, the agent and the dry run work from. ``disclosure``
+    says how much of it the agent sees at once: ``all`` from turn one; ``plan`` only the path's
+    tools in guided mode (everything in free mode); ``progressive`` a relevance-scored starting
+    set (or the explicit ``initial`` globs) that grows through the framework's
+    ``discover_tools`` meta-tool (unless ``discover_tool`` is false) and through observers.
+    A glob that matches nothing is not an error here (the catalog is unknown until the server
+    answers); the runner warns about it.
+    """
+
+    allow: list[str] = Field(default_factory=lambda: ["*"])
+    deny: list[str] = Field(default_factory=list)
+    disclosure: Disclosure = "all"
+    initial: list[str] | None = None
+    discover_tool: bool = True
+
+    @model_validator(mode="after")
+    def _progressive_only_fields(self) -> ToolPolicy:
+        if self.initial is not None and self.disclosure != "progressive":
+            raise ValueError(
+                f"tools.initial only applies to disclosure 'progressive' "
+                f"(this scenario says {self.disclosure!r})"
+            )
+        for field_name, patterns in (("allow", self.allow), ("deny", self.deny)):
+            for i, pattern in enumerate(patterns):
+                if not pattern.strip():
+                    raise ValueError(f"tools.{field_name}[{i}] is blank")
+        if not self.allow:
+            raise ValueError("tools.allow must list at least one glob ('*' allows every tool)")
+        return self
+
+
 class Scenario(_Strict):
     name: str = Field(min_length=1, pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
     role: str = Field(min_length=1)
@@ -126,6 +165,7 @@ class Scenario(_Strict):
     budgets: Budgets = Field(default_factory=Budgets)
     models: Models = Field(default_factory=Models)
     concurrency: int = Field(default=4, ge=1)
+    tools: ToolPolicy = Field(default_factory=ToolPolicy)
 
     @model_validator(mode="after")
     def _instructions_non_blank(self) -> Scenario:

@@ -134,3 +134,59 @@ def test_unparseable_yaml(tmp_path: Path) -> None:
 def test_missing_file(tmp_path: Path) -> None:
     with pytest.raises(ScenarioError, match="cannot read scenario"):
         load_scenario(tmp_path / "nope.yaml")
+
+
+# --- tools policy (DESIGN §2 "Tool scoping and disclosure") ----------------------------------
+
+
+def test_tools_policy_defaults_allow_everything_all_at_once(scenario_data: dict[str, Any]) -> None:
+    s = parse_scenario(scenario_data)
+    assert s.tools.allow == ["*"]
+    assert s.tools.deny == []
+    assert s.tools.disclosure == "all"
+    assert s.tools.initial is None
+    assert s.tools.discover_tool is True
+
+
+def test_tools_policy_is_parsed(scenario_data: dict[str, Any]) -> None:
+    scenario_data["tools"] = {
+        "deny": ["submit_*", "review_*"],
+        "disclosure": "progressive",
+        "initial": ["lookup", "list_*"],
+        "discover_tool": False,
+    }
+    s = parse_scenario(scenario_data)
+    assert s.tools.allow == ["*"]
+    assert s.tools.deny == ["submit_*", "review_*"]
+    assert s.tools.disclosure == "progressive"
+    assert s.tools.initial == ["lookup", "list_*"]
+    assert s.tools.discover_tool is False
+    scenario_data["tools"] = {"allow": ["find_product", "get_product"], "disclosure": "plan"}
+    s = parse_scenario(scenario_data)
+    assert s.tools.allow == ["find_product", "get_product"] and s.tools.disclosure == "plan"
+
+
+@pytest.mark.parametrize(
+    ("tools", "needle"),
+    [
+        ({"initial": ["lookup"]}, "tools.initial only applies to disclosure 'progressive'"),
+        (
+            {"disclosure": "plan", "initial": ["lookup"]},
+            "tools.initial only applies to disclosure 'progressive'",
+        ),
+        # Reveal rules were removed from the design (v2): the key is simply unknown.
+        ({"reveal": [{"after_tool": "lookup", "tools": ["echo"]}]}, "tools.reveal"),
+        ({"disclosure": "sometimes"}, "tools.disclosure"),
+        ({"allow": []}, "tools.allow must list at least one glob"),
+        ({"deny": ["ok", " "]}, "tools.deny[1] is blank"),
+        ({"allow": "lookup"}, "tools.allow"),
+    ],
+)
+def test_tools_policy_validation_errors_name_the_field(
+    tmp_path: Path, scenario_data: dict[str, Any], tools: dict[str, Any], needle: str
+) -> None:
+    scenario_data["tools"] = tools
+    path = _write(tmp_path, scenario_data)
+    with pytest.raises(ScenarioError) as exc_info:
+        load_scenario(path)
+    assert needle in str(exc_info.value)

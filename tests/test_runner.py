@@ -6,6 +6,7 @@ themselves, so they must be called from outside an event loop, exactly as the CL
 
 from __future__ import annotations
 
+import asyncio
 import json
 import sys
 from collections.abc import AsyncIterator
@@ -308,6 +309,64 @@ def test_judge_run_dir_rejects_zero_votes(quick_path: FsPath, out_dir: FsPath) -
     run_dir = runner.run_scenario(quick_path, out_dir, dry_run=True, repeat=1, mode="guided")
     with pytest.raises(ValueError, match="votes"):
         runner.judge_run_dir(run_dir, votes=0)
+
+
+# --- tool scoping: the allowed catalog is what the plan, the runs and the digest see ----------
+
+
+def test_deny_globs_scope_the_plan_the_runs_and_the_digest(
+    tmp_path: FsPath,
+    quick_data: dict[str, Any],
+    out_dir: FsPath,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    quick_data["tools"] = {"deny": ["fail", "expensive_*", "nope_*"]}
+    path = tmp_path / "scoped.yaml"
+    path.write_text(yaml.safe_dump(quick_data, sort_keys=False), encoding="utf-8")
+
+    run_dir = runner.run_scenario(path, out_dir, dry_run=True, repeat=1, mode="guided")
+
+    plan = ExecutionPlan.load(run_dir / "plan.json")
+    assert plan.paths[0].tools_used() == ["lookup", "list_items", "echo"]
+    full = asyncio.run(_fake_catalog())
+    assert plan.catalog_digest == full.filtered(["*"], ["fail", "expensive_*"]).digest()
+    assert plan.catalog_digest != full.digest()
+    stem = f"{DRY_RUN_PATH_ID}-guided-0"
+    transcript = Transcript.read_jsonl(run_dir / "transcripts" / f"{stem}.jsonl")
+    assert [c.name for c in transcript.tool_calls()] == ["lookup", "list_items", "echo"]
+    err = capsys.readouterr().err
+    assert "warning: tools.deny glob 'nope_*' matches no tool of this server" in err
+    assert "glob 'fail'" not in err and "glob 'expensive_*'" not in err
+
+
+async def _fake_catalog() -> Any:
+    from tests.conftest import open_session
+
+    async with open_session() as session:
+        return await session.catalog()
+
+
+def test_reused_plan_is_compared_against_the_allowed_catalog(
+    tmp_path: FsPath,
+    quick_data: dict[str, Any],
+    out_dir: FsPath,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    unscoped = tmp_path / "unscoped.yaml"
+    unscoped.write_text(yaml.safe_dump(quick_data, sort_keys=False), encoding="utf-8")
+    plan_path = runner.plan_scenario(unscoped, out_dir, dry_run=True)
+    scoped_data = {**quick_data, "tools": {"deny": ["fail"]}}
+    scoped = tmp_path / "scoped.yaml"
+    scoped.write_text(yaml.safe_dump(scoped_data, sort_keys=False), encoding="utf-8")
+
+    runner.run_scenario(scoped, out_dir, plan_path=plan_path, dry_run=True, repeat=1, mode="free")
+    err = capsys.readouterr().err
+    assert "warning: the allowed catalog changed since plan" in err
+    assert "the scenario's tools policy" in err
+
+    capsys.readouterr()
+    runner.run_scenario(unscoped, out_dir, plan_path=plan_path, dry_run=True, repeat=1, mode="free")
+    assert "allowed catalog changed" not in capsys.readouterr().err
 
 
 # --- narrowing: plan reuse, only_path, repeat, mode -------------------------------------------

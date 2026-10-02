@@ -176,3 +176,56 @@ async def test_second_server_instance_is_independent() -> None:
         "store": "Corner Shop",
         "origin_status": "verified",
     }
+
+
+# --- allowed catalog: allow/deny globs ---------------------------------------------------------
+
+
+async def test_filtered_applies_allow_then_deny_and_keeps_everything_else() -> None:
+    async with open_session() as session:
+        full = await session.catalog()
+
+    allowed = full.filtered(["*"], ["fail", "expensive_*"])
+    assert allowed.tool_names() == ["lookup", "list_items", "echo"]
+    assert [r.uri for r in allowed.resources] == ["fake://about"]
+    assert [t.uri_template for t in allowed.resource_templates] == ["fake://item/{slug}"]
+    assert [p.name for p in allowed.prompts] == ["shopping_prompt"]
+    assert allowed.server_name == SERVER_NAME
+    assert allowed.digest() != full.digest()
+    assert full.tool_names() == list(TOOL_NAMES), "filtering never mutates the source"
+
+    # deny is applied after allow; globs are case-sensitive fnmatch patterns.
+    assert full.filtered(["l*"], []).tool_names() == ["lookup", "list_items"]
+    assert full.filtered(["l*"], ["*_items"]).tool_names() == ["lookup"]
+    assert full.filtered(["LOOKUP"], []).tool_names() == []
+    assert full.filtered(["*"], ["*"]).tool_names() == []
+    assert full.filtered(["*"], []).digest() == full.digest()
+
+
+async def test_select_and_unmatched_patterns() -> None:
+    async with open_session() as session:
+        catalog = await session.catalog()
+    assert [t.name for t in catalog.select(["*_items", "echo"])] == ["list_items", "echo"]
+    assert [t.name for t in catalog.select(["echo", "lookup"])] == ["lookup", "echo"]
+    assert catalog.select(["nope"]) == []
+    assert catalog.unmatched_patterns(["nope_*", "lookup", "*", "Echo"]) == ["nope_*", "Echo"]
+    assert catalog.unmatched_patterns([]) == []
+
+
+async def test_catalog_records_tool_annotations() -> None:
+    from mcp.types import ToolAnnotations
+
+    annotated = build_server("annotated")
+
+    @annotated.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False))
+    def record_note(text: str) -> dict[str, str]:
+        """Record a note."""
+        return {"text": text}
+
+    async with open_session(annotated) as session:
+        catalog = await session.catalog()
+    assert catalog.tool("lookup").annotations is None, "the fake tools declare no annotations"
+    assert catalog.tool("record_note").annotations == {
+        "read_only_hint": False,
+        "destructive_hint": False,
+    }

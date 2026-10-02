@@ -208,6 +208,28 @@ async def discover_catalog(scenario: Scenario) -> Catalog:
         return await session.catalog()
 
 
+def allowed_catalog(scenario: Scenario, catalog: Catalog) -> Catalog:
+    """The catalog after ``scenario.tools`` allow/deny globs, warning once per unmatched glob.
+
+    This is applied once per scenario; the planner, every run (the agent and the dry run) and
+    ``plan.catalog_digest`` all work from the result, never from the server's full catalog.
+    """
+    policy = scenario.tools
+    for field_name, patterns in (("allow", policy.allow), ("deny", policy.deny)):
+        for pattern in catalog.unmatched_patterns(patterns):
+            _log(
+                f"warning: tools.{field_name} glob {pattern!r} matches no tool of this server "
+                f"(tools: {', '.join(catalog.tool_names()) or '(none)'})"
+            )
+    allowed = catalog.filtered(policy.allow, policy.deny)
+    if not allowed.tools:
+        _log(
+            f"warning: tools.allow/deny leave no tool for {scenario.name!r}; the agent will have "
+            "nothing to call"
+        )
+    return allowed
+
+
 async def _plan(scenario: Scenario, catalog: Catalog, *, dry_run: bool) -> ExecutionPlan:
     llm = None if dry_run else make_llm_for(scenario, "planner")
     return await plan_paths(scenario, catalog, llm, dry_run=dry_run)
@@ -366,7 +388,7 @@ async def _run_scenario_async(
                 "(allowed by models.allow_same_judge)"
             )
 
-    catalog = await discover_catalog(scenario)
+    catalog = allowed_catalog(scenario, await discover_catalog(scenario))
     if plan_path is not None:
         plan = ExecutionPlan.load(FsPath(plan_path))
         if plan.scenario != scenario.name:
@@ -376,8 +398,9 @@ async def _run_scenario_async(
             )
         if plan.catalog_digest != catalog.digest():
             _log(
-                f"warning: the server's catalog changed since plan {plan_path} was made "
-                "(digest differs); review the plan"
+                f"warning: the allowed catalog changed since plan {plan_path} was made "
+                "(digest differs: the server's tools or the scenario's tools policy); "
+                "review the plan"
             )
     else:
         plan = await _plan(scenario, catalog, dry_run=dry_run)
@@ -431,7 +454,7 @@ def plan_scenario(
     run_setup(scenario)
 
     async def body() -> ExecutionPlan:
-        catalog = await discover_catalog(scenario)
+        catalog = allowed_catalog(scenario, await discover_catalog(scenario))
         return await _plan(scenario, catalog, dry_run=dry_run)
 
     plan = asyncio.run(body())
