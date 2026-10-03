@@ -20,6 +20,13 @@ sees no conversation); their effects grow or shrink the disclosed set, enable go
 flags. Tools an effect enabled get one pass of steps 2–3 (no unbounded loops). The result is
 saved as ``scout.json`` beside ``plan.json`` and is what the orchestrating planner reads instead
 of raw tool output.
+
+**Probes.** The local planner (:mod:`mcpsim.execution_planner`) grounds its variant paths in
+what the server actually does with a mutated input: :func:`probe` makes that call on the same
+read-only session, counts it against the same budget (the runner has the scout leave
+``reserve`` calls unspent for it) and records it as an observation with ``probe: true``. A probe
+of a write tool or of one whose description claims a cost is refused (:func:`probe_refusal`)
+before anything reaches the server.
 """
 
 from __future__ import annotations
@@ -50,6 +57,8 @@ from mcpsim.transcript import (
 
 SCOUT_FILE = "scout.json"
 MIN_SCOUT_CALLS = 2
+# Calls of the scout budget a local planner keeps for its variant probe (one per plan).
+PROBE_RESERVE = 1
 SUMMARY_LIMIT = 600
 RESOURCE_BODY_LIMIT = 50_000
 _KEYS_SHOWN = 12
@@ -78,6 +87,8 @@ class Observation(BaseModel):
     chars: int = 0
     mime_type: str | None = None
     from_expected: list[str] = Field(default_factory=list)
+    # A planner probe (a mutated input sent on purpose, see :func:`probe`), not a scout call.
+    probe: bool = False
 
     def call_label(self) -> str:
         """``find_product(query="penne")`` or the resource URI."""
@@ -218,6 +229,82 @@ def is_zero_argument(tool: ToolInfo) -> bool:
     return not (isinstance(required, list) and required)
 
 
+def is_read_only(tool: ToolInfo) -> bool:
+    """The server's ``readOnlyHint`` when it sent one, else not a write tool by name.
+
+    A tool whose hint says read-only is still refused when its name or ``destructiveHint`` says
+    it writes (:func:`mcpsim.scoping.is_write_tool`): either signal is enough to stay away.
+    """
+    annotations = tool.annotations or {}
+    hint = annotations.get("read_only_hint", annotations.get("readOnlyHint"))
+    if hint is not None and hint is not True:
+        return False
+    return not is_write_tool(tool)
+
+
+def probe_refusal(tool: ToolInfo) -> str | None:
+    """Why ``tool`` must not be probed with a mutated input, or ``None`` when it may be."""
+    if not is_read_only(tool):
+        return "it is not read-only (a write tool)"
+    if is_expensive(tool):
+        return "its description says it costs money, credits or time"
+    return None
+
+
+async def observe_call(
+    session: Session, tool: ToolInfo, arguments: dict[str, Any], from_expected: list[str]
+) -> Observation:
+    """Call ``tool`` once and describe the result as an :class:`Observation`."""
+    result = await session.call_tool(tool.name, arguments)
+    if result.structured is not None:
+        summary = summarise_json(result.structured)
+    else:
+        summary = _clip(result.text, SUMMARY_LIMIT) or (
+            "(error, no message)" if result.is_error else "(empty)"
+        )
+    return Observation(
+        kind="tool",
+        name=tool.name,
+        arguments=dict(arguments),
+        is_error=result.is_error,
+        summary=summary,
+        structured_keys=structured_keys(result.structured),
+        structured=result.structured,
+        ms=result.ms,
+        chars=result.chars,
+        from_expected=list(from_expected),
+    )
+
+
+async def probe(
+    result: ScoutResult,
+    session: Session,
+    tool: ToolInfo,
+    arguments: dict[str, Any],
+    *,
+    why: str,
+) -> Observation | None:
+    """One planner probe on the scout's session: ``None`` when the scout budget is spent.
+
+    Raises :class:`ValueError` for a tool :func:`probe_refusal` rejects, before anything is
+    sent: the planner never asks for one, so a request is a bug to surface, not to skip. The
+    call is counted in ``result.tool_calls``, appended to ``result.observations`` with
+    ``probe=True`` and noted (``why`` says what the probe is for).
+    """
+    refusal = probe_refusal(tool)
+    if refusal is not None:
+        raise ValueError(f"refusing to probe {tool.name}: {refusal}")
+    if result.tool_calls >= result.budget:
+        return None
+    observation = await observe_call(session, tool, arguments, [])
+    observation.probe = True
+    result.tool_calls += 1
+    result.observations.append(observation)
+    status = "error" if observation.is_error else "ok"
+    result.notes.append(f"probe: {observation.call_label()} → {status} ({why})")
+    return observation
+
+
 # --- the scout --------------------------------------------------------------------------------
 
 
@@ -229,13 +316,19 @@ class _Scouting:
         session: Session,
         observers: ObserverRunner | None,
         budget: int,
+        reserve: int = 0,
     ) -> None:
         self.scenario = scenario
         self.catalog = catalog
         self.session = session
         self.observers = observers
         self.budget = budget
+        self.reserve = max(0, min(reserve, budget))
         self.result = ScoutResult(disclosed=initial_disclosed(scenario, catalog), budget=budget)
+        if self.reserve:
+            self.result.notes.append(
+                f"{self.reserve} of {budget} tool call(s) left for the planner's probes"
+            )
         self.called: set[str] = set()
 
     @property
@@ -243,7 +336,7 @@ class _Scouting:
         return self.result.observations
 
     def remaining(self) -> int:
-        return self.budget - self.result.tool_calls
+        return self.budget - self.reserve - self.result.tool_calls
 
     async def read_resources(self) -> None:
         seen: set[str] = set()
@@ -281,29 +374,10 @@ class _Scouting:
     async def call(
         self, tool: ToolInfo, arguments: dict[str, Any], from_expected: list[str]
     ) -> None:
-        result = await self.session.call_tool(tool.name, arguments)
+        observation = await observe_call(self.session, tool, arguments, from_expected)
         self.result.tool_calls += 1
         self.called.add(tool.name)
-        if result.structured is not None:
-            summary = summarise_json(result.structured)
-        else:
-            summary = _clip(result.text, SUMMARY_LIMIT) or (
-                "(error, no message)" if result.is_error else "(empty)"
-            )
-        self.observations.append(
-            Observation(
-                kind="tool",
-                name=tool.name,
-                arguments=dict(arguments),
-                is_error=result.is_error,
-                summary=summary,
-                structured_keys=structured_keys(result.structured),
-                structured=result.structured,
-                ms=result.ms,
-                chars=result.chars,
-                from_expected=list(from_expected),
-            )
-        )
+        self.observations.append(observation)
 
     def _readable(self, names: list[str]) -> list[ToolInfo]:
         """The disclosed tools the scout may call: never a write tool, never one whose
@@ -402,14 +476,21 @@ async def scout(
     *,
     observers: ObserverRunner | None = None,
     budget: int | None = None,
+    reserve: int = 0,
 ) -> ScoutResult:
     """Observe the server read-only, let the observers report, return the :class:`ScoutResult`.
 
     ``catalog`` is the *allowed* catalog. ``observers`` is the scenario's runner (``None`` runs
     no observer at all; the dry run passes one with ``include_llm=False``). ``budget`` overrides
-    :func:`scout_budget`.
+    :func:`scout_budget`. ``reserve`` tool calls of the budget are left unspent for the planner's
+    :func:`probe` calls (the runner reserves :data:`PROBE_RESERVE` for a local planner).
     """
     scouting = _Scouting(
-        scenario, catalog, session, observers, scout_budget(scenario) if budget is None else budget
+        scenario,
+        catalog,
+        session,
+        observers,
+        scout_budget(scenario) if budget is None else budget,
+        reserve,
     )
     return await scouting.run()

@@ -16,7 +16,9 @@ HTTP shares the URL). A stdio ``setup`` command runs once per ``run_scenario`` (
 Before planning, whenever the scenario's disclosure is not ``all``, the :mod:`mcpsim.scout`
 observes the server read-only on the same session that discovered the catalog, the observers
 report at the ``scout`` trigger, and the result is saved as ``scout.json`` beside ``plan.json``
-(``--plan`` reuse skips the scout; the runs' observers still fire).
+(``--plan`` reuse skips the scout; the runs' observers still fire). Planning happens on that
+session too, so a local planner's probe (:mod:`mcpsim.execution_planner`) is recorded in the
+same ``scout.json``.
 
 Dry run (``dry_run=True``): :func:`mcpsim.planner.plan` with ``dry_run=True``,
 :func:`mcpsim.agent.run_path` with ``dry_run=True`` and the matcher-only
@@ -58,6 +60,7 @@ from mcpsim.mcpclient import Catalog, Session, connect
 from mcpsim.observers import ObserverRunner
 from mcpsim.plan import MODES, ExecutionPlan, Mode, Path
 from mcpsim.planner import plan as plan_paths
+from mcpsim.planner import planner_profile
 from mcpsim.report import (
     Report,
     SuiteReport,
@@ -69,7 +72,7 @@ from mcpsim.report import (
 )
 from mcpsim.report import exit_code as report_exit_code
 from mcpsim.scenario import MODEL_ROLES, Models, Observer, Scenario, load_scenario
-from mcpsim.scout import SCOUT_FILE, ScoutResult, scout, should_scout
+from mcpsim.scout import PROBE_RESERVE, SCOUT_FILE, ScoutResult, scout, should_scout
 from mcpsim.transcript import EndEvent, SystemEvent, Transcript
 from mcpsim.verdict import Verdict
 
@@ -252,24 +255,43 @@ def scout_observers(scenario: Scenario, *, dry_run: bool) -> ObserverRunner | No
     return ObserverRunner(scenario, make_llm_for(scenario, "observer") if needs_llm else None)
 
 
-async def discover_and_scout(
+async def discover_scout_and_plan(
     scenario: Scenario, *, dry_run: bool
-) -> tuple[Catalog, ScoutResult | None]:
+) -> tuple[Catalog, ScoutResult | None, ExecutionPlan]:
     """One session: discover the catalog, apply the tool policy, scout (unless disclosure is
-    ``all``), and say what was disclosed."""
+    ``all``), and plan while the session is still open, so a local planner can probe one
+    mutated read-only call on it (counted against the scout's budget, of which the scout leaves
+    :data:`~mcpsim.scout.PROBE_RESERVE` call(s) unspent for it)."""
+    llm = None if dry_run else make_llm_for(scenario, "planner")  # a missing key fails first
+    plan: ExecutionPlan | None = None
+    failure: Exception | None = None
     async with connect(scenario.server) as session:
         catalog = allowed_catalog(scenario, await session.catalog())
-        if not should_scout(scenario):
-            return catalog, None
-        result = await _scout(scenario, catalog, session, dry_run=dry_run)
-    return catalog, result
+        scout_result = None
+        if should_scout(scenario):
+            scout_result = await _scout(scenario, catalog, session, dry_run=dry_run)
+        try:
+            plan = await _plan(scenario, catalog, llm, scout_result=scout_result, session=session)
+        except Exception as exc:  # noqa: BLE001 - re-raised below, outside the session
+            # Raised inside the session, it would leave the stdio client's task group as an
+            # ExceptionGroup; callers (and the CLI's messages) expect the PlanError itself.
+            failure = exc
+    if failure is not None:
+        raise failure
+    assert plan is not None
+    return catalog, scout_result, plan
 
 
 async def _scout(
     scenario: Scenario, catalog: Catalog, session: Session, *, dry_run: bool
 ) -> ScoutResult:
+    probes = not dry_run and planner_profile(scenario) == "local"
     result = await scout(
-        scenario, catalog, session, observers=scout_observers(scenario, dry_run=dry_run)
+        scenario,
+        catalog,
+        session,
+        observers=scout_observers(scenario, dry_run=dry_run),
+        reserve=PROBE_RESERVE if probes else 0,
     )
     _log(
         f"{scenario.name}: scouted {len(result.observations)} observation(s) "
@@ -322,12 +344,15 @@ def allowed_catalog(scenario: Scenario, catalog: Catalog) -> Catalog:
 async def _plan(
     scenario: Scenario,
     catalog: Catalog,
+    llm: LLM | None,
     *,
-    dry_run: bool,
     scout_result: ScoutResult | None = None,
+    session: Session | None = None,
 ) -> ExecutionPlan:
-    llm = None if dry_run else make_llm_for(scenario, "planner")
-    plan = await plan_paths(scenario, catalog, llm, scout=scout_result, dry_run=dry_run)
+    """``llm`` is ``None`` exactly in a dry run."""
+    plan = await plan_paths(
+        scenario, catalog, llm, scout=scout_result, dry_run=llm is None, probe_session=session
+    )
     for note in plan.notes:
         _log(f"{scenario.name}: {note}")
     return plan
@@ -503,8 +528,7 @@ async def _run_scenario_async(
                 "review the plan"
             )
     else:
-        catalog, scout_result = await discover_and_scout(scenario, dry_run=dry_run)
-        plan = await _plan(scenario, catalog, dry_run=dry_run, scout_result=scout_result)
+        catalog, scout_result, plan = await discover_scout_and_plan(scenario, dry_run=dry_run)
         if scout_result is not None:
             scout_result.save(run_dir / SCOUT_FILE)
     plan.save(run_dir / PLAN_FILE)
@@ -567,8 +591,7 @@ def plan_scenario(
     run_setup(scenario)
 
     async def body() -> tuple[ExecutionPlan, ScoutResult | None]:
-        catalog, scout_result = await discover_and_scout(scenario, dry_run=dry_run)
-        plan = await _plan(scenario, catalog, dry_run=dry_run, scout_result=scout_result)
+        _, scout_result, plan = await discover_scout_and_plan(scenario, dry_run=dry_run)
         return plan, scout_result
 
     plan, scout_result = asyncio.run(body())

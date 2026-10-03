@@ -430,10 +430,14 @@ machine against the real pantry server (DEMO_MODE, seeded SQLite), described in
   `tools_offered(reason="observer:shelf_clerk.direct_match")` and a `goal_enabled`, and whose
   `final_result` is now `find_product`'s result (the covering one, not the last), a
   deterministic verdict and the report;
-* `local-plan/` — a plan written by the local Cohere model (`ollama:command-r7b`, 24 minutes on
-  a loaded CPU): two paths, every tool real, arguments schema-checked by the hardened validator;
-* `local-run/` — one guided run of that plan with `command-r7b` as the agent. It made **no tool
-  call** and wrote a plausible, entirely fabricated answer (product ids 12345 and 67890, a
+* `local-plan/` — a plan from the local profile (`ollama:command-r7b`, 513 s on a CPU held at
+  24–80 % of its clock): the model planned `find_product(query="penne")` and where each answer
+  field comes from; the framework built a happy path with fourteen checkpoints, a boundary path
+  from a live probe of `find_product(query="pene")` (the server answered `match: none`, no
+  items; recorded in `scout.json`), and a policy path for `plan_recipe`, the tool instruction 1
+  forbids;
+* `local-run/` — one guided run of the earlier local plan (a copy is in `local-run/plan.json`)
+  with `command-r7b` as the agent. It made **no tool call** and wrote a plausible, entirely fabricated answer (product ids 12345 and 67890, a
   "Health Food Store" that does not exist). That is precisely the failure the framework exists
   to catch: the deterministic matcher fails it (`match` is `relaxed`, not `direct`; the
   top-level `product_id`/`store`/`price` are missing) regardless of what any judge model says.
@@ -499,7 +503,16 @@ mcpsim run  scenarios/pantry/cheapest-penne.yaml \
 ```
 
 A 404 from Ollama names the `ollama pull <model>` to run; the report's cost line says the local
-calls cost 0. How the protocol maps onto `/api/chat`, how an 8k context is respected, what to
+calls cost 0.
+
+An `ollama:` planner gets a smaller job than a hosted one. Asked for whole test paths, a 7–8B
+model wrote plans that validate and test almost nothing; asked to plan the tool execution for
+the user's request, it gets the main call right. So the local model writes only the steps and,
+for each expected-outcome field, which step's result it comes from; the framework builds the
+happy path and its checkpoints from that, grounds one recovery or boundary path in a live probe
+of a mutated read-only call on the scout's session (never a write or costly tool), and adds a
+policy path for each tool an instruction forbids (one tiny constrained question per
+instruction). Details and measurements: docs/LOCAL_MODELS.md, "The execution planner". How the protocol maps onto `/api/chat`, how an 8k context is respected, what to
 expect from a 7–8B model and the smoke sequence are in
 [docs/LOCAL_MODELS.md](docs/LOCAL_MODELS.md).
 

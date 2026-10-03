@@ -92,10 +92,11 @@ too; the local model is simply where their absence shows first.
 
 ## What to expect from a 7–8B model
 
-* **Planner.** Produces usable happy paths and recovery paths; weaker at inventing boundary and
-  policy paths. Plans are validated against the catalog and re-asked once on an unknown tool;
-  with structured decoding the schema is always satisfied, so the failure mode is a thin plan,
-  not a broken one. Review `plan.json` before a long run.
+* **Planner.** Asked for whole test paths, it writes plans that validate and test almost
+  nothing (see "Speed"); asked to plan the tool execution for the user's request, it gets the
+  main call right and most of the lineage, and the validator catches the rest. So an `ollama:`
+  planner only plans the execution and the framework builds the paths, the checkpoints and the
+  variants (see "The execution planner"). Review `plan.json` before a long run.
 * **Agent under test.** Handles 2–4 tool-call paths reliably when `guided`; `free` mode is where
   it shows its limits, which is exactly what the simulation is for. Treat a `free`-mode failure
   on a local model as a hint about tool descriptions, not as a verdict on the server.
@@ -130,59 +131,36 @@ ruled out: the JSON-schema grammar (4.07 tok/s with the plan grammar, 4.17 witho
 not add the schema to the prompt) and the thread count (12 threads: 8.8 tok/s against 16.7 for
 Ollama's default of 6).
 
-**The local planner profile.** A planner addressed as `ollama:` gets a profile built for those
-numbers:
-
-* *A compact prompt* (`LOCAL_PROMPT_BUDGET`, 4,000 characters): the same rules said once and
-  briefly; tools only (a step cannot name a resource or a prompt); descriptions cut to 90
-  characters and output keys to six; short section headers; an example step drawn from the
-  disclosed tools. The cheapest-penne prompt went from 11,702 characters to 4,750 (3,385 tokens
-  to 1,616).
-* *One path per call.* Call 1 asks for the happy path. Each later call continues the same
-  conversation (the accepted answer replayed as the compact JSON the model wrote, then "one
-  more path, of a kind not used yet"), so the server restores its cached prompt and evaluates
-  only the new turn. A rejected path gets the usual re-ask; one that fails twice is dropped and
-  its kind is not asked for again (at temperature 0 the same request fails the same way). The
-  happy path is mandatory. `MCPSIM_LOCAL_PLAN_PATHS` (default 3) sets how many paths; a plan
-  never makes more than two calls per path. `plan.json` `notes` record every call's tokens and
-  seconds.
-* *A grammar that bounds the output.* One path per call, at most six steps and three
-  checkpoints, capped string lengths, and every checkpoint matched against a regex of the
-  allowed shapes with the catalog's real tool names. Told the shape in prose, `command-r7b`
-  wrote `find_product: match == 'direct'`; with the pattern it writes
-  `tool_result[find_product]: match equals direct`. llama.cpp converts a pattern only when one
-  `^…$` wraps the whole expression; an anchor inside an alternation is logged as unsupported
-  and the string goes unconstrained, which a test guards against.
+**The first local profile (retired).** On 2026-10-02 a planner addressed as `ollama:` got a
+profile built for those numbers: a compact prompt (`LOCAL_PROMPT_BUDGET`, 4,000 characters:
+the rules said once, tools only, descriptions cut to 90 characters and output keys to six; the
+cheapest-penne prompt went from 11,702 characters to 4,750, 3,385 tokens to 1,616), one path per
+call in one continuing conversation (the accepted answer replayed as the compact JSON the model
+wrote, so the server evaluated only the new turn), and a grammar that capped strings and lists
+and matched every checkpoint against a single-anchored regex of the allowed shapes.
 
 | cheapest-penne plan | prompt tokens | output tokens | wall |
 | --- | --- | --- | --- |
 | before, under memory pressure (browser open) | 3,385 | 226 | 27 min, invalid |
 | before, no pressure | 3,385 | 236 | 4.5 min per call, invalid |
-| local profile, call 1 (happy) | 1,616 | 248 | 290 s |
-| local profile, call 2 (next path, cached prompt) | 1,845 | 181 | 107 s |
-| local profile, call 3 (rejected: `list_products` takes `search`, not `query`) | 2,088 | 171 | 228 s |
-| local profile, call 4 (the re-ask, accepted) | 2,377 | 171 | 218 s |
+| one path per call, call 1 (happy) | 1,616 | 248 | 290 s |
+| one path per call, call 2 (next path, cached prompt) | 1,845 | 181 | 107 s |
+| one path per call, call 3 (rejected: `list_products` takes `search`, not `query`) | 2,088 | 171 | 228 s |
+| one path per call, call 4 (the re-ask, accepted) | 2,377 | 171 | 218 s |
 
-The local-profile rows ran with the CPU held at 22–33 % of its clock (see below): prompt 5.6–6.6
-tok/s, output 0.9–2.4. No call came near the deadline. At the unthrottled rates the same calls
-take about 2.4 minutes (call 1, whose answer the model pretty-prints; later calls copy the
-compact JSON in the conversation and write a third fewer tokens) and one minute (each later
-call). A second run, after the recovery rule below, took 134 s, 163 s, 140 s and 129 s.
+Those rows ran with the CPU held at 22–33 % of its clock (see below): prompt 5.6–6.6 tok/s,
+output 0.9–2.4. No call came near the deadline. At the unthrottled rates the same calls take
+about 2.4 minutes (call 1, whose answer the model pretty-prints; later calls copy the compact
+JSON in the conversation and write a third fewer tokens) and one minute (each later call). A
+second run took 134 s, 163 s, 140 s and 129 s.
 
-**Speed is fixed; plan quality is not.** Both runs produced plans that validate and test almost
-nothing. In the first, the "recovery" path sent good input marked `expect_error` and had no
-corrected call (the validator now requires the failure, a later tool step that expects success,
-and different input between the two). In the second, told so, the model changed the kind
-instead of the path: all three paths call `find_product(query="penne")` and expect,
-respectively, a direct match, a relaxed match and zero results; only the first is what the
-server returns. The happy path's single checkpoint (`match equals direct`) never mentions the
-price, store or origin status the goal asks for. The grammar guarantees the shape, not the
-reasoning, and designing distinct test cases is reasoning a 7–8B model on a compact prompt does
-poorly. Neither plan is committed as an example; `examples/cheapest-penne/local-plan` is still
-the earlier two-path plan. The likely remedy is a smaller job for the local model: checkpoints
-derived from `expected_outcome.json`, the happy path from the scout's proven calls, a fixed shape
-per path kind, and short constrained questions to the model ("a bad value for `product_id`",
-"the instruction most tempting to break") instead of whole paths.
+Speed was fixed; plan quality was not, which is why that profile was replaced by the execution
+planner below. Both runs produced plans that validate and test almost nothing: a "recovery" path
+that sent good input marked `expect_error` with no corrected call; then, told so, three paths
+that all call `find_product(query="penne")` and expect a direct match, a relaxed match and zero
+results (only the first is what the server returns); and a happy path whose single checkpoint
+(`match equals direct`) never mentions the price, store or origin status the goal asks for. The
+grammar guarantees the shape, not the reasoning.
 
 **What the machine does to it.** Two things outside the framework dominated:
 
@@ -199,6 +177,140 @@ per path kind, and short constrained questions to the model ("a bad value for `p
 
 Check both before a long local run: `pmset -g therm` (`CPU_Speed_Limit` should be 100),
 `memory_pressure | tail -1`, and `ollama ps` (100 % CPU, the model loaded).
+
+## The execution planner
+
+A planner addressed as `ollama:` gets a smaller job than a hosted one
+(`mcpsim/execution_planner.py`). Asked to write whole test paths, `command-r7b` on a compact
+prompt wrote plans that validate and test almost nothing (see "Speed"). An A/B on 2026-10-02
+with the user's own framing, "plan the tool execution for the user's request", got the main
+call right for both pantry scenarios it was tried on (`find_product(query="penne")`;
+`plan_recipe(slug="tomato_penne", exclude_origin=[…])`), though it still traced `store` to
+`items[0].brand` and added a redundant step with a placeholder id. So the model plans the
+execution and the framework builds the tests.
+
+**1. The execution plan (the model).** One constrained call, in the user's framing:
+
+```
+system: You are an expert JSON config generator. Generate a JSON config of the format:
+        {"steps":[{"tool":"<tool name>","arguments":{"<argument>":<value>},"why":"<one sentence>",
+        "expect":"<what the result will show>"}],"answer_fields":{"<field the answer must contain>":
+        "step <n>: <path in the result of step n, e.g. items[0].price>"}}
+
+        that represents the plan of tool execution, using only these tools:
+        - find_product(lat?: number, limit?: integer, lon?: number, query: string) → returns …
+user:   The user's request: <goal>
+
+        Rules the plan must follow:
+        - <one line per instruction, and per goal an observer enabled>
+```
+
+The informant reports and the scout's tool observations (as result *shapes*:
+`find_product(query="penne") → {query="penne", tokens[1], match="direct", total=2,
+items[2]{id, name, brand, …, store, price, …}, note}`) are added line by line while the prompt
+stays within `LOCAL_PROMPT_BUDGET` (4,000 characters); resource reads are left out, since a step
+can only call a tool. The grammar: 1 to `min(6, max_tool_calls)` steps, `tool` an enum of the
+disclosed tools (plus `discover_tools` when offered), `why` ≤ 120 and `expect` ≤ 160
+characters, and `answer_fields` with exactly the keys of `expected_outcome.json`, each matching
+`^step [1-6]: [A-Za-z0-9_.*\[\]]{1,80}$` (one pair of anchors around the whole pattern, which
+llama.cpp needs; a test guards it).
+
+The answer is reviewed, and sent back once with every problem listed:
+
+* arguments are checked like any plan step (keys, scalar types, enums against the tool's input
+  schema, so `product_ids: ["your_product_id_here"]` is rejected with the hint to write a
+  `$from_step` reference);
+* a lineage must name a step that exists and calls a tool, and a path the tool's output schema
+  declares (walking `$ref`, optionals and lists);
+* when the scout made the same call (arguments equal once schema defaults are filled in), the
+  path must exist in the observed result and its value must satisfy the field's own
+  `expected_outcome.json` spec, with the matcher's operators (`query ← items[0].name` gives
+  "Penne Rigate 500g", which fails `equals penne`);
+* a lineage that reads a key of another name, or goes through a property the schema marks
+  optional, is sent back when the result holds the field under its own name;
+* every lineage problem carries that path when there is one: searched in the lineage's own
+  subtree, then in each enclosing object up to the root, an always-present path (required, not
+  nullable) before one that may be absent, then the fewest extra list steps. `store ←
+  items[0].brand` → `items[0].store`; `query ← items[0].name` → `query`; `total_cost ← full` →
+  `summary.total_cost` (`full` is null unless `verbose=True`); `origin_status ← coverage_note`
+  (no such key) → `summary.origin_status`.
+
+A step no answer field and no later step uses, and a step that repeats an earlier call, are
+dropped without a re-ask. If the re-asked answer still has problems, a field with a same-name
+key takes it, other bad fields lose their lineage checkpoint (the expected-outcome checkpoint
+stays), invalid steps are dropped with whatever depends on them, and only a plan with no tool
+step left is a `PlanError`. Every repair and drop is in the plan's `notes`.
+
+**2. The happy path (the framework)** is the steps plus a final answer step. Its checkpoints are
+derived, not written: `final_result: <key> equals tool_result[<tool>] <path>` per answer field
+and `final_result: <key> <spec in words>` per `expected_outcome.json` entry (`is greater than
+0`, `is one of unknown, verified`, `matches the pattern (?i)penne`).
+
+**3. One grounded variant (the framework and the server).** The first happy step whose tool is
+read-only (`readOnlyHint`, else not a write tool by name) and free (`is_expensive`), with a
+string or integer argument and no `$from_step` reference, is sent once more on the scout's still
+open session with that argument mutated: a string loses its middle interior character
+(`penne` → `pene`), an integer becomes 999999; an `enum` argument is never mutated. The probe
+counts against the scout budget (the scout leaves one call of it unspent for a local planner)
+and is recorded in `scout.json` with `probe: true`. If the server rejects it, the plan gets a
+**recovery** path: the mutated call with `expect_error` and the server's real error text, then
+the original call, then the answer. If it answers, a **boundary** path: the mutated call, the
+original call, the answer, with checkpoints stating what the server really returned (only what
+differs from the scout's result for the original call: `tool_result[find_product]: match
+equals none when query is pene`) and that the answer does not come from it. A write tool or one
+whose description claims a cost is never probed; `scout.probe` refuses one before anything is
+sent. A probe the server cannot answer (an HTTP session dropped while the model was thinking)
+costs the variant, not the plan.
+
+**4. Policy paths (the model, one word at a time).** For up to three instructions with a
+prohibition cue (`do not`, `never`, `avoid`, `only`, …), one tiny call: "Rule: <instruction>.
+Which of these tools does this rule forbid calling?", constrained to an enum of the allowed
+tools plus `none`, about 15 output tokens. A named tool becomes a policy path (the happy steps,
+an answer step naming the rule, `transcript: no call to <tool>`) unless the happy path calls it
+or no prohibiting clause of the instruction names it (`planning` names `plan_recipe`; `never
+round a price or guess a store` names no tool, whatever the model answered). No two paths have
+identical steps.
+
+**Live results** (2026-10-03, `command-r7b` on Ollama 0.34.4, the pantry server over stdio in
+`DEMO_MODE` from the pantry-api working tree, `mcpsim plan scenarios/pantry/<name>.yaml`):
+
+| call | cheapest-penne | tomato-penne-boycott |
+| --- | --- | --- |
+| scout | 4 of 5 calls (1 kept for the probe) | 2 of 10 calls |
+| execution plan, call 1 | 1,243 prompt + 134 output tokens, 205 s; 7 problems: lineage into `items[2]` of a two-item result | 1,217 + 235, 236 s; 8 problems: `items[0].…`, `coverage_note`, `coverage.…` in a result whose keys are `summary` and `full` |
+| execution plan, call 2 (the re-ask) | 2,127 + 126, 174 s, accepted | 1,989 + 182, 201 s, accepted |
+| probe | `find_product(query="pene")`: `match: none`, 0 items, 13 ms → boundary path | none: `plan_recipe` claims a cost |
+| policy questions | 3 × 543–557 + 13–16 tokens, 41–43 s each | 3 × 538–560 + 16 tokens, 42–47 s each |
+| wall, scout and plan | 513 s | 590 s |
+
+`CPU_Speed_Limit` was 80 when cheapest-penne started and 24 for the rest (prompt 7–10 tok/s,
+output 1.4–1.7); no call came near the deadline. The first attempt that day did: with other
+work holding the load average at 93, prompt evaluation fell to 1.7 tok/s and the deadline
+cancelled the call at 600 s, as designed.
+
+*cheapest-penne* (committed as `examples/cheapest-penne/local-plan/`): the happy path is
+`find_product(query="penne")` and an answer step, with all seven lineage checkpoints right
+(`store ← items[0].store`, `query ← query`, …) plus the seven expected-outcome ones. The model
+wrote that lineage itself on the re-ask, which carried the paths the observed result holds; in
+two earlier runs, before the value check and the search above existed, its re-asked answer
+kept `query ← items[0].name` and `match ← items[0].store`, which exist in the result but are
+wrong. The boundary path sends `pene`, states what the server really returned (`match equals
+none`, `items has 0 entries`) and requires the answer to come from the `penne` call. The
+policy path forbids `plan_recipe` (instruction 1, "do not run a planning tool"); the model
+also named `get_product_origins` for "never round a price or guess a store" and `find_product`
+for instruction 3, and both were dropped. Three paths, each testing something the others do
+not, every checkpoint tied to the goal. The policy path is the weakest: guided runs follow the
+same steps, and `plan_recipe` is only on request, so the real temptation is the happy path's
+free-mode run.
+
+*tomato-penne-boycott*: the happy path is `plan_recipe(slug="tomato_penne",
+exclude_origin=["US"])` (`us` is one of the server's aliases for United States) with all eight
+lineage checkpoints under `summary.…`, accepted on the re-ask. There is no recovery or boundary
+path: the only step calls a tool that claims a cost, which is never probed. The policy path
+forbids `get_product_origins` for "do not price the basket yourself from product lookups"; it
+passes the clause check through the word "product", but the direct temptation is `find_product`
+or `get_product`, and the model answered `get_product_origins` for all three questions. Read it
+as a weak path.
 
 ## Observers on local models
 
