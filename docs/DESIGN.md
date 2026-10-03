@@ -243,9 +243,10 @@ observers:
   on-request tool is re-asked once unless a `discover_tools` step precedes it or an observer
   that watches tool traffic at `tool_result`/`turn` can enable it. Checkpoints may read
   `report: <observer>.<condition> is true|false`. The prompt stays under
-  `MCPSIM_PLANNER_PROMPT_BUDGET` characters (default 12,000): observations are trimmed first,
-  the on-request list second, never the digest or the reports. `scout.json` records it all,
-  with `planner_prompt_chars`.
+  `MCPSIM_PLANNER_PROMPT_BUDGET` characters (default 12,000; 4,000 for an `ollama:` planner,
+  which takes the local profile of LOCAL_MODELS.md "Speed": a compact prompt and one path per
+  call): observations are trimmed first, the on-request list second, never the digest or the
+  reports. `scout.json` records it all, with `planner_prompt_chars`.
 * **Judge as aggregator.** See §2 "Judge": the reports and flags are in the prompt, the
   subject's statements are never evidence, `fail` effects are a deterministic layer after the
   matcher and the scope check.

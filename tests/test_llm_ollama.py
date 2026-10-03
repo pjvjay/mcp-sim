@@ -6,7 +6,9 @@ docs/LOCAL_MODELS.md table; no network, no model.
 
 from __future__ import annotations
 
+import asyncio
 import json
+import time
 from collections.abc import Callable
 from typing import Any
 
@@ -16,16 +18,22 @@ import pytest
 from mcpsim.llm import (
     DEFAULT_OLLAMA_HOST,
     DEFAULT_OLLAMA_NUM_CTX,
+    MAX_OLLAMA_DEADLINE_S,
+    OLLAMA_DEADLINE_ENV,
     OLLAMA_HOST_ENV,
+    OLLAMA_KEEP_ALIVE_ENV,
     OLLAMA_NUM_CTX_ENV,
     LLMResponse,
     OllamaError,
     OllamaLLM,
     Usage,
     estimate_cost_usd,
+    forced_history_as_text,
     forced_tool,
     is_retryable_ollama,
+    ollama_deadline_s,
     ollama_host,
+    ollama_keep_alive,
     ollama_num_ctx,
     to_ollama_messages,
     to_ollama_tools,
@@ -138,6 +146,7 @@ async def test_tools_call_request_body() -> None:
             {"role": "user", "content": "Price of penne?"},
         ],
         "stream": False,
+        "keep_alive": "30m",
         "options": {"temperature": 0, "num_ctx": 8192, "num_predict": 512},
         "tools": [
             {
@@ -394,7 +403,8 @@ def test_is_retryable_ollama() -> None:
         )
         assert is_retryable_ollama(exc) is expected, status
     assert is_retryable_ollama(httpx.ConnectError("refused")) is True
-    assert is_retryable_ollama(httpx.ReadTimeout("slow")) is True
+    # A read timeout is the model being slow: retrying spends the deadline on the same prompt.
+    assert is_retryable_ollama(httpx.ReadTimeout("slow")) is False
     assert is_retryable_ollama(ValueError("x")) is False
 
 
@@ -417,3 +427,81 @@ def test_constructor_reads_env(monkeypatch: pytest.MonkeyPatch) -> None:
     assert (llm.host, llm.num_ctx) == ("http://box:11434", 4096)
     with pytest.raises(ValueError):
         OllamaLLM(HOST, max_attempts=0)
+
+
+# --- deadline and keep_alive (docs/LOCAL_MODELS.md "Speed") ------------------------------------
+
+
+def test_deadline_defaults_to_and_never_exceeds_ten_minutes() -> None:
+    assert MAX_OLLAMA_DEADLINE_S == 600.0
+    assert ollama_deadline_s({}) == 600.0
+    assert ollama_deadline_s({OLLAMA_DEADLINE_ENV: "120"}) == 120.0
+    assert ollama_deadline_s({OLLAMA_DEADLINE_ENV: "600"}) == 600.0
+    for bad in ("601", "3600", "0", "-5", "ten"):
+        with pytest.raises(ValueError, match=OLLAMA_DEADLINE_ENV):
+            ollama_deadline_s({OLLAMA_DEADLINE_ENV: bad})
+    with pytest.raises(ValueError, match="deadline"):
+        OllamaLLM(HOST, deadline=601)
+
+
+async def test_a_call_past_its_deadline_is_cancelled_with_a_clear_error() -> None:
+    async def slow(request: httpx.Request) -> httpx.Response:
+        await asyncio.sleep(30)
+        return httpx.Response(200, json=reply("late"))
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(slow))
+    llm = OllamaLLM(HOST, client=client, num_ctx=8192, deadline=0.2)
+    started = time.monotonic()
+    with pytest.raises(OllamaError, match=r"command-r7b did not answer within 0\.2 s"):
+        await llm.complete(model="ollama:command-r7b", system="s",
+                           messages=[{"role": "user", "content": "hi"}])
+    assert time.monotonic() - started < 5
+    assert llm.calls == 1 and llm.retries == 0
+
+
+async def test_a_read_timeout_is_the_deadline_and_is_not_retried() -> None:
+    llm, server, sleeps = make([httpx.ReadTimeout("slow model"), reply("never sent")])
+    with pytest.raises(OllamaError, match="did not answer within 600 s"):
+        await llm.complete(model="ollama:command-r7b", system="s", messages=[])
+    assert len(server.requests) == 1 and sleeps == []
+    assert not is_retryable_ollama(httpx.ReadTimeout("slow"))
+    assert is_retryable_ollama(httpx.ConnectError("down"))
+
+
+async def test_keep_alive_is_sent_and_configurable(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv(OLLAMA_KEEP_ALIVE_ENV, raising=False)
+    assert ollama_keep_alive() == "30m"
+    monkeypatch.setenv(OLLAMA_KEEP_ALIVE_ENV, "2h")
+    llm, server, _ = make([reply("ok")])
+    await llm.complete(model="ollama:command-r7b", system="s", messages=[])
+    assert server.body()["keep_alive"] == "2h"
+
+
+def test_forced_history_is_replayed_as_the_json_the_model_wrote() -> None:
+    """In a ``format`` conversation an earlier answer goes back as its compact JSON text, so
+    the next call extends what the server cached instead of a re-rendered tool call."""
+    payload = {"paths": [{"id": "1", "kind": "happy", "steps": []}]}
+    messages: list[dict[str, Any]] = [
+        {"role": "user", "content": "plan it"},
+        {"role": "assistant", "content": [
+            {"type": "tool_use", "id": "call_1", "name": "emit_plan", "input": payload}]},
+        {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "call_1", "content": "accepted"},
+            {"type": "text", "text": "Now one more path."}]},
+    ]
+    replayed = forced_history_as_text(messages, "emit_plan")
+    assert replayed[1]["content"] == [
+        {"type": "text", "text": '{"paths":[{"id":"1","kind":"happy","steps":[]}]}'}]
+    llm = OllamaLLM(HOST, num_ctx=8192)
+    body = llm.build_request(model="command-r7b", system="sys", messages=messages,
+                             tools=[PLAN_TOOL], tool_choice={"type": "tool", "name": "emit_plan"},
+                             max_tokens=100)
+    assert body["messages"][1:] == [
+        {"role": "user", "content": "plan it"},
+        {"role": "assistant", "content": '{"paths":[{"id":"1","kind":"happy","steps":[]}]}'},
+        {"role": "user", "content": "accepted\nNow one more path."},
+    ]
+    # An unforced conversation keeps real tool calls (the agent loop needs them).
+    body = llm.build_request(model="command-r7b", system="sys", messages=messages,
+                             tools=[PLAN_TOOL], tool_choice={"type": "auto"}, max_tokens=100)
+    assert body["messages"][2]["tool_calls"][0]["function"]["name"] == "emit_plan"

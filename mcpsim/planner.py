@@ -36,12 +36,13 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from mcpsim.llm import LLM, LLMResponse
+from mcpsim.llm import LLM, OLLAMA, LLMResponse, parse_model_spec
 from mcpsim.mcpclient import Catalog, ToolInfo
 from mcpsim.plan import (
     CHECKPOINT_PATTERN,
@@ -75,6 +76,51 @@ DRY_RUN_PATH_ID = "happy-dry-run"
 PROMPT_BUDGET_ENV = "MCPSIM_PLANNER_PROMPT_BUDGET"
 DEFAULT_PROMPT_BUDGET = 12_000
 OBSERVATION_LINE_LIMIT = 600
+
+# The local profile (docs/LOCAL_MODELS.md "Speed"): used when the planner is an ``ollama:`` model.
+# On a CPU a 7-8B model reads about 20 prompt tokens/s and writes about 3-4, so a two-minute
+# answer allows roughly 1,100 prompt tokens and 250 output tokens: a compact prompt of about
+# 4,000 characters and one path per call. Later calls continue the same conversation, so Ollama
+# evaluates only the new turn.
+LOCAL_PROMPT_BUDGET = 4_000
+LOCAL_PLAN_MAX_TOKENS = 1_200
+LOCAL_PATHS_ENV = "MCPSIM_LOCAL_PLAN_PATHS"
+DEFAULT_LOCAL_PATHS = 3
+LOCAL_DESCRIPTION_LIMIT = 90
+LOCAL_MAX_OUTPUT_KEYS = 6
+LOCAL_OBSERVATION_LINE_LIMIT = 200
+# Grammar caps on one local path. They are safety bounds well above the lengths the prompt asks
+# for, because a constrained decoder stopped at a cap can end a string mid-token; they bound the
+# worst-case output (and so the time) of a call, the prompt sets the typical one.
+LOCAL_MAX_STEPS = 6
+LOCAL_MAX_CHECKPOINTS = 3
+LOCAL_STRING_CAPS: dict[str, dict[str, int]] = {
+    "Path": {"id": 32, "title": 100, "rationale": 300},
+    "Step": {"intent": 160, "success_looks_like": 240},
+}
+LOCAL_CHECKPOINT_CAP = 200
+_REGEX_SPECIAL = set(".^$*+?()[]{}|\\")
+
+
+def checkpoint_grammar_pattern(tool_names: list[str], cap: int = LOCAL_CHECKPOINT_CAP) -> str:
+    """A JSON-schema ``pattern`` that only admits checkpoints :data:`CHECKPOINT_PATTERN` accepts.
+
+    command-r7b, told the shape in prose, wrote ``find_product: match == 'direct'``; in the
+    grammar the shape cannot be missed. ``<where>`` is ``final_result``, ``transcript`` or
+    ``tool_result[<one of tool_names>]``, then ``": "`` and a condition that starts with a
+    non-space and holds no quote, backslash or control character (the decoder writes the
+    string raw inside JSON); or ``report: <observer>.<condition> is true|false``.
+
+    llama.cpp converts only a pattern with ONE ``^…$`` around the whole expression: an anchor
+    inside an alternation (``^a$|^b$``) is logged as unsupported and the string goes
+    unconstrained, so the alternatives are grouped under a single pair of anchors.
+    """
+    names = "|".join("".join(f"\\{c}" if c in _REGEX_SPECIAL else c for c in n)
+                     for n in tool_names)
+    where = "final_result|transcript" + (f"|tool_result\\[({names})\\]" if names else "")
+    text = '[^ "\\\\\\n\\r\\t][^"\\\\\\n\\r\\t]'
+    report = "report: [a-z_][a-z0-9_]*\\.[a-z_][a-z0-9_]* is (true|false)"
+    return f"^(({where}): {text}{{1,{cap}}}|{report})$"
 # When no tool shares a word with the scenario, the dry run still calls this many (catalog
 # order) so the smoke proves the server answers.
 DRY_RUN_FALLBACK = 3
@@ -209,19 +255,56 @@ def strict_structured_schema(schema: Any) -> Any:
     model schema, emitted steps with no ``tool`` and no ``success_looks_like`` and named the
     tool only in prose. Requiring every key (nullable ones stay nullable) makes the decoder
     produce a ``tool`` slot on every step. Free-form objects (no ``properties``, e.g.
-    ``arguments_sketch``) are left open. Titles and defaults are dropped as decoding noise.
+    ``arguments_sketch``) are left open. The ``title`` and ``default`` *annotations* are dropped
+    as decoding noise; a property that happens to be called ``title`` (``Path.title``) is a
+    field, not an annotation, and is kept.
     """
     if isinstance(schema, list):
         return [strict_structured_schema(item) for item in schema]
     if not isinstance(schema, dict):
         return schema
-    out = {k: strict_structured_schema(v) for k, v in schema.items()
-           if k not in ("default", "title")}
+    out: dict[str, Any] = {}
+    for key, value in schema.items():
+        if key in ("default", "title"):
+            continue
+        if key in ("properties", "$defs") and isinstance(value, dict):
+            out[key] = {name: strict_structured_schema(sub) for name, sub in value.items()}
+        else:
+            out[key] = strict_structured_schema(value)
     props = out.get("properties")
     if isinstance(props, dict) and props:
         out["required"] = list(props)
         out["additionalProperties"] = False
     return out
+
+
+def local_plan_input_schema(
+    catalog: Catalog, view: PlannerView | None, kinds: list[str]
+) -> dict[str, Any]:
+    """:func:`plan_input_schema` for ONE local path of one of ``kinds``, with grammar caps.
+
+    ``paths`` holds exactly one item, ``Path.kind`` is the enum ``kinds`` (``["happy"]`` on the
+    first call, the kinds not used yet afterwards), strings and lists are capped
+    (``LOCAL_STRING_CAPS``, ``LOCAL_MAX_STEPS``, ``LOCAL_MAX_CHECKPOINTS``) so the worst-case
+    output of a call is bounded, and every checkpoint must match
+    :func:`checkpoint_grammar_pattern`. Ollama's grammar enforces ``maxLength``, ``maxItems``
+    and ``pattern``.
+    """
+    schema = plan_input_schema(catalog, view)
+    defs = schema["$defs"]
+    path_props = defs["Path"]["properties"]
+    path_props["kind"] = {"type": "string", "enum": list(kinds)}
+    for model, caps in LOCAL_STRING_CAPS.items():
+        for name, cap in caps.items():
+            defs[model]["properties"][name]["maxLength"] = cap
+    path_props["steps"]["maxItems"] = LOCAL_MAX_STEPS
+    path_props["checkpoints"]["maxItems"] = LOCAL_MAX_CHECKPOINTS
+    path_props["checkpoints"]["items"]["pattern"] = checkpoint_grammar_pattern(
+        sorted(catalog.tool_names())
+    )
+    schema["properties"]["paths"]["minItems"] = 1
+    schema["properties"]["paths"]["maxItems"] = 1
+    return schema
 
 
 def plan_tool_definition(catalog: Catalog, view: PlannerView | None = None) -> dict[str, Any]:
@@ -393,8 +476,8 @@ def render_arguments(tool: ToolInfo) -> str:
     return ", ".join(parts)
 
 
-def output_keys(schema: dict[str, Any]) -> str:
-    """What the digest says a tool returns: its top-level output keys.
+def output_keys(schema: dict[str, Any], *, max_keys: int = _MAX_OUTPUT_KEYS) -> str:
+    """What the digest says a tool returns: its top-level output keys (at most ``max_keys``).
 
     A one-level ``$ref`` is resolved. When the schema wraps a single ``result`` key (the MCP SDK
     does this for non-object return types) the inner object's keys are shown; an array of
@@ -407,24 +490,24 @@ def output_keys(schema: dict[str, Any]) -> str:
         inner = resolve_ref(inner_raw, schema) if isinstance(inner_raw, dict) else {}
         inner_props = inner.get("properties")
         if isinstance(inner_props, dict) and inner_props:
-            return _join_keys(list(inner_props))
+            return _join_keys(list(inner_props), max_keys)
         if "array" in schema_types(inner, schema):
             items = inner.get("items")
             item_schema = resolve_ref(items, schema) if isinstance(items, dict) else {}
             item_props = item_schema.get("properties")
             if isinstance(item_props, dict) and item_props:
-                return "list of {" + _join_keys(list(item_props)) + "}"
+                return "list of {" + _join_keys(list(item_props), max_keys) + "}"
             return "list"
         types = sorted(t for t in schema_types(inner, schema) if t != "null")
         return "result (" + "|".join(types) + ")" if types else "result"
     if isinstance(properties, dict) and properties:
-        return _join_keys(list(properties))
+        return _join_keys(list(properties), max_keys)
     types = sorted(t for t in schema_types(resolved, schema) if t != "null")
     return "|".join(types) if types else "object"
 
 
-def _join_keys(keys: list[str]) -> str:
-    shown = keys[:_MAX_OUTPUT_KEYS]
+def _join_keys(keys: list[str], max_keys: int = _MAX_OUTPUT_KEYS) -> str:
+    shown = keys[:max_keys]
     suffix = f", … ({len(keys) - len(shown)} more)" if len(keys) > len(shown) else ""
     return ", ".join(shown) + suffix
 
@@ -435,22 +518,37 @@ def first_sentence(text: str) -> str:
     return m.group(1) if m else flat
 
 
-def render_tool_line(tool: ToolInfo) -> str:
-    """One digest line: ``- name(arg: type, opt?: type) → returns k1, k2 — first sentence``."""
+def render_tool_line(
+    tool: ToolInfo,
+    *,
+    description_limit: int | None = None,
+    max_output_keys: int = _MAX_OUTPUT_KEYS,
+) -> str:
+    """One digest line: ``- name(arg: type, opt?: type) → returns k1, k2 — first sentence``.
+
+    ``description_limit`` cuts the sentence to that many characters and ``max_output_keys``
+    the returned keys (the local profile: some servers write a paragraph before the first full
+    stop, or return a record of seventeen fields).
+    """
     line = f"- {tool.name}({render_arguments(tool)})"
     if tool.output_schema is not None:
-        line += f" → returns {output_keys(tool.output_schema)}"
+        line += f" → returns {output_keys(tool.output_schema, max_keys=max_output_keys)}"
     sentence = first_sentence(tool.description)
+    if description_limit is not None and len(sentence) > description_limit:
+        sentence = sentence[: description_limit - 1].rstrip() + "…"
     if sentence:
         line += f" — {sentence}"
     return line
 
 
-def on_request_line(view: PlannerView, *, shown: int | None = None) -> str:
+def on_request_line(
+    view: PlannerView, *, shown: int | None = None, compact: bool = False
+) -> str:
     """The one line naming the tools the planner may not name directly.
 
     ``shown`` caps how many names appear (the prompt budget cuts this list second); the rest
-    become a count.
+    become a count. ``compact`` states the rule in a few words (the local prompt's rules say
+    the rest).
     """
     names = list(view.on_request)
     if not names:
@@ -461,6 +559,10 @@ def on_request_line(view: PlannerView, *, shown: int | None = None) -> str:
         listed = f"{listed}{rest}" if shown else rest
     else:
         listed = ", ".join(names)
+    if compact:
+        how = (f"only after a {DISCOVER_TOOL_NAME} step" if view.discoverable
+               else "only an observer effect can enable them")
+        return f"AVAILABLE ON REQUEST ({how}): {listed}"
     if view.discoverable:
         return (
             f"AVAILABLE ON REQUEST through {DISCOVER_TOOL_NAME} (name only; a step may use one "
@@ -474,7 +576,11 @@ def on_request_line(view: PlannerView, *, shown: int | None = None) -> str:
 
 
 def render_catalog_for_prompt(
-    catalog: Catalog, view: PlannerView | None = None, *, on_request_shown: int | None = None
+    catalog: Catalog,
+    view: PlannerView | None = None,
+    *,
+    on_request_shown: int | None = None,
+    compact: bool = False,
 ) -> str:
     """The catalog digest the planner sees (LOCAL_MODELS.md, "Fitting an 8k context").
 
@@ -482,23 +588,31 @@ def render_catalog_for_prompt(
     top-level output keys when the server publishes an output schema, then the first sentence of
     the description. With a view only the disclosed tools get a line and the on-request tools
     are named on one line (:func:`on_request_line`). Resources, templates and prompts follow,
-    one line each.
+    one line each, unless ``compact`` (the local profile): a step can only name a tool, so they
+    are left out, and descriptions are cut to ``LOCAL_DESCRIPTION_LIMIT`` characters.
     """
+    limit = LOCAL_DESCRIPTION_LIMIT if compact else None
     lines: list[str] = []
     tools = catalog.tools if view is None else view.disclosed
-    if view is None or not view.on_request:
+    if compact:
+        lines.append("TOOLS (a step may name only these):")
+    elif view is None or not view.on_request:
         lines.append(f"TOOLS ({len(tools)}) — the ONLY tools that exist:")
     else:
         lines.append(
             f"TOOLS ({len(tools)} disclosed of {len(view.allowed)} allowed) — the tools a step "
             "may name directly:"
         )
+    keys = LOCAL_MAX_OUTPUT_KEYS if compact else _MAX_OUTPUT_KEYS
     for tool in tools:
-        lines.append(render_tool_line(tool))
+        lines.append(render_tool_line(tool, description_limit=limit, max_output_keys=keys))
     if view is not None and view.discoverable:
-        lines.append(render_tool_line(ToolInfo.model_validate(discover_tool_definition())))
+        discover = ToolInfo.model_validate(discover_tool_definition())
+        lines.append(render_tool_line(discover, description_limit=limit))
     if view is not None and view.on_request:
-        lines.append(on_request_line(view, shown=on_request_shown))
+        lines.append(on_request_line(view, shown=on_request_shown, compact=compact))
+    if compact:
+        return "\n".join(lines)
     lines.append(f"RESOURCES ({len(catalog.resources)}):")
     for res in catalog.resources:
         lines.append(f"- {res.uri} [{res.name}]{_dash(res.description)}")
@@ -518,10 +632,13 @@ def _dash(description: str) -> str:
     return f" — {flat}" if flat else ""
 
 
-def render_scenario_for_prompt(scenario: Scenario) -> str:
+def render_scenario_for_prompt(scenario: Scenario, *, compact: bool = False) -> str:
     lines: list[str] = [f"SCENARIO: {scenario.name}", "", "ROLE:", scenario.role.strip(), ""]
     lines += ["GOAL:", scenario.goal.strip(), ""]
-    lines.append("INSTRUCTIONS (policies the agent must follow; each is a judge checklist item):")
+    lines.append(
+        "INSTRUCTIONS (the judge checks each):" if compact
+        else "INSTRUCTIONS (policies the agent must follow; each is a judge checklist item):"
+    )
     if scenario.instructions:
         lines += [f"{i + 1}. {item.strip()}" for i, item in enumerate(scenario.instructions)]
     else:
@@ -532,7 +649,8 @@ def render_scenario_for_prompt(scenario: Scenario) -> str:
         lines.append(f"text: {scenario.expected_outcome.text.strip()}")
     if scenario.expected_outcome.json is not None:
         lines.append(
-            "json (matched deterministically against the agent's final_result): "
+            ("json (final_result must match): " if compact
+             else "json (matched deterministically against the agent's final_result): ")
             + _compact_json(scenario.expected_outcome.json)
         )
     return "\n".join(lines)
@@ -561,12 +679,15 @@ def example_literal(schema: dict[str, Any], root: dict[str, Any]) -> Any:
     return "example"
 
 
-def example_step(catalog: Catalog) -> Step:
+def example_step(catalog: Catalog, tools: list[ToolInfo] | None = None) -> Step:
     """One concrete example step using a real catalog tool (the one with the most required args).
 
-    Falls back to a no-tool step when the catalog is empty, so the prompt is always well formed.
+    ``tools`` narrows the choice (the local prompt passes the disclosed tools, so the example
+    never names a tool the planner may not use). Falls back to a no-tool step when there is no
+    tool, so the prompt is always well formed.
     """
-    if not catalog.tools:
+    candidates = list(catalog.tools) if tools is None else list(tools)
+    if not candidates:
         return Step(
             intent="Compose the final answer from the results so far",
             tool=None,
@@ -577,7 +698,7 @@ def example_step(catalog: Catalog) -> Step:
         req = (tool.input_schema or {}).get("required")
         return len(req) if isinstance(req, list) else 0
 
-    tool = max(catalog.tools, key=required_count)  # the first tool wins ties
+    tool = max(candidates, key=required_count)  # the first tool wins ties
     schema = tool.input_schema or {}
     properties = schema.get("properties")
     properties = properties if isinstance(properties, dict) else {}
@@ -680,30 +801,84 @@ def build_system_prompt(
     )
 
 
-def render_observation_line(observation: Observation) -> str:
+def build_local_system_prompt(
+    catalog: Catalog, view: PlannerView | None = None, *, on_request_shown: int | None = None
+) -> str:
+    """The local profile's system prompt: the rules of :func:`build_system_prompt`, said once and
+    briefly, for a model that writes one path per turn (docs/LOCAL_MODELS.md "Speed")."""
+    tools = view.disclosed if view is not None else None
+    example_model = example_step(catalog, tools)
+    example = example_model.model_dump(mode="json")
+    where = f"tool_result[{example_model.tool}]" if example_model.tool else "final_result"
+    reference = _compact_json({REFERENCE_KEY: 1, "path": "items[*].id"})
+    return "\n".join(
+        [
+            "Plan test paths for a simulated agent using an MCP server. A path is the tool calls",
+            "the agent makes to reach the goal; a judge checks its checkpoints. Answer ONE path",
+            "per turn as JSON: first the happy path (the straightforward route), then, when",
+            "asked, one path of a kind not used yet:",
+            "- recovery: a step with bad input and expect_error true (success_looks_like names"
+            " the error), then the corrected call",
+            "- alternative: other tools, same end",
+            "- boundary: limits, pagination, empty results, unknown ids",
+            "- policy: tempts breaking an instruction; checkpoints say what obeying looks like",
+            "Rules (a path that breaks one is sent back):",
+            "1. `tool`: a name from TOOLS, or null for the final answer.",
+            "2. `arguments_sketch`: that tool's arguments with the listed types; `()` means none.",
+            f"3. A value only an earlier step returns: {reference} (earlier tool step,"
+            " dotted path).",
+            f"4. At most {LOCAL_MAX_CHECKPOINTS} checkpoints shaped '<where>: <condition>', <where>"
+            f" = final_result, tool_result[<tool>] or transcript, e.g. '{where}: <field> equals"
+            " <value>'.",
+            "5. Use the INFORMANT REPORTS and OBSERVATIONS (real ids, values). FALSE: say it does"
+            " not exist. UNKNOWN: settle it first.",
+            f"6. A tool AVAILABLE ON REQUEST needs a {DISCOVER_TOOL_NAME} step first.",
+            "7. Do not call a tool for what an earlier result already returns.",
+            "Short: title under 60 characters, one sentence per rationale and success_looks_like,",
+            f"at most {LOCAL_MAX_STEPS} steps. Example step: " + _compact_json(example),
+            "",
+            render_catalog_for_prompt(catalog, view, on_request_shown=on_request_shown,
+                                      compact=True),
+        ]
+    )
+
+
+def render_observation_line(
+    observation: Observation, *, limit: int = OBSERVATION_LINE_LIMIT
+) -> str:
     """``find_product(query="penne") → ok: <summary>`` (the scout's compact summary)."""
     status = "ERROR" if observation.is_error else "ok"
     summary = " ".join(observation.summary.split())
-    if len(summary) > OBSERVATION_LINE_LIMIT:
-        summary = summary[: OBSERVATION_LINE_LIMIT - 1] + "…"
+    if len(summary) > limit:
+        summary = summary[: limit - 1] + "…"
     return f"- {observation.call_label()} → {status}: {summary or '(empty)'}"
 
 
 def render_informants_for_prompt(
-    view: PlannerView, *, observations_shown: int | None = None
+    view: PlannerView,
+    *,
+    observations_shown: int | None = None,
+    line_limit: int = OBSERVATION_LINE_LIMIT,
+    compact: bool = False,
 ) -> str:
     """The INFORMANT REPORTS, GOALS ENABLED BY OBSERVATION and OBSERVATIONS sections.
 
     ``observations_shown`` keeps only the LAST that many observations (the prompt budget trims
     the oldest first) and says how many were left out.
     """
-    lines: list[str] = ["INFORMANT REPORTS (observers watched the scout's calls; plan from these):"]
+    lines: list[str] = [
+        "INFORMANT REPORTS:" if compact
+        else "INFORMANT REPORTS (observers watched the scout's calls; plan from these):"
+    ]
     if view.reports:
         lines += [f"- {r.line()}" for r in view.reports]
     else:
         lines.append("(none)")
     lines.append("")
-    lines.append("GOALS ENABLED BY OBSERVATION (the agent will be told these too):")
+    lines.append(
+        "GOALS ENABLED BY OBSERVATION:" if compact
+        else "GOALS ENABLED BY OBSERVATION (the agent will be told these too):"
+    )
     if view.goals:
         lines += [f"- {g.strip()}" for g in view.goals]
     else:
@@ -715,24 +890,37 @@ def render_informants_for_prompt(
         trimmed = len(observations) - observations_shown
         observations = observations[len(observations) - observations_shown :]
     lines.append(
-        "OBSERVATIONS (read-only calls already made against the live server; use these values):"
+        "OBSERVATIONS (read-only calls already made):" if compact
+        else "OBSERVATIONS (read-only calls already made against the live server; use these "
+        "values):"
     )
     if trimmed:
         lines.append(f"({trimmed} earlier observation(s) left out to fit the prompt budget)")
     if observations:
-        lines += [render_observation_line(o) for o in observations]
+        lines += [render_observation_line(o, limit=line_limit) for o in observations]
     elif not trimmed:
         lines.append("(none)")
     return "\n".join(lines)
 
 
 def build_user_prompt(
-    scenario: Scenario, view: PlannerView | None = None, *, observations_shown: int | None = None
+    scenario: Scenario,
+    view: PlannerView | None = None,
+    *,
+    observations_shown: int | None = None,
+    compact: bool = False,
 ) -> str:
-    sections = [render_scenario_for_prompt(scenario)]
+    sections = [render_scenario_for_prompt(scenario, compact=compact)]
     if view is not None:
-        sections.append(render_informants_for_prompt(view, observations_shown=observations_shown))
-    sections.append("Produce the execution plan for this scenario now.")
+        limit = LOCAL_OBSERVATION_LINE_LIMIT if compact else OBSERVATION_LINE_LIMIT
+        sections.append(
+            render_informants_for_prompt(view, observations_shown=observations_shown,
+                                         line_limit=limit, compact=compact)
+        )
+    if compact:
+        sections.append("Emit the first path now: the happy path.")
+    else:
+        sections.append("Produce the execution plan for this scenario now.")
     return "\n\n".join(sections)
 
 
@@ -756,25 +944,31 @@ def build_prompts(
     view: PlannerView | None = None,
     *,
     budget: int | None = None,
+    compact: bool = False,
 ) -> tuple[str, str]:
     """``(system, user)`` for the planner, trimmed to ``budget`` characters in total.
 
     Observations go first (oldest first, one at a time), then the on-request list is shortened
-    to a count; the disclosed digest, the reports and the scenario are never cut.
+    to a count; the disclosed digest, the reports and the scenario are never cut. ``compact``
+    builds the local profile's prompts (:func:`build_local_system_prompt`, short observation
+    lines, a closing line asking for the happy path) with ``LOCAL_PROMPT_BUDGET`` as the default
+    budget.
     """
-    budget = planner_prompt_budget() if budget is None else budget
+    if budget is None:
+        budget = planner_prompt_budget(LOCAL_PROMPT_BUDGET if compact else DEFAULT_PROMPT_BUDGET)
+    build_system = build_local_system_prompt if compact else build_system_prompt
     if view is None:
-        return build_system_prompt(catalog), build_user_prompt(scenario)
+        return build_system(catalog), build_user_prompt(scenario, compact=compact)
     shown = len(view.observations)
-    system = build_system_prompt(catalog, view)
-    user = build_user_prompt(scenario, view, observations_shown=shown)
+    system = build_system(catalog, view)
+    user = build_user_prompt(scenario, view, observations_shown=shown, compact=compact)
     while len(system) + len(user) > budget and shown > 0:
         shown -= 1
-        user = build_user_prompt(scenario, view, observations_shown=shown)
+        user = build_user_prompt(scenario, view, observations_shown=shown, compact=compact)
     on_request = len(view.on_request)
     while len(system) + len(user) > budget and on_request > 0:
         on_request = 0 if on_request <= 3 else on_request // 2
-        system = build_system_prompt(catalog, view, on_request_shown=on_request)
+        system = build_system(catalog, view, on_request_shown=on_request)
     return system, user
 
 
@@ -840,6 +1034,37 @@ def validate_arguments(step: Step, position: int, path: Path, tool: ToolInfo) ->
     return problems
 
 
+def recovery_problems(path: Path) -> list[str]:
+    """Why a ``recovery`` path does not show a recovery, or nothing.
+
+    It needs the failure (a step with ``expect_error`` true), then the corrected call (a later
+    tool step that expects success), and the two cannot send the same input: the same tool with
+    the same arguments cannot both fail and succeed. ``command-r7b`` wrote a "recovery" that
+    marked ``find_product(query="penne")`` as the failure and had no corrected call at all.
+    """
+    failing = next((i for i, s in enumerate(path.steps) if s.expect_error), None)
+    if failing is None:
+        return [
+            "a recovery path must contain at least one step with expect_error true (the step "
+            "that sends the bad input the server rejects), followed by the corrected call"
+        ]
+    bad = path.steps[failing]
+    fixes = [s for s in path.steps[failing + 1 :] if s.tool is not None and not s.expect_error]
+    if not fixes:
+        return [
+            f"step {failing + 1} expects an error, but no later step makes the corrected call "
+            "(a tool step with expect_error false)"
+        ]
+    same = [s for s in fixes if s.tool == bad.tool and s.arguments_sketch == bad.arguments_sketch]
+    if same:
+        return [
+            f"step {failing + 1} expects an error from {bad.tool} with the same arguments the "
+            "corrected call sends; the failing step must send the bad input (a misspelling, a "
+            "wrong type, an unknown id)"
+        ]
+    return []
+
+
 def validate_checkpoint(text: str) -> str | None:
     """Why a checkpoint is rejected, or ``None`` when it has the required shape."""
     if CHECKPOINT_PATTERN.match(text.strip()):
@@ -852,6 +1077,8 @@ def validate_draft(
     catalog: Catalog,
     view: PlannerView | None = None,
     scenario: Scenario | None = None,
+    *,
+    require_happy: bool = True,
 ) -> list[str]:
     """Every problem with a draft, as human-readable lines; empty means valid.
 
@@ -860,6 +1087,8 @@ def validate_draft(
     requirement on recovery paths, and the shape of every checkpoint. With a view, a step naming
     an on-request tool must come after a ``discover_tools`` step or after a tool step whose
     result an observer effect can react to by enabling it (``scenario`` supplies the observers).
+    ``require_happy=False`` checks a draft that adds paths to a plan that already has its happy
+    path (the local profile validates one path per call).
     """
     problems: list[str] = []
     if not draft.paths:
@@ -915,17 +1144,13 @@ def validate_draft(
                 discovered = True
             else:
                 tool_step_before = True
-        if path.kind == "recovery" and not path.expects_error():
-            problems.append(
-                f"{where}: a recovery path must contain at least one step with "
-                "expect_error true (the step that sends the bad input the server rejects), "
-                "followed by the corrected call"
-            )
+        if path.kind == "recovery":
+            problems += [f"{where}: {text}" for text in recovery_problems(path)]
         for c_index, checkpoint in enumerate(path.checkpoints):
             reason = validate_checkpoint(checkpoint)
             if reason is not None:
                 problems.append(f"paths[{p_index}].checkpoints[{c_index}] ({path.id!r}): {reason}")
-    if not any(p.kind == "happy" for p in draft.paths):
+    if require_happy and not any(p.kind == "happy" for p in draft.paths):
         problems.append("plan has no path of kind 'happy'")
     return problems
 
@@ -992,6 +1217,180 @@ def reask_content(response: LLMResponse, problems: list[str]) -> str | list[dict
     return [{"type": "tool_result", "tool_use_id": tool_use_id, "content": text, "is_error": True}]
 
 
+def planner_profile(scenario: Scenario) -> str:
+    """``"local"`` when the planner is an ``ollama:`` model, else ``"hosted"``."""
+    provider, _ = parse_model_spec(scenario.models.planner)
+    return "local" if provider == OLLAMA else "hosted"
+
+
+def local_plan_paths(default: int = DEFAULT_LOCAL_PATHS) -> int:
+    """``MCPSIM_LOCAL_PLAN_PATHS`` (default 3): paths the local profile asks for, happy first."""
+    raw = os.environ.get(LOCAL_PATHS_ENV, "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{LOCAL_PATHS_ENV} must be an integer, got {raw!r}") from exc
+    if not 1 <= value <= len(PATH_KINDS):
+        raise ValueError(f"{LOCAL_PATHS_ENV} must be between 1 and {len(PATH_KINDS)}, got {value}")
+    return value
+
+
+def _unique_path_id(path: Path, taken: set[str]) -> Path:
+    """``path`` renamed after its kind (then ``<kind>-2``, ``-3``…) when an accepted path
+    already has its id.
+
+    Each local call sees only its own path's schema, so a model that calls every path "1" (or
+    "happy") is not wrong; the ids are labels and are made unique here rather than sent back.
+    """
+    if path.id not in taken:
+        return path
+    candidate: str = path.kind
+    n = 2
+    while candidate in taken:
+        candidate, n = f"{path.kind}-{n}", n + 1
+    return path.model_copy(update={"id": candidate})
+
+
+def _next_path_content(
+    response: LLMResponse, accepted: list[Path], kinds: list[str]
+) -> list[dict[str, Any]]:
+    """The user turn after an accepted local path: its tool result, then the next request."""
+    last = accepted[-1]
+    used = ", ".join(f"{p.id} ({p.kind}: {' → '.join(p.tools_used()) or 'no tools'})"
+                     for p in accepted)
+    text = (
+        f"Accepted path {last.id!r}. Now emit ONE more path, of a kind not used yet: "
+        f"{', '.join(kinds)}. Paths so far: {used}; the new one must test something they do not."
+    )
+    blocks = [b for b in response.tool_uses() if b.get("name") == PLAN_TOOL_NAME]
+    return [
+        {"type": "tool_result", "tool_use_id": str(blocks[0].get("id", "")), "content": "accepted"},
+        {"type": "text", "text": text},
+    ]
+
+
+async def plan_locally(
+    scenario: Scenario,
+    catalog: Catalog,
+    llm: LLM,
+    scout: ScoutResult | None = None,
+    *,
+    prompt_budget: int | None = None,
+    paths: int | None = None,
+) -> ExecutionPlan:
+    """The local profile: a compact prompt and ONE path per call (docs/LOCAL_MODELS.md "Speed").
+
+    Call 1 asks for the happy path; each later call continues the same conversation (the
+    accepted answer, then "one more path, of a kind not used yet") so the server reuses its
+    cached prompt and evaluates only the new turn. Each path gets the usual single re-ask. The
+    happy path is mandatory (:class:`PlanError` without it); a later path that fails twice is
+    dropped and its kind excluded (the same request at temperature 0 would fail the same way),
+    the conversation resumes from the last accepted path, and the plan's ``notes`` say what was
+    dropped and why. ``notes`` also record every call's tokens and seconds. A plan never makes
+    more than ``paths × MAX_PLAN_ATTEMPTS`` calls, so with the Ollama deadline its worst case is
+    bounded too.
+    """
+    view = planner_view(scenario, catalog, scout) if scout is not None else None
+    system, user = build_prompts(scenario, catalog, view, budget=prompt_budget, compact=True)
+    if scout is not None:
+        scout.planner_prompt_chars = len(system) + len(user)
+    wanted = local_plan_paths() if paths is None else paths
+    tool_choice = {"type": "tool", "name": PLAN_TOOL_NAME}
+    # Everything up to and including the last accepted answer; each call appends one user turn.
+    prefix: list[dict[str, Any]] = [{"role": "user", "content": user}]
+    last_accepted: LLMResponse | None = None
+    accepted: list[Path] = []
+    dropped: set[str] = set()
+    notes: list[str] = []
+    calls = 0
+    # Every path may take its re-ask, and no more: a plan never costs more than this many calls.
+    max_calls = wanted * MAX_PLAN_ATTEMPTS
+    while len(accepted) < wanted:
+        if calls >= max_calls:
+            notes.append(f"stopped after {calls} calls, the cap for {wanted} path(s)")
+            break
+        taken = {p.kind for p in accepted} | dropped
+        kinds: list[str] = ["happy"] if not accepted else [
+            k for k in PATH_KINDS if k != "happy" and k not in taken
+        ]
+        if not kinds:
+            break
+        messages = list(prefix)
+        if last_accepted is not None:
+            messages.append(
+                {"role": "user", "content": _next_path_content(last_accepted, accepted, kinds)}
+            )
+        tools = [{**plan_tool_definition(catalog, view),
+                  "input_schema": local_plan_input_schema(catalog, view, kinds)}]
+        problems: list[str] = []
+        new_path: Path | None = None
+        tried_kind: str | None = None
+        response: LLMResponse | None = None
+        for attempt in range(1, MAX_PLAN_ATTEMPTS + 1):
+            if calls >= max_calls:
+                break
+            calls += 1
+            started = time.monotonic()
+            response = await llm.complete(
+                model=scenario.models.planner,
+                system=system,
+                messages=list(messages),
+                tools=tools,
+                tool_choice=tool_choice,
+                max_tokens=LOCAL_PLAN_MAX_TOKENS,
+            )
+            seconds = time.monotonic() - started
+            draft, problems = extract_draft(response, catalog, view, scenario)
+            if draft is not None and len(draft.paths) == 1:
+                candidate = _unique_path_id(draft.paths[0], {p.id for p in accepted})
+                tried_kind = candidate.kind
+                problems = validate_draft(PlanDraft(paths=[candidate]), catalog, view, scenario,
+                                          require_happy=False)
+                if candidate.kind not in kinds:
+                    problems.append(f"path kind must be one of {', '.join(kinds)}, "
+                                    f"got {candidate.kind!r}")
+                if not problems:
+                    new_path = candidate
+            elif draft is not None:
+                problems = [f"emit exactly one path, got {len(draft.paths)}"]
+            notes.append(
+                f"call {calls} ({'/'.join(kinds)}, attempt {attempt}): "
+                f"{response.usage.input_tokens} prompt + {response.usage.output_tokens} output "
+                f"tokens in {seconds:.0f} s, {'accepted' if new_path else 'rejected'}"
+            )
+            if new_path is not None:
+                break
+            if attempt < MAX_PLAN_ATTEMPTS:
+                messages.append({"role": "assistant", "content": list(response.content)})
+                messages.append({"role": "user", "content": reask_content(response, problems)})
+        if new_path is None or response is None:
+            if not accepted:
+                raise PlanError(
+                    f"local planner for scenario {scenario.name!r} produced no valid happy path "
+                    f"in {MAX_PLAN_ATTEMPTS} attempts; last errors:\n"
+                    + "\n".join(f"- {p}" for p in problems)
+                )
+            notes.append(f"dropped a {tried_kind or '/'.join(kinds)} path after "
+                         f"{attempt} invalid draft(s): {'; '.join(problems[:3])}")
+            # The same request at temperature 0 would get the same answer: ask for the other
+            # kinds, or stop when the model never produced a path whose kind could be excluded.
+            if tried_kind is None or tried_kind == "happy":
+                break
+            dropped.add(tried_kind)
+            continue
+        accepted.append(new_path)
+        prefix = [*messages, {"role": "assistant", "content": list(response.content)}]
+        last_accepted = response
+    return ExecutionPlan(
+        scenario=scenario.name,
+        catalog_digest=catalog.digest(),
+        paths=accepted,
+        notes=[f"local planner ({scenario.models.planner}): {n}" for n in notes],
+    )
+
+
 async def plan_with_llm(
     scenario: Scenario,
     catalog: Catalog,
@@ -1004,8 +1403,11 @@ async def plan_with_llm(
 
     With a ``scout`` the prompts are the orchestrator's (disclosed digest, on-request names,
     informant reports, goals, observations) and ``scout.planner_prompt_chars`` records their
-    final size after trimming.
+    final size after trimming. An ``ollama:`` planner takes the local profile instead
+    (:func:`plan_locally`).
     """
+    if planner_profile(scenario) == "local":
+        return await plan_locally(scenario, catalog, llm, scout, prompt_budget=prompt_budget)
     view = planner_view(scenario, catalog, scout) if scout is not None else None
     system, user = build_prompts(scenario, catalog, view, budget=prompt_budget)
     if scout is not None:

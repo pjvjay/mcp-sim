@@ -327,7 +327,10 @@ async def _plan(
     scout_result: ScoutResult | None = None,
 ) -> ExecutionPlan:
     llm = None if dry_run else make_llm_for(scenario, "planner")
-    return await plan_paths(scenario, catalog, llm, scout=scout_result, dry_run=dry_run)
+    plan = await plan_paths(scenario, catalog, llm, scout=scout_result, dry_run=dry_run)
+    for note in plan.notes:
+        _log(f"{scenario.name}: {note}")
+    return plan
 
 
 def _write_scenario(scenario: Scenario, run_dir: FsPath) -> FsPath:

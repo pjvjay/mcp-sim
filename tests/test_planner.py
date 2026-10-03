@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 from typing import Any
 
 import pytest
@@ -425,6 +424,12 @@ def test_checkpoint_shapes_accepted(text: str) -> None:
         {"paths": [path("happy", "happy", step("lookup"), checkpoints=[text])]}
     )
     assert validate_draft(draft, catalog) == []
+
+
+def test_gateway_tool_names_are_valid_in_checkpoints() -> None:
+    """ContextForge exposes ``find_product`` as ``pantry-find-product``."""
+    assert CHECKPOINT_PATTERN.match("tool_result[pantry-find-product]: match equals direct")
+    assert CHECKPOINT_PATTERN.match("tool_result[svc.v2_lookup]: total is 2")
 
 
 @pytest.mark.parametrize(
@@ -997,7 +1002,47 @@ def test_plan_schema_requires_every_step_field_for_constrained_decoders() -> Non
     path = schema["$defs"]["Path"]
     assert set(path["required"]) == set(path["properties"])
     assert schema["required"] == ["paths"]
-    # free-form arguments stay open; nothing carries a default or a title any more
+    # free-form arguments stay open
     assert "required" not in step["properties"]["arguments_sketch"]
-    text = json.dumps(schema)
-    assert '"default"' not in text and '"title"' not in text
+
+
+def test_strict_schema_keeps_every_model_field_and_drops_only_annotations() -> None:
+    """``Path.title`` is a field. The first strict schema dropped every key named ``title`` and
+    so the property too: command-r7b never emitted it and every local plan failed with
+    ``paths.0.title: Field required``."""
+    from mcpsim.mcpclient import Catalog, ToolInfo
+    from mcpsim.plan import Path, Step
+    from mcpsim.planner import plan_input_schema
+
+    catalog = Catalog(tools=[ToolInfo(name="find_product", input_schema={"type": "object"})])
+    schema = plan_input_schema(catalog)
+    for name, model in (("Path", Path), ("Step", Step)):
+        node = schema["$defs"][name]
+        assert list(node["properties"]) == list(model.model_fields)
+        assert node["required"] == list(model.model_fields)
+    assert schema["$defs"]["Path"]["properties"]["title"] == {"type": "string"}
+
+    def annotations(node: object) -> list[str]:
+        """``title``/``default`` used as annotations, i.e. anywhere but as a property name."""
+        found: list[str] = []
+        if isinstance(node, dict):
+            for key, value in node.items():
+                if key in ("title", "default"):
+                    found.append(key)
+                if key in ("properties", "$defs") and isinstance(value, dict):
+                    for sub in value.values():
+                        found += annotations(sub)
+                else:
+                    found += annotations(value)
+        elif isinstance(node, list):
+            for item in node:
+                found += annotations(item)
+        return found
+
+    assert annotations(schema) == []
+    # A draft that fills every required key validates against the model.
+    path = {"id": "happy", "kind": "happy", "title": "Look it up", "rationale": "r",
+            "steps": [{"intent": "i", "tool": "find_product", "arguments_sketch": {},
+                       "success_looks_like": "s", "expect_error": False}],
+            "checkpoints": []}
+    assert PlanDraft.model_validate({"paths": [path]}).paths[0].title == "Look it up"

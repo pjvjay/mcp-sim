@@ -82,8 +82,9 @@ planner must close with structure rather than prose:
 4. **A recovery path must contain the failure.** The model's recovery path was the happy path
    with `exclude_origin: ["server_suggestion"]`; a recovery path must have a step whose
    `success_looks_like` names the server's rejection (e.g. a ToolError with suggestions) before
-   the corrected call. The validator checks that a `recovery` path has at least one step marked
-   `expect_error: true`.
+   the corrected call. The validator checks that a `recovery` path has a step marked
+   `expect_error: true`, a later tool step that expects success, and that the two do not send
+   the same tool the same arguments.
 
 Timing under a heavily loaded machine: 1,451 prompt tokens, 918 output tokens, 20 minutes.
 Unloaded, expect a few minutes. These rules are provider-independent and improve hosted plans
@@ -103,11 +104,90 @@ too; the local model is simply where their absence shows first.
   against. Use an Anthropic model for the judge when a key is available; when it is not, set
   `allow_same_judge: true` and read the verdicts as a first pass — the deterministic matcher
   still runs and still overrides the votes, so JSON expectations are enforced exactly.
-* **Speed.** Measured on this CPU-only Intel laptop with `command-r7b`: 45 s to load the model,
-  then about 2.5 minutes for a 90-token structured answer to a one-line prompt; a full plan or an
-  agent turn that reads a long tool result takes several minutes. `concurrency: 1` for local
-  servers (Ollama serialises requests anyway); `llama3.2:3b` is the fast option when the task is
-  simple, `qwen2.5:7b` a middle ground.
+* **Speed.** See "Speed" below. `concurrency: 1` for local servers (Ollama serialises requests
+  anyway); `llama3.2:3b` is the fast option when the task is simple, `qwen2.5:7b` a middle ground.
+
+## Speed
+
+No local call may take longer than ten minutes, and on a CPU that is not throttled each
+planner call should answer in about two. What follows is how that is enforced and what was
+measured getting there (`command-r7b`, Ollama 0.34.4, i7-9750H with 6 cores and 16 GB, CPU only,
+2026-10-02).
+
+**A local call has a deadline.** `MCPSIM_OLLAMA_DEADLINE_S` (default 600) bounds one call *in
+total*, retries included; a call that reaches it is cancelled (Ollama stops generating when the
+client goes away) and fails with the prompt size in the message. The setting can lower the
+limit, never raise it: an answer that needs more than ten minutes means the prompt or the
+machine is wrong. A read timeout is not retried, since asking again spends the rest of the
+deadline on the same prompt. Requests carry `keep_alive` (`MCPSIM_OLLAMA_KEEP_ALIVE`, default
+`30m`) so the model stays loaded while the hosted agent and judge run; Ollama's own five
+minutes unloaded it between scenarios, and each one paid the load again with a cold cache.
+
+**Where the time goes.** On this machine with the CPU cool, the model reads about 20 prompt
+tokens per second and writes 3.5–4 (4.1 at a short context, 2.7 at 3,400 tokens). The first
+planner prompt was 3,385 tokens, so 170 s passed before the first output token. Measured and
+ruled out: the JSON-schema grammar (4.07 tok/s with the plan grammar, 4.17 without; Ollama does
+not add the schema to the prompt) and the thread count (12 threads: 8.8 tok/s against 16.7 for
+Ollama's default of 6).
+
+**The local planner profile.** A planner addressed as `ollama:` gets a profile built for those
+numbers:
+
+* *A compact prompt* (`LOCAL_PROMPT_BUDGET`, 4,000 characters): the same rules said once and
+  briefly; tools only (a step cannot name a resource or a prompt); descriptions cut to 90
+  characters and output keys to six; short section headers; an example step drawn from the
+  disclosed tools. The cheapest-penne prompt went from 11,702 characters to 4,750 (3,385 tokens
+  to 1,616).
+* *One path per call.* Call 1 asks for the happy path. Each later call continues the same
+  conversation (the accepted answer replayed as the compact JSON the model wrote, then "one
+  more path, of a kind not used yet"), so the server restores its cached prompt and evaluates
+  only the new turn. A rejected path gets the usual re-ask; one that fails twice is dropped and
+  its kind is not asked for again (at temperature 0 the same request fails the same way). The
+  happy path is mandatory. `MCPSIM_LOCAL_PLAN_PATHS` (default 3) sets how many paths; a plan
+  never makes more than two calls per path. `plan.json` `notes` record every call's tokens and
+  seconds.
+* *A grammar that bounds the output.* One path per call, at most six steps and three
+  checkpoints, capped string lengths, and every checkpoint matched against a regex of the
+  allowed shapes with the catalog's real tool names. Told the shape in prose, `command-r7b`
+  wrote `find_product: match == 'direct'`; with the pattern it writes
+  `tool_result[find_product]: match equals direct`. llama.cpp converts a pattern only when one
+  `^…$` wraps the whole expression; an anchor inside an alternation is logged as unsupported
+  and the string goes unconstrained, which a test guards against.
+
+| cheapest-penne plan | prompt tokens | output tokens | wall |
+| --- | --- | --- | --- |
+| before, under memory pressure (browser open) | 3,385 | 226 | 27 min, invalid |
+| before, no pressure | 3,385 | 236 | 4.5 min per call, invalid |
+| local profile, call 1 (happy) | 1,616 | 248 | 290 s |
+| local profile, call 2 (next path, cached prompt) | 1,845 | 181 | 107 s |
+| local profile, call 3 (rejected: `list_products` takes `search`, not `query`) | 2,088 | 171 | 228 s |
+| local profile, call 4 (the re-ask, accepted) | 2,377 | 171 | 218 s |
+
+The local-profile rows ran with the CPU held at 22–33 % of its clock (see below): prompt 5.6–6.6
+tok/s, output 0.9–2.4. The plan validated with three paths (`examples/cheapest-penne/local-plan`)
+and no call came near the deadline. At the unthrottled rates the same calls take about 2.4
+minutes (call 1, whose answer the model pretty-prints; later calls copy the compact JSON in the
+conversation and write a third fewer tokens) and one minute (each later call).
+
+The same run showed a "recovery" path whose failing step sent good input and had no corrected
+call; the validator now requires the failure, then a later tool step that expects success, and
+rejects a failing step that sends the same tool the same arguments as the fix.
+
+**What the machine does to it.** Two things outside the framework dominated:
+
+* *CPU speed limit.* `pmset -g therm` reported `CPU_Speed_Limit` between 22 and 37 during these
+  runs (`sysctl machdep.xcpm.cpu_thermal_level` 144–244), even with Ollama idle: every rate
+  above fell by about 3.5×. On this laptop a 65 W adapter was charging the battery from 10 %;
+  the machine ships with an 87 W or 96 W one. Other steady CPU users (an animated wallpaper,
+  `mediaanalysisd`, a busy browser or chat window) cost more than their share, because llama.cpp
+  runs one thread per core and waits for the slowest.
+* *Memory pressure.* Ollama 0.34 loads the weights (5.8 GB with the 8k context) into ordinary
+  memory and rejects `use_mlock` as an invalid option, so when the system runs short macOS
+  compresses or swaps them: with a browser holding many tabs, prompt evaluation fell to 3 tok/s
+  and generation to 0.44.
+
+Check both before a long local run: `pmset -g therm` (`CPU_Speed_Limit` should be 100),
+`memory_pressure | tail -1`, and `ollama ps` (100 % CPU, the model loaded).
 
 ## Observers on local models
 

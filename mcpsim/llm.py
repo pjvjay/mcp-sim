@@ -38,10 +38,17 @@ DEFAULT_PROVIDER = ANTHROPIC
 API_KEY_ENV = "ANTHROPIC_API_KEY"
 OLLAMA_HOST_ENV = "OLLAMA_HOST"
 OLLAMA_NUM_CTX_ENV = "MCPSIM_OLLAMA_NUM_CTX"
+OLLAMA_DEADLINE_ENV = "MCPSIM_OLLAMA_DEADLINE_S"
+OLLAMA_KEEP_ALIVE_ENV = "MCPSIM_OLLAMA_KEEP_ALIVE"
 DEFAULT_OLLAMA_HOST = "http://localhost:11434"
 DEFAULT_OLLAMA_NUM_CTX = 8192
-# A local 7B model on a CPU can take many minutes per answer (docs/LOCAL_MODELS.md "Speed").
-DEFAULT_OLLAMA_TIMEOUT_S = 3600.0
+# The longest one local call may take, retries included, and the ceiling for the env override:
+# a local answer that needs more than ten minutes means the prompt or the machine is wrong, not
+# that the caller should wait longer (docs/LOCAL_MODELS.md "Speed").
+MAX_OLLAMA_DEADLINE_S = 600.0
+# Keep the model loaded between calls: Ollama's own default (5 minutes) unloads it while the
+# hosted agent and judge run, and every scenario then pays the load again with a cold cache.
+DEFAULT_OLLAMA_KEEP_ALIVE = "30m"
 # Rendered after "Cost is an ..." in report.md, hence the leading noun.
 LOCAL_COST_NOTE = "estimate; local model(s) via Ollama cost 0 (no API spend)"
 
@@ -324,6 +331,33 @@ def ollama_num_ctx(env: Mapping[str, str] | None = None) -> int:
     return value
 
 
+def ollama_deadline_s(env: Mapping[str, str] | None = None) -> float:
+    """``MCPSIM_OLLAMA_DEADLINE_S`` (default and ceiling 600): seconds one call may take in all.
+
+    A value above the ceiling raises rather than being clamped, so a configuration that asks for
+    a longer wait is visibly refused instead of silently shortened.
+    """
+    source = os.environ if env is None else env
+    raw = source.get(OLLAMA_DEADLINE_ENV, "").strip()
+    if not raw:
+        return MAX_OLLAMA_DEADLINE_S
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise ValueError(f"{OLLAMA_DEADLINE_ENV} must be a number of seconds, got {raw!r}") from exc
+    if not 0 < value <= MAX_OLLAMA_DEADLINE_S:
+        raise ValueError(
+            f"{OLLAMA_DEADLINE_ENV} must be > 0 and <= {MAX_OLLAMA_DEADLINE_S:.0f}, got {raw}"
+        )
+    return value
+
+
+def ollama_keep_alive(env: Mapping[str, str] | None = None) -> str:
+    """``MCPSIM_OLLAMA_KEEP_ALIVE`` (default ``30m``), passed to Ollama verbatim."""
+    source = os.environ if env is None else env
+    return source.get(OLLAMA_KEEP_ALIVE_ENV, "").strip() or DEFAULT_OLLAMA_KEEP_ALIVE
+
+
 def _block_text(content: Any) -> str:
     """The text of a ``content`` that is a string or a list of Anthropic ``text`` blocks."""
     if content is None:
@@ -440,6 +474,40 @@ def forced_tool(
     raise ValueError(f"tool_choice names {name!r}, which is not in tools")
 
 
+def forced_history_as_text(messages: list[dict[str, Any]], name: str) -> list[dict[str, Any]]:
+    """Earlier answers of a structured-output conversation, replayed as the JSON text they were.
+
+    In a ``format`` call Ollama is sent no tools, so an assistant ``tool_use`` for the forced
+    tool would reach the chat template as a tool call it re-renders in its own syntax. The
+    model actually wrote compact JSON; replaying exactly that keeps the conversation a strict
+    extension of what the server has cached (the next call evaluates only the new turn) and
+    shows the model its own words. The matching ``tool_result`` becomes plain user text.
+    """
+    ids: set[str] = set()
+    out: list[dict[str, Any]] = []
+    for message in messages:
+        content = message.get("content")
+        if not isinstance(content, list):
+            out.append(message)
+            continue
+        blocks: list[dict[str, Any]] = []
+        for block in content:
+            if block.get("type") == "tool_use" and block.get("name") == name:
+                ids.add(str(block.get("id", "")))
+                text = json.dumps(block.get("input") or {}, ensure_ascii=False,
+                                  separators=(",", ":"))
+                blocks.append({"type": "text", "text": text})
+            elif block.get("type") == "tool_result" and str(block.get("tool_use_id", "")) in ids:
+                text = _block_text(block.get("content"))
+                if block.get("is_error"):
+                    text = f"ERROR: {text}" if text else "ERROR"
+                blocks.append({"type": "text", "text": text})
+            else:
+                blocks.append(block)
+        out.append({**message, "content": blocks})
+    return out
+
+
 def _parse_arguments(raw: Any) -> dict[str, Any]:
     if isinstance(raw, dict):
         return raw
@@ -451,9 +519,12 @@ def _parse_arguments(raw: Any) -> dict[str, Any]:
 
 
 def is_retryable_ollama(exc: BaseException) -> bool:
-    """Connection-level failures and 5xx responses; never a 4xx."""
+    """Connection-level failures and 5xx responses; never a 4xx, never a read timeout (the model
+    is slow, and asking again would spend the rest of the deadline on the same prompt)."""
     if isinstance(exc, httpx.HTTPStatusError):
         return exc.response.status_code >= 500
+    if isinstance(exc, httpx.ReadTimeout):
+        return False
     return isinstance(exc, httpx.TransportError)
 
 
@@ -466,7 +537,8 @@ class OllamaLLM:
         *,
         client: httpx.AsyncClient | None = None,
         num_ctx: int | None = None,
-        timeout: float | None = DEFAULT_OLLAMA_TIMEOUT_S,
+        deadline: float | None = None,
+        keep_alive: str | None = None,
         max_attempts: int = 3,
         base_delay: float = 1.0,
         max_delay: float = 30.0,
@@ -477,8 +549,14 @@ class OllamaLLM:
             raise ValueError("max_attempts must be >= 1")
         self.host = (host or ollama_host()).rstrip("/")
         self.num_ctx = num_ctx if num_ctx is not None else ollama_num_ctx()
+        self.deadline = deadline if deadline is not None else ollama_deadline_s()
+        if not 0 < self.deadline <= MAX_OLLAMA_DEADLINE_S:
+            raise ValueError(
+                f"deadline must be > 0 and <= {MAX_OLLAMA_DEADLINE_S:.0f} s, got {self.deadline}"
+            )
+        self.keep_alive = keep_alive or ollama_keep_alive()
         self._client = client or httpx.AsyncClient(
-            timeout=httpx.Timeout(timeout, connect=min(30.0, timeout or 30.0))
+            timeout=httpx.Timeout(self.deadline, connect=min(30.0, self.deadline))
         )
         self._max_attempts = max_attempts
         self._base_delay = base_delay
@@ -518,17 +596,20 @@ class OllamaLLM:
         forced = forced_tool(tools, tool_choice)
         if forced is not None:
             hint = (
-                f"Answer with exactly one JSON object matching the `{forced['name']}` schema; "
-                "no prose before or after it."
+                f"Answer with exactly one JSON object matching the `{forced['name']}` schema, "
+                "written compactly on one line; no prose before or after it."
             )
             description = str(forced.get("description", "")).strip()
             if description:
                 hint = f"{hint}\n{description}"
             system = f"{system.rstrip()}\n\n{hint}" if system.strip() else hint
+        if forced is not None:
+            messages = forced_history_as_text(messages, forced["name"])
         body: dict[str, Any] = {
             "model": model,
             "messages": to_ollama_messages(system, messages),
             "stream": False,
+            "keep_alive": self.keep_alive,
             "options": {
                 "temperature": 0,
                 "num_ctx": self.num_ctx,
@@ -639,6 +720,25 @@ class OllamaLLM:
             tool_choice=tool_choice,
             max_tokens=max_tokens,
         )
+        try:
+            async with asyncio.timeout(self.deadline):
+                return await self._post_with_retries(model, model_id, body, forced)
+        except TimeoutError as exc:
+            prompt_chars = sum(len(str(m.get("content") or "")) for m in body["messages"])
+            raise OllamaError(
+                f"{model_id} did not answer within {self.deadline:g} s "
+                f"({prompt_chars:,} prompt characters) and the call was cancelled; shrink the "
+                "prompt or free the machine (docs/LOCAL_MODELS.md \"Speed\"). "
+                f"{OLLAMA_DEADLINE_ENV} can only lower this limit."
+            ) from exc
+
+    async def _post_with_retries(
+        self,
+        model: str,
+        model_id: str,
+        body: dict[str, Any],
+        forced: dict[str, Any] | None,
+    ) -> LLMResponse:
         url = f"{self.host}/api/chat"
         attempt = 0
         while True:
@@ -653,6 +753,8 @@ class OllamaLLM:
                     response.raise_for_status()
             except OllamaError:
                 raise
+            except httpx.ReadTimeout as exc:  # the deadline, reached by the socket first
+                raise TimeoutError from exc
             except Exception as exc:
                 if attempt >= self._max_attempts or not is_retryable_ollama(exc):
                     if isinstance(exc, httpx.TransportError):

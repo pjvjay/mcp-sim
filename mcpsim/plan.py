@@ -26,9 +26,11 @@ REFERENCE_KEY = "$from_step"
 
 # A checkpoint is ``<where>: <observable condition>`` with ``<where>`` one of ``final_result``,
 # ``tool_result[<tool>]`` or ``transcript`` (LOCAL_MODELS.md, "Checkpoints need a shape"), or
-# ``report: <observer>.<condition> is true|false`` over an informant report (DESIGN §2b).
+# ``report: <observer>.<condition> is true|false`` over an informant report (DESIGN §2b). Tool
+# names are lowercase and may carry digits, dots and hyphens (a gateway prefixes them:
+# ``pantry-find-product``).
 CHECKPOINT_PATTERN = re.compile(
-    r"^(?:(final_result|tool_result\[[a-z_]+\]|transcript):\s*\S"
+    r"^(?:(final_result|tool_result\[[a-z0-9_][a-z0-9_.-]*\]|transcript):\s*\S"
     r"|report:\s*[a-z_][a-z0-9_]*\.[a-z_][a-z0-9_]*\s+is\s+(true|false)\s*$)"
 )
 CHECKPOINT_SHAPE = (
@@ -135,6 +137,8 @@ class ExecutionPlan(BaseModel):
     scenario: str
     catalog_digest: str
     paths: list[Path] = Field(default_factory=list)
+    # What the planner wants a reviewer to know: per-call tokens and seconds, dropped paths.
+    notes: list[str] = Field(default_factory=list)
 
     def path(self, path_id: str) -> Path:
         for p in self.paths:
