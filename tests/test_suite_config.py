@@ -239,6 +239,26 @@ def test_run_sh_config_loads_the_environment_like_suite(tmp_path: Path) -> None:
     assert "args=config --skill" in out and "--scenario recipe-link-mala-chicken" in out
 
 
+def test_run_sh_exports_the_pantry_api_checkout_the_stdio_scenarios_launch(
+    tmp_path: Path,
+) -> None:
+    """The stdio pantry scenarios read ${PANTRY_API_HOME:-...}; run.sh exports its own default,
+    $WORKSPACE/pantry-platform/pantry-api, so mcpsim launches the same checkout."""
+    home = tmp_path / "mcp-sim"
+    (home / ".venv" / "bin").mkdir(parents=True)
+    stub = home / ".venv" / "bin" / "mcpsim"
+    stub.write_text("#!/bin/bash\necho \"api=${PANTRY_API_HOME:-unset}\"\n", encoding="utf-8")
+    stub.chmod(0o755)
+    drop = ("PANTRY_API_HOME", "WORKSPACE", "RECIPE_SHOPPER_SKILL", "CF_JWT_FILE")
+    env = {k: v for k, v in os.environ.items() if k not in drop}
+    env.update(MCPSIM_HOME=str(home))
+    out = subprocess.run(
+        [str(CHECKOUT_DIR / "scripts" / "run.sh"), "config"],
+        capture_output=True, text=True, env=env, check=True,
+    ).stdout
+    assert out.strip() == f"api={tmp_path}/pantry-platform/pantry-api"
+
+
 def test_the_environment_variable_selects_the_skill(
     skill: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

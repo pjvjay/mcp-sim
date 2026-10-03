@@ -18,14 +18,17 @@ roles_dir: roles
 #   judge: anthropic:claude-opus-5
 defaults: {}
 
-# Run defaults. repeat is pass^k's k; modes are the run modes to keep (every path runs guided,
-# the happy path also free); concurrency is how many runs of one scenario are in flight at
-# once. judge_votes (how many independent judge votes each transcript gets) is left to
-# roles/judge.md's `votes`; setting it here would shadow that. A scenario file that sets
-# repeat, judge_votes or concurrency itself keeps its own value.
+# Run defaults: one conversation per scenario. `free` runs the happy path without the plan's
+# suggested steps, the way a real request arrives; add `guided` (--modes guided,free, or an
+# override) to also run every planned path with its steps: the recovery, boundary and policy
+# variants. repeat is pass^k's k (--repeat N for more); concurrency is how many runs of one
+# scenario are in flight at once. judge_votes (how many independent judge votes each transcript
+# gets) is left to roles/judge.md's `votes`; setting it here would shadow that. A scenario file
+# that sets repeat, judge_votes or concurrency itself keeps its own value (the pantry scenarios
+# set none).
 run:
   repeat: 1
-  modes: [guided, free]
+  modes: [free]
   concurrency: 2
 
 # What `mcpsim suite` (and `mcpsim ui`) runs: directories (their *.yaml / *.yml / *.json files),

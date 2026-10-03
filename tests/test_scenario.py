@@ -86,6 +86,48 @@ def test_http_server_and_overrides(tmp_path: Path, scenario_data: dict[str, Any]
     assert s.models.judge == DEFAULT_JUDGE_MODEL
 
 
+def test_stdio_fields_expand_environment_references(
+    tmp_path: Path, scenario_data: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("MCPSIM_TEST_HOME", "/opt/pantry")
+    monkeypatch.setenv("MCPSIM_TEST_EMPTY", "")
+    monkeypatch.delenv("MCPSIM_TEST_UNSET", raising=False)
+    scenario_data["server"] = {
+        "stdio": {
+            "command": "${MCPSIM_TEST_HOME}/bin/serve",
+            "args": [
+                "--db",
+                "${MCPSIM_TEST_UNSET:-/tmp/x.db}",
+                "--mode=${MCPSIM_TEST_EMPTY:-demo}",
+            ],
+            # Only the braced form is a reference: $HOME, a bare $ and ${} stay as written.
+            "env": {"DB_URL": "sqlite:///${MCPSIM_TEST_HOME}/db.sqlite", "TOKEN": "a$b${}$HOME"},
+            "setup": "${MCPSIM_TEST_HOME}/bin/python -m seed",
+        }
+    }
+    stdio = load_scenario(_write(tmp_path, scenario_data)).server.stdio
+    assert stdio is not None
+    assert stdio.command == "/opt/pantry/bin/serve"
+    assert stdio.args == ["--db", "/tmp/x.db", "--mode=demo"]
+    assert stdio.env == {"DB_URL": "sqlite:////opt/pantry/db.sqlite", "TOKEN": "a$b${}$HOME"}
+    assert stdio.setup == "/opt/pantry/bin/python -m seed"
+
+
+def test_an_unset_variable_without_a_default_fails_the_load_naming_the_field(
+    tmp_path: Path, scenario_data: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("MCPSIM_TEST_UNSET", raising=False)
+    scenario_data["server"] = {
+        "stdio": {"command": "python", "env": {"DB_URL": "sqlite:///${MCPSIM_TEST_UNSET}/x.db"}}
+    }
+    path = _write(tmp_path, scenario_data)
+    with pytest.raises(ScenarioError) as exc_info:
+        load_scenario(path)
+    message = str(exc_info.value)
+    assert "server.stdio" in message
+    assert "env.DB_URL: MCPSIM_TEST_UNSET is not set" in message
+
+
 def test_expected_outcome_text_only_is_fine(scenario_data: dict[str, Any]) -> None:
     scenario_data["expected_outcome"] = {"text": "A price."}
     s = parse_scenario(scenario_data)
@@ -462,6 +504,39 @@ def test_no_scenario_in_the_repo_names_a_local_model() -> None:
         for obs in s.observers:
             assert not is_local_model(s.models.model_for_observer(obs)), (path, obs.name)
         assert planner_profile(s) == "hosted", path
+
+
+def test_the_pantry_scenarios_are_portable_and_set_no_run_settings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    files = sorted((SCENARIOS_DIR / "pantry").glob("*.yaml"))
+    assert len(files) == 6
+    for path in files:
+        text = path.read_text(encoding="utf-8")
+        assert "/Users/" not in text, path.name
+        data = yaml.safe_load(text)
+        for key in ("repeat", "judge_votes", "concurrency"):
+            assert key not in data, (path.name, key)
+    # Unset: the sibling layout and a throwaway database in /tmp.
+    monkeypatch.delenv("PANTRY_API_HOME", raising=False)
+    monkeypatch.delenv("PANTRY_SIM_DB", raising=False)
+    for path in files:
+        stdio = load_scenario(path).server.stdio
+        assert stdio is not None
+        assert stdio.command == "../pantry-platform/pantry-api/.venv/bin/pantry-mcp", path.name
+        assert stdio.setup == (
+            "../pantry-platform/pantry-api/.venv/bin/python -m pantry_planner.db seed"
+        ), path.name
+        assert stdio.env == {"DEMO_MODE": "1", "DB_URL": "sqlite:////tmp/mcpsim-pantry-sim.db"}
+    # Set: every path follows the environment.
+    monkeypatch.setenv("PANTRY_API_HOME", "/srv/pantry-api")
+    monkeypatch.setenv("PANTRY_SIM_DB", "/srv/sim.db")
+    for path in files:
+        stdio = load_scenario(path).server.stdio
+        assert stdio is not None
+        assert stdio.command == "/srv/pantry-api/.venv/bin/pantry-mcp", path.name
+        assert stdio.setup == "/srv/pantry-api/.venv/bin/python -m pantry_planner.db seed"
+        assert stdio.env["DB_URL"] == "sqlite:////srv/sim.db", path.name
 
 
 def test_the_pantry_scenarios_are_v2() -> None:

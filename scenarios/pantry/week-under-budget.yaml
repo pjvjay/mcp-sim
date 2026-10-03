@@ -61,17 +61,17 @@ expected_outcome:
     "shopping_list[*].used_by": { $len: { $gte: 1 } }
 server:
   stdio:
-    command: /Users/paulvijayakumar/Documents/workspace/pantry-platform/pantry-api/.venv/bin/pantry-mcp
+    # pantry-api's checkout: $PANTRY_API_HOME, else the sibling layout (relative to the directory
+    # mcpsim runs in, the mcp-sim checkout). $PANTRY_SIM_DB is a throwaway SQLite file.
+    command: ${PANTRY_API_HOME:-../pantry-platform/pantry-api}/.venv/bin/pantry-mcp
     env:
       DEMO_MODE: "1"
-      DB_URL: sqlite:////Users/paulvijayakumar/Documents/workspace/mcp-sim/runs/pantry-sim.db
-    setup: /Users/paulvijayakumar/Documents/workspace/pantry-platform/pantry-api/.venv/bin/python -m pantry_planner.db seed
+      DB_URL: sqlite:///${PANTRY_SIM_DB:-/tmp/mcpsim-pantry-sim.db}
+    setup: ${PANTRY_API_HOME:-../pantry-platform/pantry-api}/.venv/bin/python -m pantry_planner.db seed
 # Tool policy: a read-only persona. The agent never sees the write tools (submit_* / review_*),
 # and progressive disclosure starts it on the handful of tools that match the goal; it can ask
 # for more with discover_tools (DESIGN §2 "Tool scoping and disclosure").
 tools: { deny: ["submit_*", "review_*"], disclosure: progressive }
-repeat: 3
-judge_votes: 3
 budgets: { max_turns: 12, max_tool_calls: 20, max_cost_usd: 1.50 }
 # Observers (DESIGN §2b): fabrication and overstated coverage both fail the run.
 observers:

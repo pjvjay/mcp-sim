@@ -61,11 +61,13 @@ expected_outcome:
     "lines[*].price": { $gte: 0 }
 server:
   stdio:
-    command: /Users/paulvijayakumar/Documents/workspace/pantry-platform/pantry-api/.venv/bin/pantry-mcp
+    # pantry-api's checkout: $PANTRY_API_HOME, else the sibling layout (relative to the directory
+    # mcpsim runs in, the mcp-sim checkout). $PANTRY_SIM_DB is a throwaway SQLite file.
+    command: ${PANTRY_API_HOME:-../pantry-platform/pantry-api}/.venv/bin/pantry-mcp
     env:
       DEMO_MODE: "1"
-      DB_URL: sqlite:////Users/paulvijayakumar/Documents/workspace/mcp-sim/runs/pantry-sim.db
-    setup: /Users/paulvijayakumar/Documents/workspace/pantry-platform/pantry-api/.venv/bin/python -m pantry_planner.db seed
+      DB_URL: sqlite:///${PANTRY_SIM_DB:-/tmp/mcpsim-pantry-sim.db}
+    setup: ${PANTRY_API_HOME:-../pantry-platform/pantry-api}/.venv/bin/python -m pantry_planner.db seed
   # Against the deployed server instead (see README "Pointing at the live pantry /mcp"):
   # http:
   #   url: https://<host>/pantry/api/mcp
@@ -74,8 +76,6 @@ server:
 # and progressive disclosure starts it on the handful of tools that match the goal; it can ask
 # for more with discover_tools (DESIGN §2 "Tool scoping and disclosure").
 tools: { deny: ["submit_*", "review_*"], disclosure: progressive }
-repeat: 3
-judge_votes: 3
 budgets: { max_turns: 12, max_tool_calls: 20, max_cost_usd: 1.00 }
 # Observers (DESIGN §2b): the consumer-protection officer fails a run that calls the basket
 # clean or US-free while origin_status is not verified; the auditor fails fabrication.

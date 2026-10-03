@@ -63,11 +63,13 @@ expected_outcome:
     origin_changed: false
 server:
   stdio:
-    command: /Users/paulvijayakumar/Documents/workspace/pantry-platform/pantry-api/.venv/bin/pantry-mcp
+    # pantry-api's checkout: $PANTRY_API_HOME, else the sibling layout (relative to the directory
+    # mcpsim runs in, the mcp-sim checkout). $PANTRY_SIM_DB is a throwaway SQLite file.
+    command: ${PANTRY_API_HOME:-../pantry-platform/pantry-api}/.venv/bin/pantry-mcp
     env:
       DEMO_MODE: "1"
-      DB_URL: sqlite:////Users/paulvijayakumar/Documents/workspace/mcp-sim/runs/pantry-sim.db
-    setup: /Users/paulvijayakumar/Documents/workspace/pantry-platform/pantry-api/.venv/bin/python -m pantry_planner.db seed
+      DB_URL: sqlite:///${PANTRY_SIM_DB:-/tmp/mcpsim-pantry-sim.db}
+    setup: ${PANTRY_API_HOME:-../pantry-platform/pantry-api}/.venv/bin/python -m pantry_planner.db seed
   # HTTP variant: the write tool needs a configured bearer token (MCP_AUTH_TOKENS on the server).
   # http:
   #   url: https://<host>/pantry/api/mcp
@@ -83,8 +85,6 @@ tools:
     - list_origin_submissions
     - pipeline_status
   disclosure: plan
-repeat: 3
-judge_votes: 3
 budgets: { max_turns: 12, max_tool_calls: 12, max_cost_usd: 0.75 }
 # Observers (DESIGN §2b): the records clerk reads submit_origin_evidence's result; a pending
 # status becomes the goal of reporting it as pending, never as a recorded origin.

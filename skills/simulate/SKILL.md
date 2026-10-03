@@ -83,7 +83,9 @@ skills/simulate/scripts/run.sh report
    prints a table with each scenario's passed/runs, pass rate, pass^k, cost and time, and writes
    `suite-<timestamp>/suite.md`. You can narrow the run:
    - `--name GLOB` and `--category GLOB` select scenarios (both repeatable).
-   - `--repeat N` and `--modes guided` change the run settings.
+   - `--repeat N` and `--modes guided,free` change the run settings. The default is one
+     free-mode conversation per scenario; `guided` adds every planned path (recovery,
+     boundary, policy), and `--repeat` repeats each one for pass^k.
    - `--models judge=anthropic:claude-opus-5` changes a model.
    - `--list` shows what would run, with the resolved settings, and runs nothing.
    - `--dry-run` uses no LLM at all.
@@ -123,8 +125,8 @@ highest:
 
 Run settings (`repeat`, `modes`, `judge_votes`, `concurrency`) follow the same ladder, with
 `roles/judge.md`'s `votes` as the layer of `judge_votes` above the built-in default. A value
-the scenario file sets itself (most pantry scenarios set `repeat` and `judge_votes`) wins over
-`config.yaml` and the role files.
+the scenario file sets itself wins over `config.yaml` and the role files. The pantry scenarios
+set none, so `config.yaml` and `roles/judge.md` decide for them.
 
 `mcpsim config` (or `run.sh config`) prints every role's model and the layer it came from, a
 `note:` for every role-file value that a higher layer shadows, the run settings and the

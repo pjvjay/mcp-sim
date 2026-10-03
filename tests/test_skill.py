@@ -16,7 +16,13 @@ from mcpsim.agent import build_agent_system_prompt
 from mcpsim.judge import VERDICT_TOOL, judge
 from mcpsim.plan import Path as PlanPath
 from mcpsim.plan import Step
-from mcpsim.scenario import DEFAULT_CATEGORY, DEFAULT_MODELS, MODEL_ROLES, parse_scenario
+from mcpsim.scenario import (
+    DEFAULT_CATEGORY,
+    DEFAULT_MODELS,
+    MODEL_ROLES,
+    load_scenario,
+    parse_scenario,
+)
 from mcpsim.skill import (
     BUILTIN,
     CHECKOUT_DIR,
@@ -113,7 +119,7 @@ def test_the_bundled_config_runs_defaults_and_sources(tmp_path: Path) -> None:
     run = skill.resolve_run("x", "y")
     assert {k: s.value for k, s in run.items()} == {
         "repeat": 1,
-        "modes": ["guided", "free"],
+        "modes": ["free"],
         "judge_votes": 3,
         "concurrency": 2,
     }
@@ -125,6 +131,22 @@ def test_the_bundled_config_runs_defaults_and_sources(tmp_path: Path) -> None:
     assert sources[0].path == str(repo / "scenarios" / "pantry")
     first_two = [f.name for f in sources[0].files][:2]
     assert first_two == ["cheapest-penne.yaml", "label-submission.yaml"]
+
+
+def test_the_bundled_skill_gives_each_pantry_scenario_one_free_run() -> None:
+    """The pantry scenarios set no run settings, so config.yaml and roles/judge.md decide: one
+    free-mode conversation per scenario, judged by three votes."""
+    skill = load_skill()
+    files = sorted((CHECKOUT_DIR.parent.parent / "scenarios" / "pantry").glob("*.yaml"))
+    assert len(files) == 6
+    for path in files:
+        run = skill.resolve(load_scenario(path)).run
+        assert (run["repeat"].value, run["repeat"].source) == (1, "config.yaml run"), path.name
+        assert (run["modes"].value, run["modes"].source) == (["free"], "config.yaml run"), path.name
+        assert (run["judge_votes"].value, run["judge_votes"].source) == (
+            3,
+            "roles/judge.md",
+        ), path.name
 
 
 # --- skill_dir resolution ---------------------------------------------------------------------

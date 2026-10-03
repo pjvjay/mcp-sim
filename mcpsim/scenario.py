@@ -90,13 +90,56 @@ with warnings.catch_warnings():
             return self
 
 
+# ``${NAME}`` / ``${NAME:-default}`` in a stdio server's fields (StdioSpec). Braces are required,
+# unlike config.yaml's scenario sources, so a literal ``$`` in an env value stays as written.
+_BRACED_ENV_REF = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}")
+
+
+def expand_braced_env(text: str, where: str) -> str:
+    """``text`` with every ``${NAME}`` / ``${NAME:-default}`` replaced from the environment (an
+    empty value counts as unset, as in config.yaml). Raises ``ValueError`` naming ``where`` when
+    a variable is unset and has no default."""
+    missing: list[str] = []
+
+    def replace(m: re.Match[str]) -> str:
+        value = os.environ.get(m.group(1), "")
+        if value:
+            return value
+        if m.group(2) is not None:
+            return m.group(2)
+        missing.append(m.group(1))
+        return ""
+
+    expanded = _BRACED_ENV_REF.sub(replace, text)
+    if missing:
+        raise ValueError(
+            f"{where}: {', '.join(missing)} is not set (set it, or write ${{NAME:-default}})"
+        )
+    return expanded
+
+
 class StdioSpec(_Strict):
-    """Launch the server as a subprocess speaking MCP over stdio."""
+    """Launch the server as a subprocess speaking MCP over stdio.
+
+    ``command``, ``args``, the ``env`` values and ``setup`` may read the environment as
+    ``${NAME}`` or ``${NAME:-default}``. They are expanded when the scenario loads, so
+    ``scenario.json`` records what ran. A relative path resolves against the directory mcpsim
+    runs in, as the subprocess sees it.
+    """
 
     command: str
     args: list[str] = Field(default_factory=list)
     env: dict[str, str] = Field(default_factory=dict)
     setup: str | None = None
+
+    @model_validator(mode="after")
+    def _expand_env(self) -> StdioSpec:
+        self.command = expand_braced_env(self.command, "command")
+        self.args = [expand_braced_env(a, f"args[{i}]") for i, a in enumerate(self.args)]
+        self.env = {k: expand_braced_env(v, f"env.{k}") for k, v in self.env.items()}
+        if self.setup is not None:
+            self.setup = expand_braced_env(self.setup, "setup")
+        return self
 
 
 class HttpSpec(_Strict):

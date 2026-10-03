@@ -40,7 +40,9 @@ An **execution plan** sits between the scenario and the runs: the planner reads 
 the live catalog and writes an ordered set of **paths** (happy, recovery, alternative, boundary,
 policy), each a list of steps and judge checkpoints. Plans are JSON on disk; review them, edit
 them, re-run them. Every path runs in `guided` mode (the agent sees the steps as a suggestion);
-the happy path also runs in `free` mode (does the agent *find* the route on its own).
+the happy path also runs in `free` mode (does the agent *find* the route on its own). The
+simulate skill's bundled settings keep only the `free` run, one conversation per scenario;
+`--modes guided,free` adds every path.
 
 ## Architecture
 
@@ -126,27 +128,28 @@ expected-behaviour bullets the judge grades one by one; none names a model:
 
 They launch the pantry MCP server over stdio in `DEMO_MODE=1` (deterministic stand-ins for the
 server's own LLM calls, so a simulation costs only the simulation's tokens) against a throwaway
-SQLite file, and seed it once per scenario with the `setup` command. **The paths are absolute
-and machine-specific**; to run them elsewhere change these three lines in each file (or
-`sed` them all at once):
+SQLite file, and seed it once per scenario with the `setup` command. The paths come from the
+environment, so the files work on any machine:
 
 ```yaml
 server:
   stdio:
-    command: /Users/paulvijayakumar/Documents/workspace/pantry-platform/pantry-api/.venv/bin/pantry-mcp
+    command: ${PANTRY_API_HOME:-../pantry-platform/pantry-api}/.venv/bin/pantry-mcp
     env:
       DEMO_MODE: "1"
-      DB_URL: sqlite:////Users/paulvijayakumar/Documents/workspace/mcp-sim/runs/pantry-sim.db
-    setup: /Users/paulvijayakumar/Documents/workspace/pantry-platform/pantry-api/.venv/bin/python -m pantry_planner.db seed
-```
-
-```bash
-sed -i '' 's#/Users/paulvijayakumar/Documents/workspace/pantry-platform/pantry-api#/your/pantry-api#g; s#/Users/paulvijayakumar/Documents/workspace/mcp-sim#/your/mcp-sim#g' scenarios/pantry/*.yaml
+      DB_URL: sqlite:///${PANTRY_SIM_DB:-/tmp/mcpsim-pantry-sim.db}
+    setup: ${PANTRY_API_HOME:-../pantry-platform/pantry-api}/.venv/bin/python -m pantry_planner.db seed
 ```
 
 `command` is the `pantry-mcp` console script from pantry-api's own venv, `DB_URL` any SQLite
-path you are happy to wipe (`runs/` is git-ignored), and `setup` runs once before the first run
-of a scenario with the same `env` applied.
+path you are happy to wipe, and `setup` runs once before the first run of a scenario with the
+same `env` applied. The defaults fit the usual layout: pantry-platform next to this checkout,
+and mcpsim run from this checkout (a relative path resolves against the directory mcpsim runs
+in). Otherwise set `PANTRY_API_HOME` to the pantry-api checkout; `skills/simulate/scripts/run.sh`
+sets and exports it for you. A stdio server's `command`, `args`, `env` values and `setup` all
+accept `${NAME}` and `${NAME:-default}`, expanded when the scenario loads (so `scenario.json`
+records the real paths); a variable that is unset and has no default is a load error naming the
+field. Braces are required, so a literal `$` in an env value stays as written.
 
 Each scenario also scopes the agent's tools (see Disclosure): the five read-only personas deny
 `submit_*` and `review_*` and disclose progressively, so a lookup starts with a handful of
@@ -624,9 +627,10 @@ overrides:
 
 **Run settings.** `repeat`, `modes`, `judge_votes` and `concurrency` follow the same ladder
 (built-in < the judge file's `votes` < `config.yaml` `run` < matching overrides < the scenario
-file < `--repeat` and `--mode` / `--modes`; `mcpsim judge --votes` for a re-judge). The bundled defaults are repeat 1, modes guided and
-free, two runs in flight (`config.yaml` `run`) and three judge votes (`roles/judge.md`'s
-`votes`, which `config.yaml` leaves live). The `scenario.json` of each run records the
+file < `--repeat` and `--mode` / `--modes`; `mcpsim judge --votes` for a re-judge). The bundled defaults are repeat 1, mode
+free only (one conversation per scenario; `--modes guided,free` adds every planned path), two
+runs in flight (`config.yaml` `run`) and three judge votes (`roles/judge.md`'s `votes`, which
+`config.yaml` leaves live). The pantry scenarios set none of these themselves. The `scenario.json` of each run records the
 resolved models and settings, so a re-judge uses what actually ran.
 
 **Prompts.** Each role file is YAML frontmatter (`role`, `provider`, `model`, optional

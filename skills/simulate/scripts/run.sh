@@ -15,7 +15,10 @@
 #   MCPSIM_HOME          the mcp-sim checkout (default: two levels above this skill)
 #   WORKSPACE            where the other repositories live (default: the parent of MCPSIM_HOME)
 #   PANTRY_GATEWAY_HOME  pantry-gateway checkout (default $WORKSPACE/pantry-gateway)
-#   PANTRY_API_HOME      pantry-api checkout (default $WORKSPACE/pantry-platform/pantry-api)
+#   PANTRY_API_HOME      pantry-api checkout (default $WORKSPACE/pantry-platform/pantry-api); exported,
+#                        the stdio pantry scenarios launch its pantry-mcp from there
+#   PANTRY_SIM_DB        the stdio pantry scenarios' throwaway SQLite file
+#                        (default /tmp/mcpsim-pantry-sim.db)
 #   PANTRY_API_URL       the pantry API (default http://127.0.0.1:8000)
 #   CF_URL               ContextForge (default http://127.0.0.1:4444)
 #   FETCH_URL            the fetch server (default http://127.0.0.1:9100)
@@ -42,7 +45,7 @@ if [ -z "${MCPSIM_HOME:-}" ]; then
 fi
 WORKSPACE=${WORKSPACE:-$(cd "$MCPSIM_HOME/.." && pwd)}
 PANTRY_GATEWAY_HOME=${PANTRY_GATEWAY_HOME:-$WORKSPACE/pantry-gateway}
-PANTRY_API_HOME=${PANTRY_API_HOME:-$WORKSPACE/pantry-platform/pantry-api}
+export PANTRY_API_HOME=${PANTRY_API_HOME:-$WORKSPACE/pantry-platform/pantry-api}
 PANTRY_API_URL=${PANTRY_API_URL:-http://127.0.0.1:8000}
 CF_URL=${CF_URL:-http://127.0.0.1:4444}
 FETCH_URL=${FETCH_URL:-http://127.0.0.1:9100}
