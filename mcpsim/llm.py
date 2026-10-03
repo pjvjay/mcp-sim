@@ -21,8 +21,8 @@ import asyncio
 import json
 import os
 import random
-from collections.abc import Awaitable, Callable, Mapping
-from typing import Any, Protocol
+from collections.abc import Awaitable, Callable, Iterable, Mapping
+from typing import Any, Protocol, TypedDict
 
 import anthropic
 import httpx
@@ -52,11 +52,23 @@ DEFAULT_OLLAMA_KEEP_ALIVE = "30m"
 # Rendered after "Cost is an ..." in report.md, hence the leading noun.
 LOCAL_COST_NOTE = "estimate; local model(s) via Ollama cost 0 (no API spend)"
 
-# USD per million tokens (input, output). These are estimates and the report says so.
+# USD per million tokens (input, output): Anthropic's first-party list prices (as of 2026-09),
+# matched by longest prefix (:func:`rate_for`), so ``claude-opus-5-5`` has its own row and a
+# dated id such as ``claude-haiku-4-5-20251001`` finds its family. Cache and batch discounts
+# are not modelled; these are estimates and the report says so. A model missing here costs 0
+# and its budget is not enforced (:func:`unpriced_models` names it so the runner can warn).
 RATE_TABLE: dict[str, tuple[float, float]] = {
-    "claude-sonnet-5-5": (3.0, 15.0),
-    "claude-opus-5-5": (15.0, 75.0),
-    "claude-fable-5-1": (15.0, 75.0),
+    "claude-fable-5-1": (10.0, 50.0),
+    "claude-fable-5": (10.0, 50.0),
+    "claude-mythos-5-1": (10.0, 50.0),
+    "claude-opus-5-5": (4.0, 20.0),
+    "claude-opus-5": (5.0, 25.0),
+    "claude-opus-4-8": (5.0, 25.0),
+    "claude-opus-4-7": (5.0, 25.0),
+    "claude-opus-4-6": (5.0, 25.0),
+    "claude-sonnet-5-5": (2.0, 10.0),
+    "claude-sonnet-5": (2.0, 10.0),
+    "claude-sonnet-4-6": (3.0, 15.0),
     "claude-haiku-4-5": (1.0, 5.0),
 }
 KNOWN_MODELS: tuple[str, ...] = (
@@ -105,6 +117,9 @@ class LLMResponse(BaseModel):
 
 
 class LLM(Protocol):
+    """``temperature`` is passed only when a role file sets one (see :func:`sampling`), so an
+    implementation that never needs it may leave it out of its signature."""
+
     async def complete(
         self,
         *,
@@ -114,7 +129,38 @@ class LLM(Protocol):
         tools: list[dict[str, Any]] | None = None,
         tool_choice: dict[str, Any] | None = None,
         max_tokens: int = DEFAULT_MAX_TOKENS,
+        temperature: float | None = None,
     ) -> LLMResponse: ...
+
+
+# Anthropic models that answer 400 to a sampling parameter (temperature / top_p / top_k): the
+# Claude Opus 4.7+ and 5 family, Sonnet 5 / 5.5 (non-default values), Fable and Mythos.
+NO_SAMPLING_PREFIXES: tuple[str, ...] = (
+    "claude-opus-4-7",
+    "claude-opus-4-8",
+    "claude-opus-5",
+    "claude-sonnet-5",
+    "claude-fable-",
+    "claude-mythos-",
+)
+
+
+def rejects_sampling(model: str) -> bool:
+    """Does this Anthropic model id reject ``temperature``?"""
+    _, name = parse_model_spec(model)
+    return name.startswith(NO_SAMPLING_PREFIXES)
+
+
+class Sampling(TypedDict, total=False):
+    """The optional sampling keyword arguments of :meth:`LLM.complete`."""
+
+    temperature: float
+
+
+def sampling(temperature: float | None) -> Sampling:
+    """``{"temperature": t}`` when a role sets one, else nothing: the keyword arguments a call
+    site adds to :meth:`LLM.complete`."""
+    return Sampling() if temperature is None else Sampling(temperature=float(temperature))
 
 
 def parse_model_spec(spec: str) -> tuple[str, str]:
@@ -162,6 +208,18 @@ def estimate_cost_usd(model: str, usage: Usage) -> float:
         return 0.0
     rate_in, rate_out = rates
     return (usage.input_tokens * rate_in + usage.output_tokens * rate_out) / 1_000_000
+
+
+def unpriced_models(specs: Iterable[str]) -> list[str]:
+    """The Anthropic models among ``specs`` that :data:`RATE_TABLE` has no price for: their
+    calls are costed at 0, so the reported cost is short and ``budgets.max_cost_usd`` never
+    trips on them. Local models are free by design and are not listed."""
+    found: list[str] = []
+    for spec in specs:
+        provider, name = parse_model_spec(spec)
+        if provider == ANTHROPIC and rate_for(spec) is None and name not in found:
+            found.append(name)
+    return found
 
 
 def total_cost_usd(usage_by_model: dict[str, Usage]) -> float:
@@ -255,6 +313,7 @@ class AnthropicLLM:
         tools: list[dict[str, Any]] | None = None,
         tool_choice: dict[str, Any] | None = None,
         max_tokens: int = DEFAULT_MAX_TOKENS,
+        temperature: float | None = None,
     ) -> LLMResponse:
         _, model_id = parse_model_spec(model)
         kwargs: dict[str, Any] = {
@@ -263,6 +322,8 @@ class AnthropicLLM:
             "system": system,
             "messages": messages,
         }
+        if temperature is not None:
+            kwargs["temperature"] = temperature
         if tools:
             kwargs["tools"] = tools
         if tool_choice is not None:
@@ -591,8 +652,10 @@ class OllamaLLM:
         tools: list[dict[str, Any]] | None,
         tool_choice: dict[str, Any] | None,
         max_tokens: int,
+        temperature: float | None = None,
     ) -> dict[str, Any]:
-        """The ``/api/chat`` body for one call (pure; tests inspect it)."""
+        """The ``/api/chat`` body for one call (pure; tests inspect it). Temperature is 0
+        unless a role sets one."""
         forced = forced_tool(tools, tool_choice)
         if forced is not None:
             hint = (
@@ -611,7 +674,7 @@ class OllamaLLM:
             "stream": False,
             "keep_alive": self.keep_alive,
             "options": {
-                "temperature": 0,
+                "temperature": 0 if temperature is None else temperature,
                 "num_ctx": self.num_ctx,
                 "num_predict": max_tokens,
             },
@@ -709,6 +772,7 @@ class OllamaLLM:
         tools: list[dict[str, Any]] | None = None,
         tool_choice: dict[str, Any] | None = None,
         max_tokens: int = DEFAULT_MAX_TOKENS,
+        temperature: float | None = None,
     ) -> LLMResponse:
         _, model_id = parse_model_spec(model)
         forced = forced_tool(tools, tool_choice)
@@ -719,6 +783,7 @@ class OllamaLLM:
             tools=tools,
             tool_choice=tool_choice,
             max_tokens=max_tokens,
+            temperature=temperature,
         )
         try:
             async with asyncio.timeout(self.deadline):
@@ -802,6 +867,7 @@ class RoutingLLM:
         tools: list[dict[str, Any]] | None = None,
         tool_choice: dict[str, Any] | None = None,
         max_tokens: int = DEFAULT_MAX_TOKENS,
+        temperature: float | None = None,
     ) -> LLMResponse:
         provider, _ = parse_model_spec(model)
         return await self._factory(provider).complete(
@@ -811,6 +877,7 @@ class RoutingLLM:
             tools=tools,
             tool_choice=tool_choice,
             max_tokens=max_tokens,
+            **sampling(temperature),
         )
 
 

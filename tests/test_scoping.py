@@ -413,7 +413,7 @@ def test_initial_tools_for_the_rest_of_the_pantry_suite(catalog: Catalog) -> Non
 # --- the committed pantry scenarios -----------------------------------------------------------
 
 
-def test_pantry_scenarios_scope_their_tools_and_route_planning_locally(catalog: Catalog) -> None:
+def test_pantry_scenarios_scope_their_tools_and_keep_the_hosted_defaults(catalog: Catalog) -> None:
     read_only = (
         "cheapest-penne",
         "misspelled-country",
@@ -450,5 +450,7 @@ def test_pantry_scenarios_scope_their_tools_and_route_planning_locally(catalog: 
 
     for name in (*read_only, "label-submission"):
         models = pantry_scenario(name).models
-        assert models.planner == "ollama:command-r7b", name
+        # Every role on the Anthropic defaults: no scenario routes a call to a local model.
+        assert models.planner == "claude-opus-5-5", name
         assert (models.agent, models.judge) == (DEFAULT_AGENT_MODEL, DEFAULT_JUDGE_MODEL), name
+        assert models.explicit() == {}, f"{name} names no model of its own"

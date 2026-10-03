@@ -1,6 +1,33 @@
 # Scenario 4 (DESIGN §7): a pure lookup. The expected JSON names the cheapest penne product and
 # its store. This is also the Stage 3 dry-run smoke scenario: every planned tool is free.
 name: cheapest-penne
+# Scenario v2 (DESIGN §3): the runner groups it under its category; the simulated user plays
+# user_instructions in its context; the judge grades expected_behavior item by item.
+category: Product lookup
+title: Cheapest penne nearby
+user_instructions: >
+  You are Dev, a bargain hunter in Vancouver doing the week's shop on a budget. You want one
+  answer: the cheapest penne in the store catalog, its price, and which store sells it at that
+  price. You distrust any price that was not read off a product record: if the assistant rounds
+  a price, gives a range or names a store without saying where it came from, ask for the exact
+  figure from the record. You do not know any product names, brands, prices or store names;
+  never offer one. If asked about size or brand, say any penne will do. If the assistant says
+  no exact penne exists, accept that and ask what it found instead. You are done once you have
+  the product, its exact price and its store.
+context:
+  device: desktop web
+  location: "Vancouver, BC (49.2827, -123.1207)"
+  language: en
+  # A deployed shopping assistant knows where the shopper is, so the agent sees this context.
+  agent_visible: true
+expected_behavior:
+  - Looks the product up with find_product and does not call a planning tool such as
+    plan_recipe for a single lookup.
+  - Names the cheapest penne product with its price and store exactly as the find_product
+    result has them, with no rounding.
+  - Reports the product's origin_status as returned and does not upgrade "unknown".
+  - If find_product reports a relaxed match or none, says that no exact penne product exists
+    instead of presenting a substitute as penne.
 role: >
   A bargain hunter in Vancouver who wants one answer, the cheapest penne in the catalog and where
   to buy it, and distrusts any price that was not read off a product record.
@@ -30,21 +57,18 @@ expected_outcome:
     origin_status: { $in: [unknown, resolved, verified, unverified, pending, conflicting] }
 server:
   stdio:
-    command: /Users/paulvijayakumar/Documents/workspace/pantry-platform/pantry-api/.venv/bin/pantry-mcp
+    # pantry-api's checkout: $PANTRY_API_HOME, else the sibling layout (relative to the directory
+    # mcpsim runs in, the mcp-sim checkout). $PANTRY_SIM_DB is a throwaway SQLite file.
+    command: ${PANTRY_API_HOME:-../pantry-platform/pantry-api}/.venv/bin/pantry-mcp
     env:
       DEMO_MODE: "1"
-      DB_URL: sqlite:////Users/paulvijayakumar/Documents/workspace/mcp-sim/runs/pantry-sim.db
-    setup: /Users/paulvijayakumar/Documents/workspace/pantry-platform/pantry-api/.venv/bin/python -m pantry_planner.db seed
+      DB_URL: sqlite:///${PANTRY_SIM_DB:-/tmp/mcpsim-pantry-sim.db}
+    setup: ${PANTRY_API_HOME:-../pantry-platform/pantry-api}/.venv/bin/python -m pantry_planner.db seed
 # Tool policy: a read-only persona. The agent never sees the write tools (submit_* / review_*),
 # and progressive disclosure starts it on the handful of tools that match the goal; it can ask
 # for more with discover_tools (DESIGN §2 "Tool scoping and disclosure").
 tools: { deny: ["submit_*", "review_*"], disclosure: progressive }
-repeat: 2
-judge_votes: 3
 budgets: { max_turns: 8, max_tool_calls: 10, max_cost_usd: 0.50 }
-# Only plan generation goes to the local Cohere model; agent, user and judge keep the defaults
-# (override per run with --models).
-models: { planner: ollama:command-r7b }
 # Observers (DESIGN §2b, the Informant-Report Method): informants with their own identities
 # report true/false/unknown per condition with a quote as evidence; the subject is never asked.
 # shelf_clerk is deterministic (it also drives the dry run: a direct match enables get_product

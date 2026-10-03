@@ -4,9 +4,13 @@
 catalog's schemas. Every ``tool_use`` block is executed through the
 :class:`~mcpsim.mcpclient.Session` and returned as a ``tool_result`` block (structured content
 as JSON, text passed through,
-``is_error`` preserved). A :class:`SimulatedUser` plays the scenario's *role*: it opens the
-conversation in the role's voice and answers clarifying questions, never volunteering more than
-the scenario gives it. The run ends when the agent delivers a ``final_result`` block (outcome
+``is_error`` preserved). A :class:`SimulatedUser` plays the scenario's ``user_instructions`` in
+its ``context`` (device, location, language; DESIGN §3 "Scenario v2"): it opens the
+conversation in that person's voice and answers clarifying questions, never volunteering more
+than its instructions give it. The agent's system prompt carries role, goal and instructions,
+the scenario's standard operating procedure (``agent.skill``, delimited) and ``agent.notes``,
+and the context only when ``context.agent_visible``; never the user's instructions or the
+judge's expected behaviour. The run ends when the agent delivers a ``final_result`` block (outcome
 ``completed``), when a budget is exhausted (``budget_exceeded``) or when the session or the LLM
 raises (``error``). A run never raises for any of those; the :class:`~mcpsim.transcript.Transcript`
 carries the reason.
@@ -55,11 +59,12 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from typing import Any
 
-from mcpsim.llm import DEFAULT_MAX_TOKENS, LLM, Usage, total_cost_usd
+from mcpsim.llm import DEFAULT_MAX_TOKENS, LLM, Usage, sampling, total_cost_usd
 from mcpsim.matcher import MISSING, resolve
-from mcpsim.mcpclient import Catalog, Session, ToolResult
+from mcpsim.mcpclient import Catalog, Session, ToolResult, describe_exception
 from mcpsim.observers import ObserverRunner
 from mcpsim.plan import Mode, Path, Step, StepReference, parse_reference
+from mcpsim.prompt_template import Value
 from mcpsim.scenario import Scenario, Trigger
 from mcpsim.scoping import (
     DISCOVER_LIMIT,
@@ -71,6 +76,7 @@ from mcpsim.scoping import (
     rank_tools,
     tokens,
 )
+from mcpsim.skill import SkillRef, load_skill, role_of
 from mcpsim.transcript import (
     AssistantEvent,
     EndEvent,
@@ -183,20 +189,15 @@ def readable_sketch(step: Step) -> str:
     return json.dumps(shown, sort_keys=True, ensure_ascii=False)
 
 
-def steps_section(path: Path) -> str:
-    """The "Suggested approach" section a ``guided`` run adds to the agent's system prompt.
+def step_lines(path: Path) -> str:
+    """The path's steps as the agent's ``Suggested approach`` lists them (guided mode).
 
     References render as ``<from step n: path>`` (take the value from that step's result) and
     ``expect_error`` steps say the server is expected to reject the call, so the agent knows
     the error is the point of the step and must read it rather than treat it as a dead end.
+    Empty when the path has no steps.
     """
-    lines = [
-        "## Suggested approach",
-        "The following steps are one way to reach the goal. Treat them as guidance: adapt when",
-        "the server responds differently, and skip anything that turns out not to be needed.",
-        "An argument written <from step n: path> means: take that value from the result of",
-        "step n (path is dotted; [*] means every element).",
-    ]
+    lines: list[str] = []
     for n, step in enumerate(path.steps, start=1):
         line = f"{n}. {step.intent.strip()}"
         if step.tool:
@@ -212,110 +213,85 @@ def steps_section(path: Path) -> str:
         if step.success_looks_like.strip():
             line += f" — success looks like: {step.success_looks_like.strip()}"
         lines.append(line)
-    if not path.steps:
-        lines.append("(the plan lists no steps for this path)")
     return "\n".join(lines)
 
 
-def answer_contract(scenario: Scenario) -> str:
-    fields = expected_top_level_keys(scenario.expected_outcome.json)
-    if fields:
-        fields_line = "The object must include these fields: " + ", ".join(
-            f"`{f}`" for f in fields
-        )
-    else:
-        fields_line = "Choose the fields that best describe the outcome"
-    return "\n".join(
-        [
-            "## Answer contract",
-            "When you have everything you need, deliver your final answer in one message with no",
-            "tool calls: a short plain-language summary for the person, followed by a fenced code",
-            f"block that starts with ```json {FINAL_RESULT_NAME} and contains a single JSON",
-            f"object. {fields_line}. Use values exactly as the tools returned them (no rounding,",
-            "renaming or guessing). If you could not achieve the goal, say so plainly in the",
-            "summary and",
-            "still deliver the block, filling what you honestly can and using null for the rest.",
-        ]
-    )
+def answer_fields(scenario: Scenario) -> str:
+    """The expected-outcome keys the final answer must carry, backquoted (``"`a`, `b`"``), or
+    ``""`` when the scenario has no ``expected_outcome.json``."""
+    return ", ".join(f"`{f}`" for f in expected_top_level_keys(scenario.expected_outcome.json))
 
 
-def goals_section(goals: list[str]) -> str:
-    """The section the system prompt gains once observers have enabled goals (already prefixed
-    ``Goal enabled by observation (<observer>.<condition>): …`` by :class:`LiveRun`)."""
-    return "## Goals enabled by observation\n" + "\n".join(f"- {g}" for g in goals)
+def context_lines(scenario: Scenario) -> list[str]:
+    """``- device: desktop web`` lines for the scenario's context (empty when none is set)."""
+    return [f"- {label}: {value}" for label, value in scenario.context.items()]
 
 
-def agent_prompt_sections(
+def agent_prompt_variables(
     scenario: Scenario, path: Path, mode: Mode, goals: list[str] | None = None
-) -> list[str]:
-    """The agent's system prompt as sections; ``guided`` inserts exactly :func:`steps_section`,
-    and ``goals`` (enabled by observers so far) add :func:`goals_section` after the
-    instructions."""
-    instructions = (
-        "\n".join(f"- {item.strip()}" for item in scenario.instructions)
-        if scenario.instructions
-        else "(none beyond the goal)"
-    )
-    sections = [
-        "You are an assistant acting on behalf of a person, using the tools of an MCP server to "
-        "achieve their goal. The person talks to you; you may ask them a clarifying question when "
-        "the goal is genuinely ambiguous, but prefer using the tools. Every factual claim you make "
-        "must be supported by a tool result you received in this conversation; when the server "
-        "returns an error, read it and correct your request rather than guessing.",
-        f"## Who you are acting for\n{scenario.role.strip()}",
-        f"## Goal\n{scenario.goal.strip()}",
-        f"## Instructions you must follow\n{instructions}",
-    ]
-    if goals:
-        sections.append(goals_section(goals))
-    if mode == "guided":
-        sections.append(steps_section(path))
-    sections.append(answer_contract(scenario))
-    return sections
+) -> dict[str, Value]:
+    """Every value the agent's ``system`` prompt (``roles/agent.md``) reads; an absent section
+    is ``""``. The context is there only when ``context.agent_visible``; the simulated user's
+    instructions, the expected behaviour and the expected outcome prose never are (the agent
+    learns what the person wants from the person, and is not shown the judge's rubric)."""
+    spec = scenario.agent
+    visible = context_lines(scenario) if scenario.context.agent_visible else []
+    return {
+        "role": scenario.role.strip(),
+        "goal": scenario.goal.strip(),
+        "instructions": "\n".join(f"- {item.strip()}" for item in scenario.instructions),
+        "skill_name": (spec.skill_name or "inline") if spec.skill_text is not None else "",
+        "skill_text": (spec.skill_text or "").strip(),
+        "notes": spec.notes.strip() if spec.notes else "",
+        "context": "\n".join(visible),
+        "goals": "\n".join(f"- {g}" for g in goals or []),
+        "guided": mode == "guided",
+        "steps": step_lines(path) if mode == "guided" else "",
+        "answer_fields": answer_fields(scenario),
+        "final_result_name": FINAL_RESULT_NAME,
+    }
 
 
 def build_agent_system_prompt(
-    scenario: Scenario, path: Path, mode: Mode, goals: list[str] | None = None
+    scenario: Scenario,
+    path: Path,
+    mode: Mode,
+    goals: list[str] | None = None,
+    *,
+    skill: SkillRef = None,
 ) -> str:
-    return "\n\n".join(agent_prompt_sections(scenario, path, mode, goals))
+    """The agent's system prompt (``roles/agent.md``, prompt ``system``); rendered again every
+    turn with the goals observers have enabled so far."""
+    variables = agent_prompt_variables(scenario, path, mode, goals)
+    return role_of(skill, "agent").render("system", variables)
 
 
-def build_user_system_prompt(scenario: Scenario) -> str:
-    return "\n\n".join(
-        [
-            "You are playing a person in a simulation. The assistant you are talking to is an AI "
-            "agent under test; it will use tools on your behalf. Stay in character throughout and "
-            "never say that you are simulated.",
-            f"## Who you are\n{scenario.role.strip()}",
-            f"## What you want\n{scenario.goal.strip()}",
-            "## Rules\n"
-            "- Speak in the first person, in your own voice, in one to three sentences.\n"
-            "- Never volunteer facts, preferences or constraints beyond what is written above. "
-            "If the assistant asks about something not covered here, say you do not know or "
-            "tell it to use its best judgement and its tools.\n"
-            "- Do not do the assistant's work: do not suggest tool names, prices or answers.\n"
-            "- If the assistant seems to have finished without its structured "
-            f"`{FINAL_RESULT_NAME}` block, ask it to deliver its final answer with that block.\n"
-            "- Do not thank, praise or correct the assistant beyond what your character would say.",
-        ]
-    )
+def user_prompt_variables(scenario: Scenario) -> dict[str, Value]:
+    """Every value the simulated user's ``system`` prompt (``roles/user.md``) reads. The user
+    always gets the context, whatever ``agent_visible`` says; never the agent's role, goal,
+    instructions, SOP or notes, the expected behaviour or the expected outcome."""
+    return {
+        "user_instructions": scenario.simulated_user_instructions.strip(),
+        "context": "\n".join(context_lines(scenario)),
+        "language": (scenario.context.language or "").strip(),
+        "final_result_name": FINAL_RESULT_NAME,
+    }
 
 
-_OPEN_CUE = (
-    "Start the conversation: in your own words and voice, tell the assistant what you want. "
-    "Reply with only what you would say."
-)
-_FALLBACK_REPLY = "Please go ahead with what you have and give me your final answer."
-_EMPTY_AGENT_MESSAGE = "(the assistant sent an empty message)"
+def build_user_system_prompt(scenario: Scenario, *, skill: SkillRef = None) -> str:
+    """The simulated user's system prompt (``roles/user.md``, prompt ``system``)."""
+    return role_of(skill, "user").render("system", user_prompt_variables(scenario))
 
 
 class SimulatedUser:
-    """An LLM playing the scenario's role; keeps its own view of the conversation."""
+    """An LLM playing the person in ``user_instructions`` and ``context``; keeps its own view of
+    the conversation. Its prompts and settings come from ``roles/user.md``."""
 
-    def __init__(self, scenario: Scenario, llm: LLM, model: str) -> None:
+    def __init__(self, scenario: Scenario, llm: LLM, model: str, *, skill: SkillRef = None) -> None:
         self.scenario = scenario
         self.model = model
-        self.system = build_user_system_prompt(scenario)
+        self.role = role_of(skill, "user")
+        self.system = self.role.render("system", user_prompt_variables(scenario))
         self._llm = llm
         self._history: list[dict[str, Any]] = []
 
@@ -325,19 +301,22 @@ class SimulatedUser:
             model=self.model,
             system=self.system,
             messages=list(self._history),
-            max_tokens=USER_MAX_TOKENS,
+            max_tokens=self.role.tokens(USER_MAX_TOKENS),
+            **sampling(self.role.temperature),
         )
         text = response.text().strip() or fallback
         self._history.append({"role": "assistant", "content": text})
         return text, response.usage
 
     async def open(self) -> tuple[str, Usage]:
-        """The first message: the goal in the role's voice (the goal verbatim as a fallback)."""
-        return await self._say(_OPEN_CUE, self.scenario.goal.strip())
+        """The first message: what the person wants, in their voice (the goal verbatim as a
+        fallback)."""
+        return await self._say(self.role.render("opening"), self.scenario.goal.strip())
 
     async def reply(self, agent_text: str) -> tuple[str, Usage]:
         """Answer a clarifying question (or any non-final agent message), staying in role."""
-        return await self._say(agent_text.strip() or _EMPTY_AGENT_MESSAGE, _FALLBACK_REPLY)
+        prompt = agent_text.strip() or self.role.render("silent_agent")
+        return await self._say(prompt, self.role.render("fallback_reply"))
 
 
 # ---------------------------------------------------------------------------------------------
@@ -362,22 +341,21 @@ def tool_result_block(tool_use_id: str, result: ToolResult) -> dict[str, Any]:
 # tool disclosure
 
 
-def goal_note(goals: list[str]) -> str:
-    """The text block that carries goals an observer enabled mid-run to the agent."""
+def goal_note(goals: list[str], *, skill: SkillRef = None) -> str:
+    """The text block that carries goals an observer enabled mid-run to the agent
+    (``roles/agent.md``, prompt ``goal_note``)."""
     bullets = "\n".join(f"- {g.strip()}" for g in goals)
-    return (
-        "## Additional goal\n"
-        "The person's situation changed. In addition to the goal above, from now on also:\n"
-        f"{bullets}"
-    )
+    return role_of(skill, "agent").render("goal_note", goals=bullets)
 
 
-def user_content(primary: str | list[dict[str, Any]], goals: list[str]) -> Any:
+def user_content(
+    primary: str | list[dict[str, Any]], goals: list[str], *, skill: SkillRef = None
+) -> Any:
     """A user message's ``content``: the reply or tool results, plus any pending goal note."""
     if not goals:
         return primary
     blocks = [{"type": "text", "text": primary}] if isinstance(primary, str) else list(primary)
-    blocks.append({"type": "text", "text": goal_note(goals)})
+    blocks.append({"type": "text", "text": goal_note(goals, skill=skill)})
     return blocks
 
 
@@ -681,8 +659,7 @@ class _Run:
 
 
 def _describe(exc: BaseException) -> str:
-    text = str(exc).strip()
-    return f"{type(exc).__name__}: {text}" if text else type(exc).__name__
+    return describe_exception(exc)
 
 
 class StepReferenceError(LookupError):
@@ -856,6 +833,7 @@ async def run_path(
     catalog: Catalog | None = None,
     on_start: Callable[[LiveRun], None] | None = None,
     observer_llm: LLM | None = None,
+    skill: SkillRef = None,
 ) -> Transcript:
     """Run ``path`` once in ``mode`` and return the transcript (never raises for run failures).
 
@@ -865,15 +843,19 @@ async def run_path(
     is called with the :class:`LiveRun` handle after the initial disclosure and before the
     first turn (a hand-held observer keeps it to call ``offer_tools`` / ``enable_goal``).
     ``observer_llm`` serves the scenario's LLM observers (default: ``llm``); their usage counts
-    against ``max_cost_usd`` like the agent's.
+    against ``max_cost_usd`` like the agent's. ``skill`` supplies the agent's, the simulated
+    user's and the observers' prompts and settings (:mod:`mcpsim.skill`; default: the
+    ``MCPSIM_SKILL`` or packaged skill); it is loaded once, before the run starts.
     """
     if not dry_run and llm is None:
         raise ValueError("run_path needs an llm unless dry_run=True")
     run = _Run(scenario, path, mode, index)
+    loaded = load_skill(skill)
+    agent_role = loaded.role("agent")
     agent_model = DRY_RUN_MODEL if dry_run else scenario.models.agent
     user_model = DRY_RUN_MODEL if dry_run else scenario.models.user_model
-    agent_system = build_agent_system_prompt(scenario, path, mode)
-    user_system = build_user_system_prompt(scenario)
+    agent_system = build_agent_system_prompt(scenario, path, mode, skill=loaded)
+    user_system = build_user_system_prompt(scenario, skill=loaded)
     run.transcript.add(
         SystemEvent(
             scenario=scenario.name,
@@ -897,11 +879,13 @@ async def run_path(
         catalog = catalog.filtered(scenario.tools.allow, scenario.tools.deny)
         scope = ToolScope(scenario, catalog, run.transcript)
         scope.disclose_initial(path, mode)
-        observers = ObserverRunner(scenario, observer_llm if observer_llm is not None else llm)
+        observers = ObserverRunner(
+            scenario, observer_llm if observer_llm is not None else llm, skill=loaded
+        )
         live = LiveRun(scope, run.transcript, observers)
         if on_start is not None:
             on_start(live)
-        user = SimulatedUser(scenario, llm, user_model)
+        user = SimulatedUser(scenario, llm, user_model, skill=loaded)
 
         opening, usage = await user.open()
         run.transcript.add(UserEvent(text=opening))
@@ -909,7 +893,7 @@ async def run_path(
         if reason is not None:
             return run.end("budget_exceeded", reason)
         messages: list[dict[str, Any]] = [
-            {"role": "user", "content": user_content(opening, live.take_goals())}
+            {"role": "user", "content": user_content(opening, live.take_goals(), skill=loaded)}
         ]
 
         while True:
@@ -918,10 +902,11 @@ async def run_path(
                 return run.end("budget_exceeded", reason)
             response = await llm.complete(
                 model=agent_model,
-                system=build_agent_system_prompt(scenario, path, mode, live.goals),
+                system=build_agent_system_prompt(scenario, path, mode, live.goals, skill=loaded),
                 messages=list(messages),
                 tools=scope.definitions() or None,
-                max_tokens=DEFAULT_MAX_TOKENS,
+                max_tokens=agent_role.tokens(DEFAULT_MAX_TOKENS),
+                **sampling(agent_role.temperature),
             )
             run.turns += 1
             text = response.text()
@@ -961,7 +946,10 @@ async def run_path(
                 if reason is not None:
                     return run.end("budget_exceeded", reason)
                 messages.append(
-                    {"role": "user", "content": user_content(results, live.take_goals())}
+                    {
+                        "role": "user",
+                        "content": user_content(results, live.take_goals(), skill=loaded),
+                    }
                 )
                 continue
 
@@ -982,6 +970,8 @@ async def run_path(
             reason = run.record_usage(user_model, usage)
             if reason is not None:
                 return run.end("budget_exceeded", reason)
-            messages.append({"role": "user", "content": user_content(reply, live.take_goals())})
+            messages.append(
+                {"role": "user", "content": user_content(reply, live.take_goals(), skill=loaded)}
+            )
     except Exception as exc:  # noqa: BLE001 - a run never crashes; the reason is recorded
         return run.end("error", _describe(exc))

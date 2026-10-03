@@ -27,10 +27,13 @@ run). Otherwise every LLM comes from :func:`make_llm_for`, which reads ``scenari
 (``provider:model``, see docs/LOCAL_MODELS.md) and asks :func:`mcpsim.llm.make_llm` for that
 provider's cached client.
 
-``model_overrides`` / ``allow_same_judge`` (the CLI's ``--models`` and ``--allow-same-judge``)
-are applied with :func:`apply_model_overrides` right after the scenario is loaded, so scenario
-files stay provider-neutral and the ``scenario.json`` written to the run directory records the
-models that actually ran.
+The simulate skill (:mod:`mcpsim.skill`: ``--skill DIR``, else ``MCPSIM_SKILL``, else the
+packaged ``skills/simulate``) supplies every role's prompts and settings, and resolves each
+scenario right after it is loaded (:meth:`mcpsim.skill.Skill.apply`): models by the precedence
+built-in < role frontmatter < ``config.yaml`` defaults < matching overrides < the scenario file
+< ``model_overrides`` (the CLI's ``--models``), and ``repeat`` / ``modes`` / ``judge_votes`` /
+``concurrency`` by the same ladder. The ``scenario.json`` written to the run directory records
+what actually ran, so a re-judge reads the resolved models and votes from it.
 """
 
 from __future__ import annotations
@@ -40,10 +43,11 @@ import os
 import shlex
 import subprocess
 import sys
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping, Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path as FsPath
-from typing import Literal
+from typing import Any, Literal
 
 from mcpsim.agent import DRY_RUN_MODEL, run_path
 from mcpsim.judge import check_judge_model, judge, judge_deterministic
@@ -55,14 +59,16 @@ from mcpsim.llm import (
     is_local_model,
     make_llm,
     parse_model_spec,
+    unpriced_models,
 )
-from mcpsim.mcpclient import Catalog, Session, connect
+from mcpsim.mcpclient import Catalog, Session, connect, describe_exception, sole_leaf
 from mcpsim.observers import ObserverRunner
 from mcpsim.plan import MODES, ExecutionPlan, Mode, Path
 from mcpsim.planner import plan as plan_paths
 from mcpsim.planner import planner_profile
 from mcpsim.report import (
     Report,
+    SuiteError,
     SuiteReport,
     aggregate,
     aggregate_suite,
@@ -71,8 +77,19 @@ from mcpsim.report import (
     summary_line,
 )
 from mcpsim.report import exit_code as report_exit_code
-from mcpsim.scenario import MODEL_ROLES, Models, Observer, Scenario, load_scenario
+from mcpsim.scenario import MODEL_ROLES, Models, Observer, Scenario, ScenarioError, load_scenario
 from mcpsim.scout import PROBE_RESERVE, SCOUT_FILE, ScoutResult, scout, should_scout
+from mcpsim.skill import (
+    Resolved,
+    ScenarioEntry,
+    Skill,
+    SkillError,
+    SkillRef,
+    load_entries,
+    load_skill,
+    one_line,
+    select_entries,
+)
 from mcpsim.transcript import EndEvent, SystemEvent, Transcript
 from mcpsim.verdict import Verdict
 
@@ -146,11 +163,15 @@ def apply_model_overrides(
     *,
     allow_same_judge: bool = False,
 ) -> Scenario:
-    """``--models`` / ``--allow-same-judge`` applied to a loaded scenario (a validated copy).
+    """``--models`` / ``--allow-same-judge`` applied to a loaded scenario (a validated copy),
+    without the simulate skill's layers.
 
-    ``overrides`` maps a role (``planner`` / ``agent`` / ``judge`` / ``user``) to a model spec;
-    ``allow_same_judge=True`` sets ``models.allow_same_judge`` (it never resets a scenario's own
-    ``true``). Unknown roles raise ``ValueError``.
+    The runner itself resolves through :meth:`mcpsim.skill.Skill.apply` (:func:`prepare_scenario`),
+    where ``--models`` is the top of the precedence; this helper stays for library callers that
+    only want the overrides. ``overrides`` maps a role (``planner`` / ``agent`` / ``judge`` /
+    ``user`` / ``observer``) to a model spec; ``allow_same_judge=True`` sets
+    ``models.allow_same_judge`` (it never resets a scenario's own ``true``). Unknown roles raise
+    ``ValueError``.
     """
     overrides = dict(overrides or {})
     if not overrides and not allow_same_judge:
@@ -244,19 +265,23 @@ async def discover_catalog(scenario: Scenario) -> Catalog:
         return await session.catalog()
 
 
-def scout_observers(scenario: Scenario, *, dry_run: bool) -> ObserverRunner | None:
+def scout_observers(
+    scenario: Scenario, *, dry_run: bool, skill: SkillRef = None
+) -> ObserverRunner | None:
     """The observer runner the scout uses: code and group observers only in dry run, every
     observer (with its LLM) otherwise; ``None`` when no observer reports at ``scout``."""
     if not any("scout" in o.on for o in scenario.observers):
         return None
     if dry_run:
-        return ObserverRunner(scenario, None, include_llm=False)
+        return ObserverRunner(scenario, None, include_llm=False, skill=skill)
     needs_llm = any("scout" in o.on for o in llm_observers(scenario))
-    return ObserverRunner(scenario, make_llm_for(scenario, "observer") if needs_llm else None)
+    return ObserverRunner(
+        scenario, make_llm_for(scenario, "observer") if needs_llm else None, skill=skill
+    )
 
 
 async def discover_scout_and_plan(
-    scenario: Scenario, *, dry_run: bool
+    scenario: Scenario, *, dry_run: bool, skill: SkillRef = None
 ) -> tuple[Catalog, ScoutResult | None, ExecutionPlan]:
     """One session: discover the catalog, apply the tool policy, scout (unless disclosure is
     ``all``), and plan while the session is still open, so a local planner can probe one
@@ -269,9 +294,11 @@ async def discover_scout_and_plan(
         catalog = allowed_catalog(scenario, await session.catalog())
         scout_result = None
         if should_scout(scenario):
-            scout_result = await _scout(scenario, catalog, session, dry_run=dry_run)
+            scout_result = await _scout(scenario, catalog, session, dry_run=dry_run, skill=skill)
         try:
-            plan = await _plan(scenario, catalog, llm, scout_result=scout_result, session=session)
+            plan = await _plan(
+                scenario, catalog, llm, scout_result=scout_result, session=session, skill=skill
+            )
         except Exception as exc:  # noqa: BLE001 - re-raised below, outside the session
             # Raised inside the session, it would leave the stdio client's task group as an
             # ExceptionGroup; callers (and the CLI's messages) expect the PlanError itself.
@@ -283,14 +310,14 @@ async def discover_scout_and_plan(
 
 
 async def _scout(
-    scenario: Scenario, catalog: Catalog, session: Session, *, dry_run: bool
+    scenario: Scenario, catalog: Catalog, session: Session, *, dry_run: bool, skill: SkillRef = None
 ) -> ScoutResult:
     probes = not dry_run and planner_profile(scenario) == "local"
     result = await scout(
         scenario,
         catalog,
         session,
-        observers=scout_observers(scenario, dry_run=dry_run),
+        observers=scout_observers(scenario, dry_run=dry_run, skill=skill),
         reserve=PROBE_RESERVE if probes else 0,
     )
     _log(
@@ -348,10 +375,17 @@ async def _plan(
     *,
     scout_result: ScoutResult | None = None,
     session: Session | None = None,
+    skill: SkillRef = None,
 ) -> ExecutionPlan:
     """``llm`` is ``None`` exactly in a dry run."""
     plan = await plan_paths(
-        scenario, catalog, llm, scout=scout_result, dry_run=llm is None, probe_session=session
+        scenario,
+        catalog,
+        llm,
+        scout=scout_result,
+        dry_run=llm is None,
+        probe_session=session,
+        skill=skill,
     )
     for note in plan.notes:
         _log(f"{scenario.name}: {note}")
@@ -401,17 +435,23 @@ def run_matrix(
     *,
     only_path: str | None,
     repeat: int,
-    mode: Mode | None,
+    mode: Mode | None = None,
+    modes: Sequence[Mode] | None = None,
 ) -> list[tuple[Path, Mode, int]]:
-    """Every (path, mode, index) the scenario asks for, after narrowing."""
+    """Every (path, mode, index) the scenario asks for, after narrowing to ``only_path`` and to
+    ``mode`` (one mode) or ``modes`` (the modes to keep; default both)."""
     if repeat < 1:
         raise ValueError(f"repeat must be >= 1, got {repeat}")
-    if mode is not None and mode not in MODES:
-        raise ValueError(f"mode must be one of {', '.join(MODES)}, got {mode!r}")
+    keep = list(modes) if modes is not None else list(MODES)
+    if mode is not None:
+        keep = [mode]
+    for m in keep:
+        if m not in MODES:
+            raise ValueError(f"mode must be one of {', '.join(MODES)}, got {m!r}")
     cells: list[tuple[Path, Mode, int]] = []
     for path in select_paths(plan, only_path):
         for m in modes_for(path):
-            if mode is not None and m != mode:
+            if m not in keep:
                 continue
             cells.extend((path, m, i) for i in range(repeat))
     return cells
@@ -421,8 +461,7 @@ def _connection_failure(
     scenario: Scenario, path: Path, mode: Mode, index: int, exc: BaseException
 ) -> Transcript:
     """A transcript standing in for a run whose MCP session could not be opened."""
-    text = str(exc).strip()
-    reason = f"could not open MCP session: {type(exc).__name__}" + (f": {text}" if text else "")
+    reason = f"could not open MCP session: {describe_exception(exc)}"
     transcript = Transcript(scenario=scenario.name, path_id=path.id, mode=mode, index=index)
     transcript.add(
         SystemEvent(scenario=scenario.name, path_id=path.id, index=index, mode=mode)
@@ -443,6 +482,7 @@ async def _one_run(
     agent_llm: LLM | None,
     dry_run: bool,
     observer_llm: LLM | None = None,
+    skill: SkillRef = None,
 ) -> Transcript:
     """One MCP session, one run of one path; never raises for run failures."""
     try:
@@ -457,6 +497,7 @@ async def _one_run(
                 dry_run=dry_run,
                 catalog=catalog,
                 observer_llm=observer_llm,
+                skill=skill,
             )
     except Exception as exc:  # noqa: BLE001 - a broken server is a failed run, not a crash
         return _connection_failure(scenario, path, mode, index, exc)
@@ -469,10 +510,13 @@ async def _judge_one(
     *,
     judge_llm: LLM | None,
     votes: int | None,
+    skill: SkillRef = None,
 ) -> Verdict:
     if judge_llm is None or _is_dry_run_transcript(transcript):
         return judge_deterministic(scenario, transcript)
-    return await judge(scenario, plan.path(transcript.path_id), transcript, judge_llm, votes)
+    return await judge(
+        scenario, plan.path(transcript.path_id), transcript, judge_llm, votes, skill=skill
+    )
 
 
 def _is_dry_run_transcript(transcript: Transcript) -> bool:
@@ -485,8 +529,19 @@ def _write_report(
     scenario: Scenario,
     verdicts: Iterable[Verdict],
     transcripts: Iterable[Transcript],
+    *,
+    repeat: int | None = None,
 ) -> tuple[FsPath, FsPath]:
-    report = aggregate(list(verdicts), list(transcripts), scenario=scenario.name, run_dir=run_dir)
+    """``report.json`` and ``report.md``; ``repeat`` is pass^k's ``k``: how many runs per
+    path × mode were asked for (the run's resolved repeat, which ``scenario.json`` records for a
+    re-judge or re-report). Without it ``k`` is inferred from the runs on disk."""
+    report = aggregate(
+        list(verdicts),
+        list(transcripts),
+        scenario=scenario.name,
+        run_dir=run_dir,
+        repeat=repeat,
+    )
     if uses_local_models(scenario):
         report.cost_note = f"{LOCAL_COST_NOTE}; hosted calls, if any, are an {report.cost_note}"
     json_path = report.save(run_dir / REPORT_JSON)
@@ -504,6 +559,8 @@ async def _run_scenario_async(
     repeat: int | None,
     mode: Mode | None,
     dry_run: bool,
+    modes: Sequence[Mode] | None = None,
+    skill: Skill | None = None,
 ) -> FsPath:
     if not dry_run:
         check_judge_model(scenario)
@@ -528,14 +585,15 @@ async def _run_scenario_async(
                 "review the plan"
             )
     else:
-        catalog, scout_result, plan = await discover_scout_and_plan(scenario, dry_run=dry_run)
+        catalog, scout_result, plan = await discover_scout_and_plan(
+            scenario, dry_run=dry_run, skill=skill
+        )
         if scout_result is not None:
             scout_result.save(run_dir / SCOUT_FILE)
     plan.save(run_dir / PLAN_FILE)
 
-    cells = run_matrix(
-        plan, only_path=only_path, repeat=scenario.repeat if repeat is None else repeat, mode=mode
-    )
+    repeats = scenario.repeat if repeat is None else repeat
+    cells = run_matrix(plan, only_path=only_path, repeat=repeats, mode=mode, modes=modes)
     agent_llm = None if dry_run else make_llm_for(scenario, "agent")
     judge_llm = None if dry_run else make_llm_for(scenario, "judge")
     observer_llm = (
@@ -557,11 +615,12 @@ async def _run_scenario_async(
                 agent_llm=agent_llm,
                 dry_run=dry_run,
                 observer_llm=observer_llm,
+                skill=skill,
             )
             transcript.write_jsonl(transcripts_dir / f"{transcript.stem}.jsonl")
             _log(f"{scenario.name}: {transcript.stem}: {transcript.outcome} ({transcript.reason})")
             verdict = await _judge_one(
-                scenario, plan, transcript, judge_llm=judge_llm, votes=None
+                scenario, plan, transcript, judge_llm=judge_llm, votes=None, skill=skill
             )
             verdict.save(verdicts_dir / f"{transcript.stem}.json")
             return transcript, verdict
@@ -569,11 +628,68 @@ async def _run_scenario_async(
     results = await asyncio.gather(*(cell(p, m, i) for p, m, i in cells))
     transcripts = [t for t, _ in results]
     verdicts = [v for _, v in results]
-    _write_report(run_dir, scenario, verdicts, transcripts)
+    _write_report(run_dir, scenario, verdicts, transcripts, repeat=repeats)
     return run_dir
 
 
 # --- public, synchronous contract -------------------------------------------------------------
+
+
+def prepare_scenario(
+    scenario_path: str | os.PathLike[str],
+    *,
+    skill: SkillRef = None,
+    model_overrides: Mapping[str, str] | None = None,
+    allow_same_judge: bool = False,
+    repeat: int | None = None,
+    modes: Sequence[Mode] | None = None,
+    check_sampling: bool = True,
+) -> tuple[Scenario, Resolved, Skill]:
+    """Load a scenario and resolve it against the skill (:meth:`mcpsim.skill.Skill.apply`):
+    ``(the scenario as it will run, the resolution with its sources, the skill)``.
+    ``check_sampling=False`` (a dry run, which calls no model) skips the refusal of a
+    temperature the resolved model rejects."""
+    loaded = load_skill(skill)
+    if repeat is not None and repeat < 1:
+        raise ValueError(f"repeat must be >= 1, got {repeat}")
+    run_overrides: dict[str, Any] = {}
+    if repeat is not None:
+        run_overrides["repeat"] = repeat
+    if modes is not None:
+        run_overrides["modes"] = list(modes)
+    for spec in (model_overrides or {}).values():
+        parse_model_spec(spec)  # raises ValueError for an empty name
+    scenario, resolved = loaded.apply(
+        load_scenario(FsPath(scenario_path)),
+        model_overrides=model_overrides,
+        run_overrides=run_overrides,
+        allow_same_judge=allow_same_judge,
+        check_sampling=check_sampling,
+    )
+    return scenario, resolved, loaded
+
+
+def _log_resolution(
+    scenario: Scenario, resolved: Resolved, skill: Skill, *, dry_run: bool = False
+) -> None:
+    models = ", ".join(f"{role}={s.value}" for role, s in resolved.models.items())
+    run = resolved.run
+    _log(
+        f"{scenario.name}: skill {skill.path}; {models}; repeat {run['repeat'].value}, "
+        f"modes {'+'.join(run['modes'].value)}, judge_votes {run['judge_votes'].value}, "
+        f"concurrency {run['concurrency'].value}"
+    )
+    if dry_run:
+        return
+    m = scenario.models
+    specs = [m.planner, m.agent, m.user, m.judge]
+    specs += [m.model_for_observer(o) for o in llm_observers(scenario)]
+    unpriced = unpriced_models(specs)
+    if unpriced:
+        _log(
+            f"warning: no price is known for {', '.join(unpriced)}: the report counts its calls "
+            "as $0 and budgets.max_cost_usd does not limit them (mcpsim.llm.RATE_TABLE)"
+        )
 
 
 def plan_scenario(
@@ -583,15 +699,23 @@ def plan_scenario(
     dry_run: bool = False,
     model_overrides: Mapping[str, str] | None = None,
     allow_same_judge: bool = False,
+    skill: SkillRef = None,
 ) -> FsPath:
     """Load, discover, plan; write ``<out_dir>/<scenario.name>/<timestamp>/plan.json``."""
-    scenario = apply_model_overrides(
-        load_scenario(FsPath(scenario_path)), model_overrides, allow_same_judge=allow_same_judge
+    scenario, resolved, loaded = prepare_scenario(
+        scenario_path,
+        skill=skill,
+        model_overrides=model_overrides,
+        allow_same_judge=allow_same_judge,
+        check_sampling=not dry_run,
     )
+    _log_resolution(scenario, resolved, loaded, dry_run=dry_run)
     run_setup(scenario)
 
     async def body() -> tuple[ExecutionPlan, ScoutResult | None]:
-        _, scout_result, plan = await discover_scout_and_plan(scenario, dry_run=dry_run)
+        _, scout_result, plan = await discover_scout_and_plan(
+            scenario, dry_run=dry_run, skill=loaded
+        )
         return plan, scout_result
 
     plan, scout_result = asyncio.run(body())
@@ -613,15 +737,26 @@ def run_scenario(
     dry_run: bool = False,
     model_overrides: Mapping[str, str] | None = None,
     allow_same_judge: bool = False,
+    skill: SkillRef = None,
+    modes: Sequence[Mode] | None = None,
 ) -> FsPath:
-    """``plan -> runs -> judge -> report``; returns the run directory (see the module docstring)."""
-    scenario = apply_model_overrides(
-        load_scenario(FsPath(scenario_path)), model_overrides, allow_same_judge=allow_same_judge
+    """``plan -> runs -> judge -> report``; returns the run directory (see the module docstring).
+
+    ``repeat`` and ``mode`` / ``modes`` are the command line's layer of the run settings;
+    without them the skill's configuration and the scenario file decide.
+    """
+    scenario, resolved, loaded = prepare_scenario(
+        scenario_path,
+        skill=skill,
+        model_overrides=model_overrides,
+        allow_same_judge=allow_same_judge,
+        repeat=repeat,
+        modes=[mode] if mode is not None else modes,
+        check_sampling=not dry_run,
     )
-    if repeat is not None and repeat < 1:
-        raise ValueError(f"repeat must be >= 1, got {repeat}")
     if plan_path is not None and not FsPath(plan_path).is_file():
         raise FileNotFoundError(f"plan file not found: {plan_path}")
+    _log_resolution(scenario, resolved, loaded, dry_run=dry_run)
     run_setup(scenario)
     run_dir = new_run_dir(out_dir, scenario.name)
     _write_scenario(scenario, run_dir)
@@ -631,9 +766,11 @@ def run_scenario(
             run_dir,
             plan_path=plan_path,
             only_path=only_path,
-            repeat=repeat,
-            mode=mode,
+            repeat=scenario.repeat,
+            mode=None,
             dry_run=dry_run,
+            modes=resolved.modes,
+            skill=loaded,
         )
     )
 
@@ -656,11 +793,14 @@ def judge_run_dir(
     run_dir: str | os.PathLike[str],
     *,
     votes: int | None = None,
+    skill: SkillRef = None,
 ) -> list[FsPath]:
     """Re-judge every saved transcript; rewrite verdicts and the report; return verdict paths.
 
     Transcripts recorded in dry run (agent model ``"dry-run"``) are judged by the matcher alone,
     as in the original run; every other transcript gets the LLM judge from :func:`make_llm_for`.
+    The judge's model and votes come from the run's ``scenario.json`` (``votes`` overrides the
+    count); its prompts and settings from ``skill``.
     """
     folder = FsPath(run_dir)
     scenario = _load_scenario_json(folder)
@@ -668,16 +808,18 @@ def judge_run_dir(
     transcripts = _read_transcripts(folder)
     if votes is not None and votes < 1:
         raise ValueError(f"votes must be >= 1, got {votes}")
+    loaded = load_skill(skill)
     needs_llm = any(not _is_dry_run_transcript(t) for t in transcripts)
     judge_llm = make_llm_for(scenario, "judge") if needs_llm else None
     if needs_llm:
         check_judge_model(scenario)
+        loaded.check_sampling(scenario)
 
     async def body() -> list[Verdict]:
         return list(
             await asyncio.gather(
                 *(
-                    _judge_one(scenario, plan, t, judge_llm=judge_llm, votes=votes)
+                    _judge_one(scenario, plan, t, judge_llm=judge_llm, votes=votes, skill=loaded)
                     for t in transcripts
                 )
             )
@@ -688,19 +830,22 @@ def judge_run_dir(
         v.save(folder / VERDICTS_DIR / f"{t.stem}.json")
         for t, v in zip(transcripts, verdicts, strict=True)
     ]
-    _write_report(folder, scenario, verdicts, transcripts)
+    # scenario.json records the repeat the run resolved (--repeat included): pass^k's k.
+    _write_report(folder, scenario, verdicts, transcripts, repeat=scenario.repeat)
     return written
 
 
 def report_run_dir(
     run_dir: str | os.PathLike[str],
 ) -> tuple[FsPath, FsPath]:
-    """Rebuild ``report.json`` and ``report.md`` from ``verdicts/`` and ``transcripts/``."""
+    """Rebuild ``report.json`` and ``report.md`` from ``verdicts/`` and ``transcripts/``.
+    pass^k's ``k`` is the repeat ``scenario.json`` records (what the run asked for, ``--repeat``
+    included), so a run that stopped early reports its missing repeats instead of a smaller k."""
     folder = FsPath(run_dir)
     scenario = _load_scenario_json(folder)
     transcripts = _read_transcripts(folder)
     verdicts = _read_verdicts(folder)
-    return _write_report(folder, scenario, verdicts, transcripts)
+    return _write_report(folder, scenario, verdicts, transcripts, repeat=scenario.repeat)
 
 
 def scenario_files(scenario_dir: str | os.PathLike[str]) -> list[FsPath]:
@@ -716,40 +861,185 @@ def scenario_files(scenario_dir: str | os.PathLike[str]) -> list[FsPath]:
     return files
 
 
+# --- the suite --------------------------------------------------------------------------------
+
+USER_ERRORS: tuple[type[Exception], ...] = (
+    ScenarioError,
+    SkillError,
+    OSError,
+    ValueError,
+    KeyError,
+    RuntimeError,
+)
+
+
+@dataclass
+class SuiteRow:
+    """One scenario of a suite: its report, or the error that stopped it."""
+
+    entry: ScenarioEntry
+    report: Report | None = None
+    run_dir: FsPath | None = None
+    error: str | None = None
+
+
+def suite_entries(
+    scenario_dir: str | os.PathLike[str] | None = None,
+    *,
+    skill: SkillRef = None,
+    names: Sequence[str] | None = None,
+    categories: Sequence[str] | None = None,
+) -> list[ScenarioEntry]:
+    """The scenarios a suite runs: the files in ``scenario_dir`` when given, else every source
+    in the skill's ``config.yaml``; narrowed by the ``names`` / ``categories`` globs (any of
+    each). Entries that fail to load are kept (with ``error``) unless a filter leaves them out.
+    Raises ``ValueError`` when nothing is left."""
+    if scenario_dir is not None:
+        files = [(f, str(scenario_dir)) for f in scenario_files(scenario_dir)]
+        entries = load_entries(files)
+        where = str(scenario_dir)
+    else:
+        loaded = load_skill(skill)
+        entries = loaded.entries()
+        where = f"the scenarios of {loaded.config_path}"
+    selected = select_entries(entries, names=names, categories=categories)
+    if not selected:
+        filters = [
+            *(f"--name {n}" for n in names or []),
+            *(f"--category {c}" for c in categories or []),
+        ]
+        raise ValueError(
+            f"no scenario in {where}"
+            + (f" matches {' '.join(filters)}" if filters else "")
+            + (f" (known: {', '.join(e.name for e in entries)})" if entries else "")
+        )
+    return selected
+
+
+def format_suite_table(rows: Sequence[SuiteRow]) -> str:
+    """The summary table ``mcpsim suite`` prints: one line per scenario with its pass rate,
+    pass^k, cost, run time and run directory (or the error that stopped it)."""
+    header = ["scenario", "category", "passed", "rate", "pass^k", "cost", "time", "result"]
+    table: list[list[str]] = []
+    for row in rows:
+        name, category = row.entry.name, row.entry.category or "-"
+        if row.report is None:
+            error = one_line(row.error or row.entry.error or "error")
+            table.append([name, category, "-", "-", "-", "-", "-", f"error: {error}"])
+            continue
+        r = row.report
+        pk = f"pass^{r.pass_k.k} {'yes' if r.pass_k.all_passed else 'no'}" if r.pass_k.k else "n/a"
+        table.append(
+            [
+                name,
+                category,
+                f"{r.passed}/{r.runs}",
+                f"{r.pass_rate * 100:.0f}%",
+                pk,
+                f"${r.cost_usd:.2f}",
+                f"{r.wall_clock_s or r.duration_s:.0f}s",
+                str(row.run_dir or r.run_dir),
+            ]
+        )
+    widths = [max([len(header[i]), *(len(t[i]) for t in table)]) for i in range(len(header) - 1)]
+    lines = []
+    for cells in [header, *table]:
+        lead = "  ".join(c.ljust(widths[i]) for i, c in enumerate(cells[:-1]))
+        lines.append(f"{lead}  {cells[-1]}".rstrip())
+    return "\n".join(lines)
+
+
 def run_suite(
-    scenario_dir: str | os.PathLike[str],
-    out_dir: str | os.PathLike[str],
+    scenario_dir: str | os.PathLike[str] | None = None,
+    out_dir: str | os.PathLike[str] | None = None,
     *,
     threshold: float = 1.0,
     dry_run: bool = False,
     model_overrides: Mapping[str, str] | None = None,
     allow_same_judge: bool = False,
+    skill: SkillRef = None,
+    names: Sequence[str] | None = None,
+    categories: Sequence[str] | None = None,
+    repeat: int | None = None,
+    modes: Sequence[Mode] | None = None,
+    on_row: Callable[[SuiteRow], None] | None = None,
 ) -> int:
-    """Run every scenario in the directory, write ``suite.json`` / ``suite.md``, return exit."""
+    """Run every selected scenario (:func:`suite_entries`) one after another into ``out_dir``
+    (default: the skill's ``runs_dir``), print the summary table (:func:`format_suite_table`),
+    write ``<out_dir>/suite-<timestamp>/suite.json`` and ``suite.md``, and return the exit code:
+    :func:`mcpsim.report.exit_code` over the suite, or 1 when a scenario could not run.
+
+    A scenario that fails to load or to run (server unreachable, planner gave up) is reported
+    and the suite goes on. ``on_row`` is called after each scenario (the UI's progress hook).
+    """
     if not 0.0 <= threshold <= 1.0:
         raise ValueError(f"threshold must be between 0 and 1, got {threshold}")
-    files = scenario_files(scenario_dir)
-    reports: list[Report] = []
-    for file in files:
-        run_dir = run_scenario(
-            file,
-            out_dir,
-            dry_run=dry_run,
-            model_overrides=model_overrides,
-            allow_same_judge=allow_same_judge,
-        )
-        report = Report.load(run_dir / REPORT_JSON)
-        reports.append(report)
-        print(f"{report.scenario}: {summary_line(report)}  ({run_dir})")
+    loaded = load_skill(skill)
+    entries = suite_entries(scenario_dir, skill=loaded, names=names, categories=categories)
+    out = FsPath(out_dir) if out_dir is not None else loaded.runs_dir()
+    _log(f"suite: {len(entries)} scenario(s) into {out} (skill {loaded.path})")
+    rows: list[SuiteRow] = []
+    for entry in entries:
+        row = SuiteRow(entry=entry)
+        if entry.error is not None:
+            row.error = entry.error
+        else:
+            try:
+                run_dir = run_scenario(
+                    entry.file,
+                    out,
+                    dry_run=dry_run,
+                    model_overrides=model_overrides,
+                    allow_same_judge=allow_same_judge,
+                    skill=loaded,
+                    repeat=repeat,
+                    modes=modes,
+                )
+                row.run_dir = FsPath(run_dir)
+                row.report = Report.load(row.run_dir / REPORT_JSON)
+            except Exception as exc:  # noqa: BLE001 - one scenario's failure is a row, not the end
+                # Besides the user-facing errors (a bad scenario, an unreachable server, a planner
+                # that gave up) this catches API refusals (an exhausted credit balance answers 400)
+                # so the other scenarios still run; MCPSIM_DEBUG=1 re-raises for the traceback.
+                if os.environ.get("MCPSIM_DEBUG"):
+                    raise
+                # The SDK's task groups wrap a failure inside an MCP session in exception
+                # groups; the row names the failure itself.
+                leaf = sole_leaf(exc)
+                if isinstance(leaf, BaseExceptionGroup):
+                    row.error = describe_exception(leaf)
+                else:
+                    message = (
+                        leaf.args[0] if isinstance(leaf, KeyError) and leaf.args else str(leaf)
+                    )
+                    prefix = "" if isinstance(leaf, USER_ERRORS) else f"{type(leaf).__name__}: "
+                    row.error = f"{prefix}{message}" if str(message) else type(leaf).__name__
+        if row.report is not None:
+            print(f"{entry.name}: {summary_line(row.report)}  ({row.run_dir})", flush=True)
+        else:
+            print(f"{entry.name}: error: {one_line(row.error or 'error')}", flush=True)
+        rows.append(row)
+        if on_row is not None:
+            on_row(row)
+    reports = [r.report for r in rows if r.report is not None]
     suite: SuiteReport = aggregate_suite(reports)
-    suite_dir = FsPath(out_dir) / f"suite-{timestamp()}"
+    suite.errors = [
+        SuiteError(scenario=r.entry.name, file=str(r.entry.file), error=r.error or "")
+        for r in rows
+        if r.report is None
+    ]
+    suite_dir = out / f"suite-{timestamp()}"
     n = 1
     while suite_dir.exists():
-        suite_dir = FsPath(out_dir) / f"suite-{timestamp()}-{n}"
+        suite_dir = out / f"suite-{timestamp()}-{n}"
         n += 1
     suite_dir.mkdir(parents=True)
     suite.save(suite_dir / SUITE_JSON)
     (suite_dir / SUITE_MD).write_text(render_suite_markdown(suite), encoding="utf-8")
+    print()
+    print(format_suite_table(rows))
+    print()
     print(f"suite: {summary_line(suite)}")
     print(f"suite report: {suite_dir / SUITE_MD}")
-    return report_exit_code(suite, threshold)
+    code = report_exit_code(suite, threshold)
+    return 1 if suite.errors and code == 0 else code

@@ -59,7 +59,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from mcpsim.llm import LLM, LLMResponse
+from mcpsim.llm import LLM, LLMResponse, sampling
 from mcpsim.matcher import MISSING, apply_operator, match, parse_path, resolve
 from mcpsim.mcpclient import Catalog, Session, ToolInfo
 from mcpsim.plan import ExecutionPlan, Path, Step, StepReference, parse_reference
@@ -89,6 +89,7 @@ from mcpsim.scout import (
     probe_argument_refusal,
     probe_refusal,
 )
+from mcpsim.skill import SkillRef, role_of
 
 EXECUTION_TOOL_NAME = "tool_execution_plan"
 POLICY_TOOL_NAME = "forbidden_tool"
@@ -116,16 +117,7 @@ FACT_VALUE_LIMIT = 40
 HAPPY_PATH_ID = "happy"
 UNUSED = "no answer field and no later step uses its result"
 
-SYSTEM_OPENING = "You are an expert JSON config generator. Generate a JSON config of the format:"
-SYSTEM_TOOLS = "that represents the plan of tool execution, using only these tools:"
-FORMAT_STEPS = (
-    '"steps":[{"tool":"<tool name>","arguments":{"<argument>":<value>},'
-    '"why":"<one sentence>","expect":"<what the result will show>"}]'
-)
-FORMAT_FIELDS = (
-    '"answer_fields":{"<field the answer must contain>":'
-    '"step <n>: <path in the result of step n, e.g. items[0].price>"}'
-)
+ROLE = "planner-local"
 
 # What the validator accepts as lineage. The grammar pattern (lineage_grammar_pattern) admits
 # exactly the well-formed paths within its caps, with step numbers up to the plan's step cap, so
@@ -283,17 +275,25 @@ def _ordered_observations(view: PlannerView) -> list[Observation]:
 
 
 def execution_prompts(
-    scenario: Scenario, view: PlannerView, fields: list[str], *, budget: int
+    scenario: Scenario,
+    view: PlannerView,
+    fields: list[str],
+    *,
+    budget: int,
+    skill: SkillRef = None,
 ) -> tuple[str, str]:
-    """``(system, user)`` in the user's own framing, within ``budget`` characters when it fits.
+    """``(system, user)`` in the user's own framing, within ``budget`` characters when it fits
+    (``roles/planner-local.md``, prompts ``system`` and ``user``).
 
-    System: the "expert JSON config generator" opening, the one-line format, and the compact
-    digest of the tools a step may name. User: "The user's request: <goal>", then "Rules the plan
-    must follow:" with one line per instruction and per goal an observer enabled. The informant
-    reports and the scout's observations (as result shapes) are added line by line, in that
-    order, only while the total stays within ``budget`` (resources are never shown); the digest,
-    the request and the rules are never cut.
+    System: the "expert JSON config generator" opening, the one-line format (with
+    ``answer_fields`` when the scenario has an expected JSON), and the compact digest of the
+    tools a step may name. User: the request (the goal), then the rules: one line per
+    instruction and per goal an observer enabled. The informant reports and the scout's
+    observations (as result shapes) are added line by line, in that order, only while the
+    rendered total stays within ``budget`` (resources are never shown); the digest, the request
+    and the rules are never cut.
     """
+    role = role_of(skill, ROLE)
     tools = list(view.disclosed)
     if view.discoverable:
         tools.append(ToolInfo.model_validate(discover_tool_definition()))
@@ -302,28 +302,33 @@ def execution_prompts(
                          max_output_keys=LOCAL_MAX_OUTPUT_KEYS)
         for t in tools
     ]
-    fmt = "{" + FORMAT_STEPS + ("," + FORMAT_FIELDS if fields else "") + "}"
-    system = "\n".join([SYSTEM_OPENING, fmt, "", SYSTEM_TOOLS, *digest])
+    system = role.render("system", tools="\n".join(digest), answer_fields=bool(fields))
     rules = [" ".join(i.split()) for i in scenario.instructions]
     rules += [" ".join(g.split()) for g in view.goals]
-    user = f"The user's request: {' '.join(scenario.goal.split())}"
-    if rules:
-        user += "\n\nRules the plan must follow:\n" + "\n".join(f"- {r}" for r in rules)
-    sections = [
-        ("What informants reported about the server:", [f"- {r.line()}" for r in view.reports]),
-        (
-            "What the server already returned (read-only calls):",
-            [observation_line(o) for o in _ordered_observations(view)],
-        ),
-    ]
-    for header, lines in sections:
-        added = False
+    sections: dict[str, list[str]] = {"reports": [], "observations": []}
+
+    def render_user() -> str:
+        return role.render(
+            "user",
+            request=" ".join(scenario.goal.split()),
+            rules="\n".join(f"- {r}" for r in rules),
+            reports="\n".join(sections["reports"]),
+            observations="\n".join(sections["observations"]),
+        )
+
+    user = render_user()
+    candidates = {
+        "reports": [f"- {r.line()}" for r in view.reports],
+        "observations": [observation_line(o) for o in _ordered_observations(view)],
+    }
+    for key, lines in candidates.items():
         for line in lines:
-            extra = (f"\n\n{header}\n" if not added else "\n") + line
-            if len(system) + len(user) + len(extra) > budget:
+            sections[key].append(line)
+            attempt = render_user()
+            if len(system) + len(attempt) > budget:
+                sections[key].pop()
                 break
-            user += extra
-            added = True
+            user = attempt
     return system, user
 
 
@@ -1539,12 +1544,10 @@ def _usage(response: LLMResponse, seconds: float) -> str:
     )
 
 
-def _reask(response: LLMResponse, problems: list[str]) -> str | list[dict[str, Any]]:
-    text = (
-        "The JSON config was rejected:\n"
-        + "\n".join(f"- {p}" for p in problems)
-        + "\n\nAnswer with the whole corrected JSON config."
-    )
+def _reask(
+    response: LLMResponse, problems: list[str], *, skill: SkillRef = None
+) -> str | list[dict[str, Any]]:
+    text = role_of(skill, ROLE).render("reask", problems="\n".join(f"- {p}" for p in problems))
     blocks = [b for b in response.tool_uses() if b.get("name") == EXECUTION_TOOL_NAME]
     tool_use_id = blocks[0].get("id") if blocks else None
     if not isinstance(tool_use_id, str) or not tool_use_id:
@@ -1562,8 +1565,11 @@ async def ask_execution(
     system: str,
     user: str,
     notes: list[str],
+    *,
+    skill: SkillRef = None,
 ) -> tuple[list[PlannedCall], dict[str, Lineage]]:
     """The execution-plan call and its single re-ask; see :func:`settle_execution`."""
+    role = role_of(skill, ROLE)
     max_steps = max(1, min(LOCAL_MAX_STEPS, scenario.budgets.max_tool_calls))
     schema = execution_schema(step_tool_names(view), fields, max_steps)
     tools = [{"name": EXECUTION_TOOL_NAME, "description": "", "input_schema": schema}]
@@ -1580,7 +1586,8 @@ async def ask_execution(
             messages=list(messages),
             tools=tools,
             tool_choice=choice,
-            max_tokens=LOCAL_PLAN_MAX_TOKENS,
+            max_tokens=role.tokens(LOCAL_PLAN_MAX_TOKENS),
+            **sampling(role.temperature),
         )
         seconds = time.monotonic() - started
         draft, problems = parse_execution(response)
@@ -1600,7 +1607,7 @@ async def ask_execution(
             return settle_execution(draft, review, fields, notes, salvage=False)
         if attempt < MAX_PLAN_ATTEMPTS:
             messages.append({"role": "assistant", "content": list(response.content)})
-            messages.append({"role": "user", "content": _reask(response, problems)})
+            messages.append({"role": "user", "content": _reask(response, problems, skill=skill)})
     if usable is None:
         raise PlanError(
             f"local planner for scenario {scenario.name!r} produced no usable execution plan in "
@@ -1646,6 +1653,8 @@ async def ask_forbidden_tools(
     tool_names: list[str],
     happy_tools: set[str],
     notes: list[str],
+    *,
+    skill: SkillRef = None,
 ) -> list[tuple[int, str, str]]:
     """``(instruction number, instruction, tool)`` for each tool an instruction forbids.
 
@@ -1659,10 +1668,8 @@ async def ask_forbidden_tools(
     """
     if not tool_names:
         return []
-    system = (
-        "You check rules for an AI agent that calls tools. The agent's tools are: "
-        + ", ".join(tool_names) + "."
-    )
+    role = role_of(skill, ROLE)
+    system = role.render("policy_system", tools=", ".join(tool_names))
     schema = policy_schema(tool_names)
     tools = [{"name": POLICY_TOOL_NAME, "description": "", "input_schema": schema}]
     choice = {"type": "tool", "name": POLICY_TOOL_NAME}
@@ -1680,10 +1687,7 @@ async def ask_forbidden_tools(
             )
             continue
         asked += 1
-        user = (
-            f"Rule: {text}\n\nWhich of these tools does this rule forbid calling? Answer "
-            f"{NONE_ANSWER} if it forbids none of them."
-        )
+        user = role.render("policy_user", rule=text, none_answer=NONE_ANSWER)
         started = time.monotonic()
         response = await llm.complete(
             model=scenario.models.planner,
@@ -1691,7 +1695,8 @@ async def ask_forbidden_tools(
             messages=[{"role": "user", "content": user}],
             tools=tools,
             tool_choice=choice,
-            max_tokens=POLICY_MAX_TOKENS,
+            max_tokens=role.setting("policy_max_tokens", POLICY_MAX_TOKENS),
+            **sampling(role.temperature),
         )
         seconds = time.monotonic() - started
         blocks = [b for b in response.tool_uses() if b.get("name") == POLICY_TOOL_NAME]
@@ -1808,6 +1813,7 @@ async def plan_execution(
     *,
     session: Session | None = None,
     prompt_budget: int | None = None,
+    skill: SkillRef = None,
 ) -> ExecutionPlan:
     """The local profile's plan: happy path, a probed variant, policy paths (module docstring).
 
@@ -1827,13 +1833,13 @@ async def plan_execution(
     budget = prompt_budget if prompt_budget is not None else planner_prompt_budget(
         LOCAL_PROMPT_BUDGET
     )
-    system, user = execution_prompts(scenario, view, fields, budget=budget)
+    system, user = execution_prompts(scenario, view, fields, budget=budget, skill=skill)
     if scout is not None:
         scout.planner_prompt_chars = len(system) + len(user)
     notes: list[str] = []
     observations = scout.tool_observations() if scout is not None else []
     calls, lineage = await ask_execution(
-        scenario, catalog, llm, view, fields, observations, system, user, notes
+        scenario, catalog, llm, view, fields, observations, system, user, notes, skill=skill
     )
     happy = happy_path(scenario, calls, lineage, fields)
     paths = [happy]
@@ -1843,7 +1849,7 @@ async def plan_execution(
     if variant is not None:
         paths.append(variant)
     forbidden = await ask_forbidden_tools(
-        scenario, llm, catalog.tool_names(), {c.tool for c in calls}, notes
+        scenario, llm, catalog.tool_names(), {c.tool for c in calls}, notes, skill=skill
     )
     seen_tools: set[str] = set()
     for index, instruction, tool in forbidden:

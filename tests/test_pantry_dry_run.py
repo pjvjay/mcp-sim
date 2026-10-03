@@ -14,6 +14,7 @@ import yaml
 
 from mcpsim import runner
 from mcpsim.plan import ExecutionPlan
+from mcpsim.scenario import load_scenario
 from mcpsim.scout import ScoutResult
 from mcpsim.transcript import Transcript
 from mcpsim.verdict import Verdict
@@ -23,8 +24,10 @@ TEST_DB = FsPath(__file__).resolve().parent.parent / "runs" / "pantry-sim-fable.
 
 
 def _server_command() -> str:
-    data = yaml.safe_load(SCENARIO.read_text(encoding="utf-8"))
-    return str(data["server"]["stdio"]["command"])
+    # As the loader expands it: the file reads ${PANTRY_API_HOME:-...}.
+    stdio = load_scenario(SCENARIO).server.stdio
+    assert stdio is not None
+    return stdio.command
 
 
 pytestmark = pytest.mark.skipif(

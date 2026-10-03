@@ -1,0 +1,59 @@
+# The simulate skill's configuration (loaded by mcpsim/skill.py at run time).
+#
+# Model precedence for every role, lowest to highest:
+#   built-in default < roles/<role>.md frontmatter < defaults (below) < every matching override
+#   (in file order) < the scenario file's own `models` < `--models` on the command line.
+# Run settings follow the same ladder (the judge's `votes` in roles/judge.md sits under `run`).
+# A layer only counts when it sets a value, and every value set here shadows the role files.
+# A model is `provider:model`; the providers are anthropic and ollama. `mcpsim config` prints
+# what resolves, from which layer, and which role-file values are shadowed.
+
+# Where the role files live, relative to this directory.
+roles_dir: roles
+
+# Models for every scenario. Empty, so each role file's frontmatter `model` is the live default:
+# planner and judge claude-opus-5-5, agent and observer claude-sonnet-5-5, user
+# claude-haiku-4-5-20251001, all on the Anthropic API (the planner included). A role set here
+# wins over its role file, for example:
+#   judge: anthropic:claude-opus-5
+defaults: {}
+
+# Run defaults: one conversation per scenario. `free` runs the happy path without the plan's
+# suggested steps, the way a real request arrives; add `guided` (--modes guided,free, or an
+# override) to also run every planned path with its steps: the recovery, boundary and policy
+# variants. repeat is pass^k's k (--repeat N for more); concurrency is how many runs of one
+# scenario are in flight at once. judge_votes (how many independent judge votes each transcript
+# gets) is left to roles/judge.md's `votes`; setting it here would shadow that. A scenario file
+# that sets repeat, judge_votes or concurrency itself keeps its own value (the pantry scenarios
+# set none).
+run:
+  repeat: 1
+  modes: [free]
+  concurrency: 2
+
+# What `mcpsim suite` (and `mcpsim ui`) runs: directories (their *.yaml / *.yml / *.json files),
+# globs or single files. Relative paths resolve against the directory mcpsim runs in (the
+# mcp-sim checkout); $NAME, ${NAME} and ${NAME:-default} read the environment, and an entry
+# whose variable is unset (without a default) is skipped with a note.
+scenarios:
+  - scenarios/pantry
+  # The gateway scenarios pantry-gateway's scripts/make_scenarios.py writes (with --recipe for
+  # the recipe-link scenarios).
+  - ${PANTRY_GATEWAY_SCENARIOS:-../pantry-gateway/scenarios/generated}
+
+# Where `mcpsim suite` writes the run directories (relative to the directory mcpsim runs in).
+runs_dir: runs/simulate
+
+# Per-scenario overrides: `match` takes fnmatch globs on the scenario's name and/or category
+# (both must match when both are given); `models` and `run` take the keys above. Later
+# overrides win over earlier ones, and a value the scenario file sets itself still wins.
+overrides:
+  # The label-submission runs write evidence to the same database; run them one at a time so
+  # one run's submission cannot race another's duplicate check.
+  - match: { category: "Origin submissions" }
+    run: { concurrency: 1 }
+  # Another example: a cheaper judge and a single vote for the gateway copies while iterating
+  # (the judge must differ from the agent's model unless allow_same_judge is set).
+  # - match: { name: "*-gateway" }
+  #   models: { judge: anthropic:claude-haiku-4-5-20251001 }
+  #   run: { judge_votes: 1 }

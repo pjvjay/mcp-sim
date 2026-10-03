@@ -70,6 +70,7 @@ class ScriptedLLM:
         tools: list[dict[str, Any]] | None = None,
         tool_choice: dict[str, Any] | None = None,
         max_tokens: int = DEFAULT_MAX_TOKENS,
+        temperature: float | None = None,
     ) -> LLMResponse:
         self.calls.append(
             {
@@ -79,6 +80,7 @@ class ScriptedLLM:
                 "tools": tools,
                 "tool_choice": tool_choice,
                 "max_tokens": max_tokens,
+                "temperature": temperature,
             }
         )
         if not self.queue:

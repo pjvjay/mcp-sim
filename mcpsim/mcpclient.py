@@ -26,10 +26,92 @@ from pydantic import BaseModel, ConfigDict, Field
 from mcpsim.scenario import ServerSpec
 
 TEXT_LIMIT = 4000
+# How much of a non-2xx HTTP answer's body a failure message quotes.
+HTTP_BODY_LIMIT = 300
+# What the SDK's streamable HTTP client says in place of a non-2xx answer that carries no
+# JSON-RPC error (it drops the status and the body): the generic fallback, and its two 404s.
+SDK_HTTP_FALLBACKS = frozenset(
+    {"Server returned an error response", "Session terminated", "Not Found"}
+)
 
 
 class MCPClientError(RuntimeError):
     """Connection or configuration failure (not a tool error; those are ``ToolResult``s)."""
+
+
+def _leaves(exc: BaseException) -> list[BaseException]:
+    if isinstance(exc, BaseExceptionGroup):
+        return [leaf for sub in exc.exceptions for leaf in _leaves(sub)]
+    return [exc]
+
+
+def sole_leaf(exc: BaseException) -> BaseException:
+    """The one exception inside ``exc`` when it is an exception group around a single failure
+    (the SDK's task groups wrap every failure in one, often twice); ``exc`` itself otherwise."""
+    leaves = _leaves(exc)
+    return leaves[0] if len(leaves) == 1 else exc
+
+
+def describe_exception(exc: BaseException) -> str:
+    """``Type: message`` of what actually went wrong, exception groups unwrapped to their
+    leaves (distinct leaves joined with '; '). An :class:`MCPClientError` is its message alone:
+    it is already written for the reader (e.g. the HTTP status a server answered)."""
+    parts: list[str] = []
+    for leaf in _leaves(exc):
+        text = str(leaf).strip()
+        if isinstance(leaf, MCPClientError) and text:
+            part = text
+        else:
+            part = f"{type(leaf).__name__}: {text}" if text else type(leaf).__name__
+        if part not in parts:
+            parts.append(part)
+    return "; ".join(parts)
+
+
+class HttpErrorLog:
+    """The non-2xx answers an HTTP MCP endpoint gave to the requests of one connection.
+
+    The SDK turns a non-2xx answer without a JSON-RPC error body into "Server returned an error
+    response" and drops the status and the body, so a gateway's rate limit (ContextForge answers
+    429 with an "Account locked" body) reads like a broken server. This keeps the last such
+    answer so a failure can say what the server actually said.
+    """
+
+    def __init__(self, url: str) -> None:
+        self.url = url
+        self.seq = 0  # bumped on every recorded answer
+        self.status = 0
+        self.reason = ""
+        self.body = ""
+
+    async def on_response(self, response: Any) -> None:
+        """An ``httpx`` response hook; records POSTs (the JSON-RPC requests) answered >= 400."""
+        if response.status_code < 400 or response.request.method != "POST":
+            return
+        try:
+            raw = await response.aread()
+            body = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else str(raw)
+        except Exception:  # noqa: BLE001 - the status alone is still worth reporting
+            body = ""
+        self.status = response.status_code
+        self.reason = str(getattr(response, "reason_phrase", "") or "")
+        self.body = " ".join(body.split())[:HTTP_BODY_LIMIT]
+        self.seq += 1
+
+    def describe(self) -> str:
+        head = f"HTTP {self.status}" + (f" {self.reason}" if self.reason else "")
+        return f"{head} from {self.url}" + (f": {self.body}" if self.body else "")
+
+    def explains(self, exc: BaseException, since: int) -> bool:
+        """Whether ``exc`` is the SDK's stand-in for an answer recorded after mark ``since``."""
+        leaf = sole_leaf(exc)
+        message = str(getattr(leaf, "message", "") or leaf).strip()
+        return self.seq > since and message in SDK_HTTP_FALLBACKS
+
+
+def _is_refusal(status: int) -> bool:
+    """Statuses that mean the server refused or failed, never "method not implemented"."""
+    return status in (401, 403, 429) or status >= 500
 
 
 class ToolInfo(BaseModel):
@@ -222,21 +304,55 @@ def normalise_result(
 class Session:
     """Thin wrapper over :class:`ClientSession` with catalog discovery and normalised calls."""
 
-    def __init__(self, session: ClientSession, *, server_name: str = "") -> None:
+    def __init__(
+        self,
+        session: ClientSession,
+        *,
+        server_name: str = "",
+        http_errors: HttpErrorLog | None = None,
+    ) -> None:
         self._session = session
         self.server_name = server_name
         self.tool_calls = 0
+        self._http_errors = http_errors
 
     @property
     def raw(self) -> ClientSession:
         return self._session
+
+    def _mark(self) -> int:
+        return self._http_errors.seq if self._http_errors is not None else 0
+
+    def _http_failure(self, exc: BaseException, since: int) -> MCPClientError | None:
+        """An :class:`MCPClientError` naming the HTTP answer behind ``exc``, when the SDK's
+        generic message stands in for a non-2xx answer recorded since mark ``since``."""
+        log = self._http_errors
+        if log is None or not log.explains(exc, since):
+            return None
+        return MCPClientError(log.describe())
+
+    def _refused(self, exc: BaseException, since: int) -> MCPClientError | None:
+        """Like :meth:`_http_failure`, but only for a refusal (401/403/429/5xx): the optional
+        listings treat any other failure as "not implemented"."""
+        failure = self._http_failure(exc, since)
+        log = self._http_errors
+        if failure is None or log is None or not _is_refusal(log.status):
+            return None
+        return failure
 
     async def catalog(self) -> Catalog:
         tools: list[ToolInfo] = []
         cursor: str | None = None
         while True:
             params = mcp_types.PaginatedRequestParams(cursor=cursor) if cursor else None
-            page = await self._session.list_tools(params=params)
+            since = self._mark()
+            try:
+                page = await self._session.list_tools(params=params)
+            except Exception as exc:
+                failure = self._http_failure(exc, since)
+                if failure is not None:
+                    raise failure from exc
+                raise
             for t in page.tools:
                 annotations = getattr(t, "annotations", None)
                 tools.append(
@@ -259,6 +375,7 @@ class Session:
         resources: list[ResourceInfo] = []
         templates: list[ResourceTemplateInfo] = []
         prompts: list[PromptInfo] = []
+        since = self._mark()
         try:
             cursor = None
             while True:
@@ -292,8 +409,11 @@ class Session:
                 cursor = tpage.next_cursor
                 if not cursor:
                     break
-        except Exception:  # noqa: BLE001 - a tools-only server may not implement resources
-            pass
+        except Exception as exc:  # noqa: BLE001 - a tools-only server may not implement resources
+            refused = self._refused(exc, since)
+            if refused is not None:
+                raise refused from exc
+        since = self._mark()
         try:
             cursor = None
             while True:
@@ -310,8 +430,10 @@ class Session:
                 cursor = ppage.next_cursor
                 if not cursor:
                     break
-        except Exception:  # noqa: BLE001 - a tools-only server may not implement prompts
-            pass
+        except Exception as exc:  # noqa: BLE001 - a tools-only server may not implement prompts
+            refused = self._refused(exc, since)
+            if refused is not None:
+                raise refused from exc
 
         return Catalog(
             server_name=self.server_name,
@@ -330,7 +452,14 @@ class Session:
         Transport failures raise, like :meth:`call_tool`.
         """
         started = time.perf_counter()
-        result = await self._session.read_resource(uri)
+        since = self._mark()
+        try:
+            result = await self._session.read_resource(uri)
+        except Exception as exc:
+            failure = self._http_failure(exc, since)
+            if failure is not None:
+                raise failure from exc
+            raise
         ms = (time.perf_counter() - started) * 1000
         parts: list[str] = []
         mime_type: str | None = None
@@ -353,25 +482,39 @@ class Session:
         """Call a tool; server-side errors come back as ``is_error`` results, never exceptions.
 
         Transport failures (closed session, broken pipe) do raise; the executor turns those
-        into an ``error`` outcome.
+        into an ``error`` outcome. An HTTP server's non-2xx answer (a gateway's rate limit, an
+        expired token) raises :class:`MCPClientError` with the status and the body's start.
         """
         self.tool_calls += 1
         started = time.perf_counter()
-        result = await self._session.call_tool(name, arguments or {})
+        since = self._mark()
+        try:
+            result = await self._session.call_tool(name, arguments or {})
+        except Exception as exc:
+            failure = self._http_failure(exc, since)
+            if failure is not None:
+                raise failure from exc
+            raise
         ms = (time.perf_counter() - started) * 1000
         return normalise_result(name, result, ms)
 
 
 @asynccontextmanager
-async def connect_streams(read: Any, write: Any) -> AsyncIterator[Session]:
-    """Wrap already-open transport streams (stdio, HTTP or the SDK's in-memory transport)."""
+async def connect_streams(
+    read: Any, write: Any, *, http_errors: HttpErrorLog | None = None
+) -> AsyncIterator[Session]:
+    """Wrap already-open transport streams (stdio, HTTP or the SDK's in-memory transport).
+
+    ``http_errors`` is the HTTP transport's log of non-2xx answers, which the session's calls
+    use to say what the server answered when the SDK reports only a generic error.
+    """
     async with ClientSession(read, write) as session:
         init = await session.initialize()
         server_name = ""
         info = getattr(init, "server_info", None)
         if info is not None:
             server_name = str(getattr(info, "name", "") or "")
-        yield Session(session, server_name=server_name)
+        yield Session(session, server_name=server_name, http_errors=http_errors)
 
 
 def stdio_params(spec: ServerSpec) -> StdioServerParameters:
@@ -408,10 +551,21 @@ async def connect(spec: ServerSpec) -> AsyncIterator[Session]:
     if spec.http is None:  # pragma: no cover - ServerSpec validation prevents this
         raise MCPClientError("server spec has neither stdio nor http")
     headers = http_headers(spec)
+    http_errors = HttpErrorLog(spec.http.url)
+    opened = False
     # mcp 2.x speaks HTTP through the ``httpx2`` package, not ``httpx``; the SDK's factory
     # builds the right client type with MCP's long SSE read timeout and merges our headers.
     async with create_mcp_http_client(headers=headers or None) as http:
-        async with streamable_http_client(spec.http.url, http_client=http) as streams:
-            read, write = streams[0], streams[1]
-            async with connect_streams(read, write) as session:
-                yield session
+        http.event_hooks = {"request": [], "response": [http_errors.on_response]}
+        try:
+            async with streamable_http_client(spec.http.url, http_client=http) as streams:
+                read, write = streams[0], streams[1]
+                async with connect_streams(read, write, http_errors=http_errors) as session:
+                    opened = True
+                    yield session
+        except Exception as exc:
+            # Only a failure to open is rewritten here; one raised by the caller's own block
+            # (after the yield) is the caller's to report and passes through unchanged.
+            if opened or not http_errors.explains(exc, 0):
+                raise
+            raise MCPClientError(http_errors.describe()) from exc

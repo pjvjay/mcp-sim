@@ -283,6 +283,26 @@ class Transcript(BaseModel):
                 self.hard_failures.append(failure)
         return event
 
+    def span(self) -> tuple[datetime, datetime] | None:
+        """``(first event time, last event time)``, or ``None`` without two parseable times."""
+        times: list[datetime] = []
+        for e in self.events:
+            try:
+                times.append(datetime.fromisoformat(e.t))
+            except (TypeError, ValueError):
+                continue
+        if len(times) < 2:
+            return None
+        return min(times), max(times)
+
+    @property
+    def duration_s(self) -> float:
+        """Seconds from the first event to the last (0.0 when the times are missing)."""
+        span = self.span()
+        if span is None:
+            return 0.0
+        return round(max(0.0, (span[1] - span[0]).total_seconds()), 3)
+
     def tools_offered(self) -> list[str]:
         """The tools offered at the end of the run, in the order they were offered."""
         offered: list[str] = []

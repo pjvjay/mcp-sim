@@ -199,11 +199,13 @@ def test_dsl_rejects_bad_effects_and_checks_at_the_call_site() -> None:
         observer("o", identity="i", kind="code").when("x", id="x").build()
 
 
-def test_models_observer_defaults_to_the_agent_model_then_per_observer() -> None:
+def test_models_observer_defaults_to_sonnet_then_per_observer() -> None:
     assert MODEL_ROLES == ("planner", "agent", "judge", "user", "observer")
     m = Models()
-    assert m.observer is None and m.observer_model == m.agent
-    assert m.for_role("observer") == m.agent
+    assert m.observer == m.observer_model == "claude-sonnet-5-5"
+    assert m.for_role("observer") == "claude-sonnet-5-5"
+    # The observers' default is their own, not a copy of the agent's.
+    assert Models(agent="claude-fable-5-1").observer_model == "claude-sonnet-5-5"
     with_observer = Models(observer="claude-haiku-4-5-20251001")
     assert with_observer.for_role("observer") == "claude-haiku-4-5-20251001"
     own = Observer.model_validate(
@@ -219,7 +221,7 @@ def test_models_observer_defaults_to_the_agent_model_then_per_observer() -> None
     )
     assert with_observer.model_for_observer(own) == "ollama:qwen2.5:7b"
     assert with_observer.model_for_observer(default) == "claude-haiku-4-5-20251001"
-    assert Models().model_for_observer(default) == Models().agent
+    assert Models().model_for_observer(default) == "claude-sonnet-5-5"
 
 
 # --- validation errors name the field --------------------------------------------------------
@@ -441,7 +443,7 @@ def test_validation_errors_name_the_field(
 
 def test_scenario_without_observers_is_unchanged(scenario_data: dict[str, Any]) -> None:
     s = parse_scenario(scenario_data)
-    assert s.observers == [] and s.models.observer is None
+    assert s.observers == [] and s.models.observer == "claude-sonnet-5-5"
     assert "observers" in Scenario.model_fields
 
 
@@ -548,7 +550,6 @@ def test_report_events_round_trip_and_rebuild_flags_and_hard_failures(tmp_path: 
 
 from mcpsim.observers import (  # noqa: E402
     BUDGET_EXHAUSTED,
-    METHOD,
     OMITTED,
     REPORT_TOOL,
     ObserverRunner,
@@ -1022,7 +1023,8 @@ def test_llm_observer_prompt_carries_identity_method_conditions_and_only_the_wat
     assert [tool["name"] for tool in call["tools"]] == [REPORT_TOOL]
     system = call["system"]
     assert AUDITOR["identity"] in system
-    assert METHOD in system
+    assert "## The method\nYou are an informant." in system
+    assert "never take its own statements as proof of status" in system
     assert "- direct_match: find_product has returned a DIRECT match for penne" in system
     assert "- fabrication: the final answer names a product no tool result returned" in system
     user = call["messages"][0]["content"]
