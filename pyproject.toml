@@ -15,6 +15,9 @@ dependencies = [
   "pydantic>=2.9",
   "pyyaml>=6",
   "httpx>=0.28",
+  # `mcpsim ui`; both already come with the mcp SDK, listed because mcpsim imports them.
+  "starlette>=0.40",
+  "uvicorn>=0.30",
 ]
 
 [project.optional-dependencies]
@@ -31,6 +34,9 @@ mcpsim = "mcpsim.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["mcpsim*"]
+
+[tool.setuptools.package-data]
+"mcpsim.ui" = ["static/*"]
 
 [tool.ruff]
 line-length = 100

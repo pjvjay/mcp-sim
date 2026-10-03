@@ -3,7 +3,8 @@
 ``catalog`` works on its own. ``plan``, ``run``, ``judge``, ``report`` and ``suite`` call into
 ``mcpsim.runner``, which is imported lazily inside each subcommand so this module imports (and
 ``mcpsim catalog`` works) before the runner exists; until it does, those subcommands print
-"not yet wired" and exit 2.
+"not yet wired" and exit 2. ``ui`` serves the local test runner (:mod:`mcpsim.ui`), which
+starts runs as ``mcpsim run`` subprocesses; it imports Starlette and uvicorn lazily too.
 
 Runner contract
 ===============
@@ -358,6 +359,28 @@ def cmd_suite(args: argparse.Namespace) -> int:
     return _guarded(args.command, body)
 
 
+def cmd_ui(args: argparse.Namespace) -> int:
+    try:
+        from mcpsim.ui.app import resolve_settings, serve
+    except ModuleNotFoundError as exc:  # starlette / uvicorn come with the mcp SDK
+        print(f"mcpsim ui: missing dependency: {exc.name}", file=sys.stderr)
+        return EXIT_USAGE
+    settings = resolve_settings(
+        skill=args.skill,
+        runs=args.runs,
+        scenarios=args.scenarios,
+        allow_remote=args.allow_remote,
+    )
+    try:
+        serve(settings, host=args.host, port=args.port)
+    except ValueError as exc:
+        print(f"mcpsim ui: {exc}", file=sys.stderr)
+        return EXIT_USAGE
+    except KeyboardInterrupt:
+        pass
+    return EXIT_OK
+
+
 def _model_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--models",
@@ -437,6 +460,30 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--dry-run", action="store_true", help="no LLM; see `run --dry-run`")
     _model_args(p)
     p.set_defaults(func=cmd_suite)
+
+    p = sub.add_parser("ui", help="serve the local test runner (scenarios, runs, transcripts)")
+    p.add_argument(
+        "--skill",
+        help="simulate skill directory (default: $MCPSIM_SKILL, else the packaged skill)",
+    )
+    p.add_argument("--host", default="127.0.0.1", help="bind address (default: 127.0.0.1)")
+    p.add_argument("--port", type=int, default=8765, help="port (default: 8765)")
+    p.add_argument(
+        "--runs", help="runs directory (default: the skill config's runs_dir, else runs/)"
+    )
+    p.add_argument(
+        "--scenarios",
+        action="append",
+        metavar="DIR_OR_GLOB",
+        help="scenario directory, file or glob; repeatable (default: the skill config's "
+        "scenarios, else scenarios/)",
+    )
+    p.add_argument(
+        "--allow-remote",
+        action="store_true",
+        help="allow a non-loopback --host (anyone who can reach it can read runs and start them)",
+    )
+    p.set_defaults(func=cmd_ui)
     return parser
 
 

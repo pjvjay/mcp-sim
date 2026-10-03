@@ -369,7 +369,12 @@ mcpsim run     <scenario> [--out runs] [--plan plan.json] [--only-path ID] [--re
 mcpsim judge   <run_dir>  [--votes N] [--threshold 1.0]      re-judge saved transcripts
 mcpsim report  <run_dir>  [--markdown] [--threshold 1.0]     rebuild report.json / report.md
 mcpsim suite   <scenario_dir> [--out runs] [--threshold 1.0] [--dry-run]
+mcpsim ui      [--skill DIR] [--host 127.0.0.1] [--port 8765] [--runs DIR]   local test runner
 ```
+
+`mcpsim ui` is a local test runner over the scenario files and run directories: scenarios by
+category with their status, search, run all / one / re-run, run history, the conversation with
+its tool calls, and the judge's per-item verdicts. See [docs/RUNNER_UI.md](docs/RUNNER_UI.md).
 
 `run`, `judge`, `report` and `suite` exit 0 when the overall pass rate reaches `--threshold`
 (a threshold of 0.8 with 4 of 5 runs passing is on the boundary and passes), 1 otherwise, and 1
