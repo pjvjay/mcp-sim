@@ -21,7 +21,7 @@ from mcpsim import runner
 from mcpsim.judge import DRY_RUN_JUDGE_MODEL, HONESTY_ITEM, VERDICT_TOOL
 from mcpsim.llm import AnthropicLLM, Usage
 from mcpsim.mcpclient import MCPClientError, Session
-from mcpsim.plan import ExecutionPlan, Path, Step
+from mcpsim.plan import MODES, ExecutionPlan, Path, Step
 from mcpsim.planner import DRY_RUN_PATH_ID
 from mcpsim.report import Report, SuiteReport
 from mcpsim.scenario import Scenario, ServerSpec, parse_scenario
@@ -39,6 +39,10 @@ from mcpsim.transcript import (
 )
 from mcpsim.verdict import Verdict
 from tests.fake_llm import ScriptedLLM, structured_response
+
+# The runner's mechanics are tested over both modes. The shipped skills/simulate/config.yaml
+# runs only `free`, so the tests that count guided and free runs ask for both explicitly.
+BOTH_MODES = list(MODES)
 
 PENNE: dict[str, Any] = {
     "slug": "penne",
@@ -74,7 +78,7 @@ def _stems(run_dir: FsPath, folder: str, suffix: str) -> list[str]:
 
 
 def test_dry_run_writes_every_artefact(quick_path: FsPath, out_dir: FsPath) -> None:
-    run_dir = runner.run_scenario(quick_path, out_dir, dry_run=True)
+    run_dir = runner.run_scenario(quick_path, out_dir, dry_run=True, modes=BOTH_MODES)
 
     assert run_dir.parent == out_dir / "fake-lookup"
     assert (run_dir / "scenario.json").is_file()
@@ -171,7 +175,7 @@ def test_dry_run_builds_no_llm(
 
 
 def test_judge_run_dir_rebuilds_verdicts_and_report(quick_path: FsPath, out_dir: FsPath) -> None:
-    run_dir = runner.run_scenario(quick_path, out_dir, dry_run=True)
+    run_dir = runner.run_scenario(quick_path, out_dir, dry_run=True, modes=BOTH_MODES)
     originals = {p.name: p.read_text(encoding="utf-8") for p in (run_dir / "verdicts").iterdir()}
     for p in (run_dir / "verdicts").iterdir():
         p.unlink()
@@ -233,7 +237,7 @@ def test_report_and_judge_of_a_run_that_stopped_early_keep_the_recorded_repeat(
 ) -> None:
     from mcpsim.cli import main
 
-    run_dir = runner.run_scenario(quick_path, out_dir, dry_run=True, repeat=3)
+    run_dir = runner.run_scenario(quick_path, out_dir, dry_run=True, repeat=3, modes=BOTH_MODES)
     assert json.loads((run_dir / "scenario.json").read_text())["repeat"] == 3, "--repeat recorded"
     _stop_early(run_dir)
 
@@ -688,7 +692,7 @@ def test_run_suite_returns_the_threshold_exit_code(
 ) -> None:
     folder = _suite_dir(tmp_path, quick_data)
 
-    assert runner.run_suite(folder, out_dir, threshold=1.0, dry_run=True) == 1
+    assert runner.run_suite(folder, out_dir, threshold=1.0, dry_run=True, modes=BOTH_MODES) == 1
     out = capsys.readouterr().out
     assert out.index("fake-a: 2/2 runs passed") < out.index("fake-b: 0/2 runs passed")
     assert "suite: 2/4 runs passed (50.0%)" in out
@@ -708,7 +712,7 @@ def test_run_suite_returns_the_threshold_exit_code(
     ]
 
     # Half the runs pass, so a threshold at or below the pass rate yields exit 0.
-    assert runner.run_suite(folder, out_dir, threshold=0.5, dry_run=True) == 0
+    assert runner.run_suite(folder, out_dir, threshold=0.5, dry_run=True, modes=BOTH_MODES) == 0
     assert len(sorted(out_dir.glob("suite-*"))) == 2
 
 
@@ -847,7 +851,7 @@ def test_a_session_that_fails_to_open_becomes_an_error_run(
             yield session
 
     monkeypatch.setattr(runner, "connect", flaky)
-    run_dir = runner.run_scenario(quick_path, out_dir, dry_run=True)
+    run_dir = runner.run_scenario(quick_path, out_dir, dry_run=True, modes=BOTH_MODES)
 
     stems = _stems(run_dir, "transcripts", ".jsonl")
     assert len(stems) == 2
