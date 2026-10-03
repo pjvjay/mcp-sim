@@ -1,0 +1,104 @@
+{
+  "scenario": "cheapest-penne",
+  "catalog_digest": "d1d667582c7bff46759a456ab84ae96e5f427fcb23d1b7b5269f65946b65061c",
+  "paths": [
+    {
+      "id": "happy-dry-run",
+      "kind": "happy",
+      "title": "Dry run over 10 goal-relevant tool(s)",
+      "rationale": "Dry run: no LLM was used. One happy path over the allowed tools that share vocabulary with the scenario, most relevant first, at most max_tool_calls=10: find_product, get_product, get_product_origins, origin_triage, list_products, rank_products_by_origin, list_origin_submissions, pipeline_status, list_recipes, get_recipe. The scout already proved these expected-outcome lookups answer, so they come first: find_product. Arguments named by a top-level expected_outcome.json key with a plain value take that value: find_product(query=\"penne\"); other required arguments take schema placeholders. Skipped because the description says they cost money/credits or are slow: plan_recipe, plan_from_text, plan_week.",
+      "steps": [
+        {
+          "intent": "Call find_product with arguments from the expected outcome to prove it answers",
+          "tool": "find_product",
+          "arguments_sketch": {
+            "query": "penne"
+          },
+          "success_looks_like": "find_product returns a result for query=\"penne\" (an error result still counts as the server answering)",
+          "expect_error": false
+        },
+        {
+          "intent": "Call get_product with placeholder arguments to prove it answers",
+          "tool": "get_product",
+          "arguments_sketch": {
+            "product_id": 1
+          },
+          "success_looks_like": "get_product returns a result (an error result still counts as the server answering)",
+          "expect_error": false
+        },
+        {
+          "intent": "Call get_product_origins with placeholder arguments to prove it answers",
+          "tool": "get_product_origins",
+          "arguments_sketch": {},
+          "success_looks_like": "get_product_origins returns a result (an error result still counts as the server answering)",
+          "expect_error": false
+        },
+        {
+          "intent": "Call origin_triage with placeholder arguments to prove it answers",
+          "tool": "origin_triage",
+          "arguments_sketch": {},
+          "success_looks_like": "origin_triage returns a result (an error result still counts as the server answering)",
+          "expect_error": false
+        },
+        {
+          "intent": "Call list_products with placeholder arguments to prove it answers",
+          "tool": "list_products",
+          "arguments_sketch": {},
+          "success_looks_like": "list_products returns a result (an error result still counts as the server answering)",
+          "expect_error": false
+        },
+        {
+          "intent": "Call rank_products_by_origin with placeholder arguments to prove it answers",
+          "tool": "rank_products_by_origin",
+          "arguments_sketch": {},
+          "success_looks_like": "rank_products_by_origin returns a result (an error result still counts as the server answering)",
+          "expect_error": false
+        },
+        {
+          "intent": "Call list_origin_submissions with placeholder arguments to prove it answers",
+          "tool": "list_origin_submissions",
+          "arguments_sketch": {},
+          "success_looks_like": "list_origin_submissions returns a result (an error result still counts as the server answering)",
+          "expect_error": false
+        },
+        {
+          "intent": "Call pipeline_status with placeholder arguments to prove it answers",
+          "tool": "pipeline_status",
+          "arguments_sketch": {},
+          "success_looks_like": "pipeline_status returns a result (an error result still counts as the server answering)",
+          "expect_error": false
+        },
+        {
+          "intent": "Call list_recipes with placeholder arguments to prove it answers",
+          "tool": "list_recipes",
+          "arguments_sketch": {},
+          "success_looks_like": "list_recipes returns a result (an error result still counts as the server answering)",
+          "expect_error": false
+        },
+        {
+          "intent": "Call get_recipe with placeholder arguments to prove it answers",
+          "tool": "get_recipe",
+          "arguments_sketch": {
+            "slug": ""
+          },
+          "success_looks_like": "get_recipe returns a result (an error result still counts as the server answering)",
+          "expect_error": false
+        }
+      ],
+      "checkpoints": [
+        "transcript: contains a tool_call for find_product",
+        "transcript: contains a tool_call for get_product",
+        "transcript: contains a tool_call for get_product_origins",
+        "transcript: contains a tool_call for origin_triage",
+        "transcript: contains a tool_call for list_products",
+        "transcript: contains a tool_call for rank_products_by_origin",
+        "transcript: contains a tool_call for list_origin_submissions",
+        "transcript: contains a tool_call for pipeline_status",
+        "transcript: contains a tool_call for list_recipes",
+        "transcript: contains a tool_call for get_recipe",
+        "final_result: equals the structured content of the successful tool result that covers the most expected_outcome.json keys (the last one otherwise), or is null when no step returned structured content",
+        "report: shelf_clerk.direct_match is true"
+      ]
+    }
+  ]
+}
