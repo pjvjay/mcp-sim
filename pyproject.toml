@@ -24,13 +24,29 @@ dev = [
   "ruff>=0.7",
   "mypy>=1.13",
   "types-PyYAML",
+  # tests/test_packaging.py builds the wheel without build isolation.
+  "setuptools>=70.1",
 ]
 
 [project.scripts]
 mcpsim = "mcpsim.cli:main"
 
-[tool.setuptools.packages.find]
-include = ["mcpsim*"]
+[tool.setuptools]
+# The simulate skill (skills/simulate: SKILL.md, config.yaml, roles/*.md, scripts/run.sh) ships
+# inside the package as mcpsim/_skills/simulate, so an installed mcpsim finds its default skill
+# without the repository (mcpsim.skill.skill_dir).
+packages = ["mcpsim", "mcpsim._skills"]
+
+[tool.setuptools.package-dir]
+"mcpsim._skills" = "skills"
+
+[tool.setuptools.package-data]
+"mcpsim._skills" = [
+  "simulate/SKILL.md",
+  "simulate/config.yaml",
+  "simulate/roles/*.md",
+  "simulate/scripts/*.sh",
+]
 
 [tool.ruff]
 line-length = 100

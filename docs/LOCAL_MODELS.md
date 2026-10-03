@@ -190,7 +190,10 @@ call right for both pantry scenarios it was tried on (`find_product(query="penne
 `items[0].brand` and added a redundant step with a placeholder id. So the model plans the
 execution and the framework builds the tests.
 
-**1. The execution plan (the model).** One constrained call, in the user's framing:
+**1. The execution plan (the model).** One constrained call, in the user's framing. The
+wording of this call, its re-ask and the policy questions below lives in the simulate skill's
+`roles/planner-local.md` (README "Configure the LLM roles"); its `max_tokens` (1,200) and
+`policy_max_tokens` (40) are that file's frontmatter, so they can be tuned without a code change:
 
 ```
 system: You are an expert JSON config generator. Generate a JSON config of the format:

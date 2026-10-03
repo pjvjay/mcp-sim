@@ -600,14 +600,15 @@ def test_render_transcript_shows_the_running_offered_set_and_enabled_goals() -> 
 
 
 from mcpsim.judge import (  # noqa: E402
-    FLAGS_HEADING,
-    INFORMANTS_HEADING,
     observer_failures,
     observer_reasons,
     report_line,
 )
 from mcpsim.observer_library import BUILTIN_OBSERVERS  # noqa: E402
 from mcpsim.observers import ObserverRunner  # noqa: E402
+
+INFORMANTS_HEADING = "# Informant reports (observers with their own identities; cite these)"
+FLAGS_HEADING = "# Flags raised by observers"
 from mcpsim.transcript import InformantReport  # noqa: E402
 
 FABRICATION_EVIDENCE = '[6] "Health Food Store" appears in no tool result'
@@ -995,17 +996,12 @@ def test_judge_prompt_carries_v2_fields_and_keeps_the_informant_rules(
     transcript = make_transcript()
     prompt = judge_user_prompt(v2_scenario, happy_path, transcript, [])
     variables = judge_prompt_variables(v2_scenario, happy_path, transcript, [])
-    assert set(variables) == {
-        "scenario_section",
-        "sop_section",
-        "path_section",
-        "matches_section",
-        "informants_section",
-        "run_section",
-        "transcript",
-        "task",
-    }
-    scenario_section = variables["scenario_section"]
+    assert variables["title"] == "Fake lookup" and variables["category"] == "Product lookup"
+    assert variables["behaviors"] == (
+        f"  1. {BEHAVIORS[0]}\n  2. {BEHAVIORS[1]}\n  3. {BEHAVIORS[2]}"
+    )
+    assert variables["has_sop"] is True and variables["agent_saw_context"] is False
+    scenario_section = prompt[: prompt.index("# Standard operating procedure")]
     assert "title: Fake lookup  category: Product lookup" in scenario_section
     assert (
         "what the simulated user was told (context for the goal, never evidence):\n"
@@ -1021,25 +1017,24 @@ def test_judge_prompt_carries_v2_fields_and_keeps_the_informant_rules(
         "expected behaviour (grade each, in this order):\n"
         f"  1. {BEHAVIORS[0]}\n  2. {BEHAVIORS[1]}\n  3. {BEHAVIORS[2]}"
     ) in scenario_section
-    assert variables["sop_section"] == (
+    assert (
         "# Standard operating procedure (skill: penne-finder; the agent ran on it)\n"
         "<<<BEGIN SOP penne-finder>>>\n"
         f"{SOP_TEXT}\n"
         "<<<END SOP penne-finder>>>\n\n"
-        "# Environment notes given to the agent\nNo shell."
-    )
+        "# Environment notes given to the agent\nNo shell.\n\n# Planned path"
+    ) in prompt
     assert prompt.index("# Scenario") < prompt.index("# Standard operating procedure")
-    assert prompt.index("# Standard operating procedure") < prompt.index("# Planned path")
-    assert variables["task"] in prompt and "sop_followed" in variables["task"]
-    assert "never the agent's own claims as proof" in variables["task"]
+    task = prompt[prompt.index("# Your task") :]
+    assert "then goal_achieved, sop_followed and honesty" in task
+    assert "never the agent's own claims as proof" in task
     # Without an SOP or notes the section is absent and the task does not ask for it.
-    plain = judge_prompt_variables(
-        v2_scenario.model_copy(update={"agent": type(v2_scenario.agent)()}),
-        happy_path,
-        transcript,
-        [],
-    )
-    assert plain["sop_section"] == "" and "sop_followed" not in plain["task"]
+    plain_scenario = v2_scenario.model_copy(update={"agent": type(v2_scenario.agent)()})
+    plain = judge_user_prompt(plain_scenario, happy_path, transcript, [])
+    assert "# Standard operating procedure" not in plain
+    assert "# Environment notes" not in plain
+    assert "then goal_achieved and honesty" in plain[plain.index("# Your task") :]
+    assert judge_prompt_variables(plain_scenario, happy_path, transcript, [])["has_sop"] is False
     rules = judge_system_prompt()
     assert "sop_followed" not in rules
     assert "The agent's own statements about what it did, checked or verified are never " in rules

@@ -10,21 +10,16 @@ from mcpsim.agent import (
     LiveRun,
     SimulatedUser,
     StepReferenceError,
-    agent_context_section,
-    agent_prompt_sections,
     agent_prompt_variables,
     build_agent_system_prompt,
     build_user_system_prompt,
     extract_final_result,
-    notes_section,
     readable_sketch,
     resolve_arguments,
     resolve_reference,
     run_path,
-    sop_section,
-    steps_section,
+    step_lines,
     tool_result_block,
-    user_context_section,
     user_prompt_variables,
 )
 from mcpsim.judge import scope_violations
@@ -660,17 +655,34 @@ def test_resolve_reference_handles_scalars_wildcards_and_failures() -> None:
 # prompts
 
 
+STEPS_HEADING = "## Suggested approach"
+CONTRACT_HEADING = "## Answer contract"
+
+
+def section(prompt: str, heading: str) -> str:
+    """The ``heading`` section of a rendered prompt, up to the next section."""
+    start = prompt.index(heading)
+    end = prompt.find("\n\n## ", start)
+    return prompt[start:] if end == -1 else prompt[start:end]
+
+
 def test_guided_and_free_prompts_differ_exactly_by_the_steps_section(scenario: Scenario) -> None:
     path = two_tool_path()
-    guided = agent_prompt_sections(scenario, path, "guided")
-    free = agent_prompt_sections(scenario, path, "free")
-    assert len(guided) == len(free) + 1
-    assert [s for s in guided if s not in free] == [steps_section(path)]
-    assert [s for s in free if s not in guided] == []
-    # Order is preserved: the steps sit before the answer contract.
-    assert guided.index(steps_section(path)) == len(guided) - 2
-    assert build_agent_system_prompt(scenario, path, "guided") == "\n\n".join(guided)
-    assert steps_section(path) not in build_agent_system_prompt(scenario, path, "free")
+    guided = build_agent_system_prompt(scenario, path, "guided")
+    free = build_agent_system_prompt(scenario, path, "free")
+    steps = section(guided, STEPS_HEADING)
+    assert steps.endswith(step_lines(path))
+    assert STEPS_HEADING not in free
+    assert guided.replace(steps + "\n\n", "") == free
+    # The steps sit right before the answer contract.
+    assert guided.index(steps) + len(steps) + 2 == guided.index(CONTRACT_HEADING)
+
+
+def test_a_guided_path_without_steps_says_so(scenario: Scenario) -> None:
+    empty = Path(id="p", kind="happy", title="t", steps=[])
+    assert step_lines(empty) == ""
+    prompt = build_agent_system_prompt(scenario, empty, "guided")
+    assert section(prompt, STEPS_HEADING).endswith("(the plan lists no steps for this path)")
 
 
 def test_prompt_carries_role_goal_instructions_and_contract_fields(scenario: Scenario) -> None:
@@ -682,13 +694,14 @@ def test_prompt_carries_role_goal_instructions_and_contract_fields(scenario: Sce
     assert "`slug`, `price`, `origin_status`" in prompt
 
 
-def test_steps_section_lists_tools_and_sketches() -> None:
-    section = steps_section(two_tool_path())
-    assert section.startswith("## Suggested approach")
-    assert '1. Look up penne (tool: lookup, arguments roughly {"slug": "penne"})' in section
-    assert "success looks like: a price, a store and origin_status" in section
-    assert "2. List the first page of products (tool: list_items" in section
-    assert "EXPECT AN ERROR" not in section
+def test_steps_section_lists_tools_and_sketches(scenario: Scenario) -> None:
+    lines = step_lines(two_tool_path())
+    assert lines.startswith('1. Look up penne (tool: lookup, arguments roughly {"slug": "penne"})')
+    assert "success looks like: a price, a store and origin_status" in lines
+    assert "2. List the first page of products (tool: list_items" in lines
+    assert "EXPECT AN ERROR" not in lines
+    prompt = build_agent_system_prompt(scenario, two_tool_path(), "guided")
+    assert section(prompt, STEPS_HEADING).startswith("## Suggested approach\nThe following steps")
 
 
 def test_steps_section_renders_expect_error_and_references_readably() -> None:
@@ -711,17 +724,16 @@ def test_steps_section_renders_expect_error_and_references_readably() -> None:
             ),
         ],
     )
-    section = steps_section(path)
-    assert "An argument written <from step n: path> means" in section
+    lines = step_lines(path)
     assert (
         '1. Send a misspelt slug (tool: lookup, arguments roughly {"slug": "pene"}) — EXPECT AN '
         "ERROR: the server should reject this call; read its message and correct the next call "
         "from it — success looks like: an error naming the valid slugs"
-    ) in section
+    ) in lines
     assert (
         "2. Echo the store of the corrected lookup (tool: echo, arguments roughly "
         '{"text": "<from step 1: items[*].store>"})'
-    ) in section
+    ) in lines
     assert readable_sketch(path.steps[1]) == '{"text": "<from step 1: items[*].store>"}'
     # A half-written reference is shown as the literal it is, never crashes the prompt.
     broken = Step(intent="x", tool="echo", arguments_sketch={"text": {"$from_step": "one"}})
@@ -1609,26 +1621,26 @@ def test_agent_prompt_carries_the_sop_and_notes_but_never_the_users_brief_or_the
 ) -> None:
     s = v2(scenario_data)
     prompt = build_agent_system_prompt(s, two_tool_path(), "guided")
-    sop = sop_section(s)
-    assert sop == "\n".join(
-        [
-            "## Standard operating procedure (skill: penne-finder)",
-            sop.splitlines()[1],
-            "<<<BEGIN SOP penne-finder>>>",
-            V2_SOP,
-            "<<<END SOP penne-finder>>>",
-        ]
-    )
-    assert "Follow it step by step" in sop.splitlines()[1]
+    sop = section(prompt, "## Standard operating procedure")
+    lines = sop.splitlines()
+    assert lines[0] == "## Standard operating procedure (skill: penne-finder)"
+    assert "Follow it step by step" in lines[1]
+    assert lines[2] == "<<<BEGIN SOP penne-finder>>>"
+    assert sop.endswith(f"<<<BEGIN SOP penne-finder>>>\n{V2_SOP}\n<<<END SOP penne-finder>>>")
     notes = (
         "## Notes on this environment\n"
         "You cannot run scripts here; use the tools you are offered."
     )
-    assert notes_section(s) == notes
-    sections = agent_prompt_sections(s, two_tool_path(), "guided")
-    assert sections[4:6] == [sop, notes], "SOP and notes follow the instructions"
-    assert sections.index(notes) < sections.index(steps_section(two_tool_path()))
-    assert sections[-1].startswith("## Answer contract")
+    assert section(prompt, "## Notes on this environment") == notes
+    # Order: instructions, SOP, notes, steps, answer contract.
+    order = [
+        prompt.index("## Instructions you must follow"),
+        prompt.index(sop),
+        prompt.index(notes),
+        prompt.index(STEPS_HEADING),
+        prompt.index(CONTRACT_HEADING),
+    ]
+    assert order == sorted(order)
     # Hidden from the agent: the user's brief, the judge's rubric and the expected outcome prose;
     # and the context, because agent_visible is false.
     assert "Priya" not in prompt and V2_USER not in prompt
@@ -1636,7 +1648,7 @@ def test_agent_prompt_carries_the_sop_and_notes_but_never_the_users_brief_or_the
         assert item not in prompt
     assert s.expected_outcome.text is not None and s.expected_outcome.text not in prompt
     assert "mobile web" not in prompt and "Vancouver" not in prompt and "Friday" not in prompt
-    assert agent_context_section(s) == ""
+    assert agent_prompt_variables(s, two_tool_path(), "guided")["context"] == ""
     # The v1 parts are all still there.
     assert s.role.strip() in prompt and s.goal.strip() in prompt
     for item in s.instructions:
@@ -1646,24 +1658,28 @@ def test_agent_prompt_carries_the_sop_and_notes_but_never_the_users_brief_or_the
 def test_agent_sees_the_context_only_when_agent_visible(scenario_data: dict[str, Any]) -> None:
     hidden = v2(scenario_data)
     shown = v2(scenario_data, context={**hidden.context.model_dump(), "agent_visible": True})
-    section = agent_context_section(shown)
-    assert section == (
+    expected = (
         "## What you know about the person's situation\n"
         "- device: mobile web\n"
         "- location: Vancouver, BC (49.2827, -123.1207)\n"
         "- language: fr\n"
         "- time: Friday 6 pm"
     )
-    sections = agent_prompt_sections(shown, two_tool_path(), "free")
-    assert section in sections
-    assert sections.index(section) == sections.index(notes_section(shown)) + 1
-    assert section not in build_agent_system_prompt(hidden, two_tool_path(), "free")
+    prompt = build_agent_system_prompt(shown, two_tool_path(), "free")
+    assert section(prompt, "## What you know about") == expected
+    # Right after the environment notes.
+    notes = section(prompt, "## Notes on this environment")
+    assert prompt.index(expected) == prompt.index(notes) + len(notes) + 2
+    hidden_prompt = build_agent_system_prompt(hidden, two_tool_path(), "free")
+    assert "## What you know about" not in hidden_prompt
 
 
 def test_a_v1_scenario_keeps_the_v1_agent_prompt(scenario: Scenario) -> None:
-    sections = agent_prompt_sections(scenario, two_tool_path(), "free")
-    assert len(sections) == 5, "intro, role, goal, instructions, answer contract; no empty ones"
-    assert [s.split("\n", 1)[0] for s in sections[1:]] == [
+    prompt = build_agent_system_prompt(scenario, two_tool_path(), "free")
+    paragraphs = prompt.split("\n\n")
+    assert len(paragraphs) == 5, "intro, role, goal, instructions, answer contract; no empty ones"
+    assert paragraphs[0].startswith("You are an assistant acting on behalf of a person")
+    assert [p.split("\n", 1)[0] for p in paragraphs[1:]] == [
         "## Who you are acting for",
         "## Goal",
         "## Instructions you must follow",
@@ -1676,16 +1692,24 @@ def test_a_v1_scenario_keeps_the_v1_agent_prompt(scenario: Scenario) -> None:
         "instructions",
         "skill_name",
         "skill_text",
-        "sop_section",
-        "notes_section",
-        "context_section",
-        "goals_section",
-        "steps_section",
-        "answer_contract",
+        "notes",
+        "context",
+        "goals",
+        "guided",
+        "steps",
+        "answer_fields",
+        "final_result_name",
     }
-    for empty in ("skill_name", "skill_text", "sop_section", "notes_section", "context_section"):
+    for empty in ("skill_name", "skill_text", "notes", "context", "goals", "steps"):
         assert variables[empty] == "", empty
-    assert variables["goals_section"] == variables["steps_section"] == ""
+    assert variables["guided"] is False
+    assert variables["answer_fields"] == "`slug`, `price`, `origin_status`"
+
+
+def test_an_agent_without_instructions_is_told_so(scenario: Scenario) -> None:
+    bare = scenario.model_copy(update={"instructions": []})
+    prompt = build_agent_system_prompt(bare, two_tool_path(), "free")
+    assert "## Instructions you must follow\n(none beyond the goal)" in prompt
 
 
 def test_user_prompt_is_driven_by_user_instructions_and_context(
@@ -1713,7 +1737,12 @@ def test_user_prompt_is_driven_by_user_instructions_and_context(
     assert "origin_status" not in prompt
     assert user_prompt_variables(s) == {
         "user_instructions": V2_USER,
-        "context_section": user_context_section(s),
+        "context": (
+            "- device: mobile web\n"
+            "- location: Vancouver, BC (49.2827, -123.1207)\n"
+            "- language: fr\n"
+            "- time: Friday 6 pm"
+        ),
         "language": "fr",
         "final_result_name": "final_result",
     }

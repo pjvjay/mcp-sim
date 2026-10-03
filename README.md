@@ -10,6 +10,11 @@ standard operating procedure. The first server it is pointed at is the pantry pl
 ([`pjvjay/pantry-api`](https://github.com/pjvjay/pantry-api)); nothing in the core knows about
 pantry, the pantry suite is just a directory of scenario files.
 
+Every LLM call (planner, agent, simulated user, observers, judge) is configured in one skill,
+[`skills/simulate/`](skills/simulate/SKILL.md): `config.yaml` picks the models and run settings,
+`roles/<role>.md` holds each role's settings and prompt templates, and `SKILL.md` walks through
+running the whole flow on this machine. See [Configure the LLM roles](#configure-the-llm-roles).
+
 Design: [docs/DESIGN.md](docs/DESIGN.md). Local models: [docs/LOCAL_MODELS.md](docs/LOCAL_MODELS.md).
 
 ## Why simulations, and the three agents
@@ -60,8 +65,10 @@ Modules: `scenario` (file model, observer declarations), `mcpclient` (connect, c
 normalised tool calls), `scout` (read-only observations before planning), `observers` (the
 informant runner and the Python DSL), `observer_library` (built-ins), `planner`, `agent` (the
 loop and the simulated user), `matcher` (deterministic JSON checks), `judge`, `transcript`,
-`verdict`, `report`, `runner` (orchestration and artefacts on disk), `cli`. Every LLM call goes
-through one `Protocol` in `llm.py`, so tests run on a scripted fake. The whole flow is drawn in
+`verdict`, `report`, `runner` (orchestration and artefacts on disk), `cli`, `skill` (loads the
+simulate skill: config, role settings, precedence, scenario sources) and `prompt_template` (the
+role files' template language). Every LLM call goes through one `Protocol` in `llm.py`, so tests
+run on a scripted fake; every prompt is rendered from a role file. The whole flow is drawn in
 [docs/WORKFLOW.md](docs/WORKFLOW.md).
 
 ## Quickstart
@@ -81,7 +88,9 @@ MCPSIM_DRY_RUN=1 .venv/bin/mcpsim run scenarios/pantry/cheapest-penne.yaml
 # The real thing
 export ANTHROPIC_API_KEY=...
 .venv/bin/mcpsim run scenarios/pantry/tomato-penne-boycott.yaml
-.venv/bin/mcpsim suite scenarios/pantry --threshold 0.8
+.venv/bin/mcpsim suite --threshold 0.8                 # every scenario in skills/simulate/config.yaml
+.venv/bin/mcpsim suite --name 'cheapest-*' --list      # what would run, with the resolved settings
+.venv/bin/mcpsim config                                # every role's model, prompts and settings
 ```
 
 Every artefact lands under `runs/<scenario>/<timestamp>/`:
@@ -427,13 +436,27 @@ scenario = load_scenario("x.yaml").with_observers([auditor, clerk, desk])
 
 ```
 mcpsim catalog <scenario> [--json]            print what the server exposes (no LLM)
-mcpsim plan    <scenario> [--out runs] [--dry-run]
+mcpsim plan    <scenario> [--out runs] [--dry-run] [--skill DIR] [--models ...]
 mcpsim run     <scenario> [--out runs] [--plan plan.json] [--only-path ID] [--repeat N]
                           [--mode guided|free] [--dry-run] [--threshold 1.0]
-mcpsim judge   <run_dir>  [--votes N] [--threshold 1.0]      re-judge saved transcripts
+                          [--skill DIR] [--models ...] [--allow-same-judge]
+mcpsim judge   <run_dir>  [--votes N] [--threshold 1.0] [--skill DIR]   re-judge saved transcripts
 mcpsim report  <run_dir>  [--markdown] [--threshold 1.0]     rebuild report.json / report.md
-mcpsim suite   <scenario_dir> [--out runs] [--threshold 1.0] [--dry-run]
+mcpsim suite   [scenario_dir] [--skill DIR] [--name GLOB]... [--category GLOB]... [--out DIR]
+                          [--repeat N] [--modes guided,free] [--list [--json]]
+                          [--threshold 1.0] [--dry-run] [--models ...] [--allow-same-judge]
+mcpsim config  [--skill DIR] [--scenario NAME|FILE] [--json]
 ```
+
+`suite` runs every scenario of the skill's `config.yaml` (or of `scenario_dir`), one after
+another, into `runs_dir` (or `--out`), and ends with a table: each scenario's passed/runs, pass
+rate, pass^k, cost, time and run directory. `--name` / `--category` select by fnmatch glob
+(repeatable, any match); `--list` shows the selection with its resolved settings and runs
+nothing. A scenario that does not load or cannot run (an unset `env:` skill, an unreachable
+server) is reported in the table and in `suite.json`'s `errors`, the others still run, and the
+suite exits 1. `config` prints every role's model and the layer it came from, its settings and
+prompts, the run settings, the scenario sources and `runs_dir`; `--scenario` resolves for one
+scenario (its overrides included), `--json` prints the same as data.
 
 `run`, `judge`, `report` and `suite` exit 0 when the overall pass rate reaches `--threshold`
 (a threshold of 0.8 with 4 of 5 runs passing is on the boundary and passes), 1 otherwise, and 1
@@ -548,6 +571,82 @@ the planning tools cost real credits on the server side (no `DEMO_MODE`), so sta
 `--only-path happy --repeat 1` and a low `max_cost_usd`. The live server has no `setup` hook;
 state such as pending submissions persists between runs.
 
+## Configure the LLM roles
+
+Every simulation LLM call is configured in one skill directory, `skills/simulate/` (packaged
+with mcpsim too, so an installed copy finds it). Pick another one with `--skill DIR` or
+`MCPSIM_SKILL=DIR`; `mcpsim config` prints what resolves.
+
+```
+skills/simulate/
+  SKILL.md            how to run the flow end to end (preflight, gateway scenarios, suite, ui, report)
+  config.yaml         defaults (role -> provider:model), run (repeat, modes, judge_votes,
+                      concurrency), scenarios (dirs, globs, $ENV), runs_dir, overrides
+  roles/planner.md        the hosted planner         roles/agent.md     the agent under test
+  roles/planner-local.md  the local execution planner (an ollama: planner only)
+  roles/user.md           the simulated user         roles/observer.md  the LLM observers
+  roles/judge.md          the judge (votes)
+  scripts/run.sh      preflight | scenarios | suite | ui | config | report | all
+```
+
+**Models.** Precedence for each role, lowest to highest: the built-in default < the role
+file's frontmatter (`provider`, `model`) < `config.yaml` `defaults` < every `config.yaml`
+override whose `match` (fnmatch globs on `name` and/or `category`) fits the scenario, in file
+order < the scenario file's own `models` < `--models`. The bundled config puts every role on the
+Anthropic API (planner `claude-opus-5-5`, agent `claude-sonnet-5-5`, user
+`claude-haiku-4-5-20251001`, observer `claude-sonnet-5-5`, judge `claude-opus-5-5`):
+
+```yaml
+defaults:
+  judge: anthropic:claude-opus-5-5
+overrides:
+  - match: { category: "Recipe*" }
+    models: { judge: anthropic:claude-opus-5 }
+    run: { judge_votes: 1 }
+```
+
+**Run settings.** `repeat`, `modes`, `judge_votes` and `concurrency` follow the same ladder
+(built-in < the judge file's `votes` < `config.yaml` `run` < matching overrides < the scenario
+file < `--repeat` and `--mode` / `--modes`; `mcpsim judge --votes` for a re-judge). The bundled defaults are repeat 1, modes guided and
+free, three judge votes, two runs in flight. The `scenario.json` of each run records the
+resolved models and settings, so a re-judge uses what actually ran.
+
+**Prompts.** Each role file is YAML frontmatter (`role`, `provider`, `model`, optional
+`temperature` and `max_tokens`; the judge's `votes`, the local planner's `policy_max_tokens`)
+and one or more prompts, each opened by a `{% prompt NAME %}` line. The code computes the
+dynamic sections (catalog digest, scenario, informant reports, observations, transcript
+excerpts, checklist, tool lists) and hands them over as named placeholders; the template owns
+the wording and the order:
+
+```
+{% prompt system %}
+## Goal
+{{ goal }}
+
+{% if notes %}
+## Notes on this environment
+{{ notes }}
+
+{% endif %}
+Rules:
+#. Judge what happened, not what should have happened.
+{% if has_sop %}
+#. sop_followed: ...
+{% endif %}
+```
+
+`{{ name }}` inserts a value verbatim; `{% if name %}` / `{% elif %}` / `{% else %}` /
+`{% endif %}` keep a block when the value is non-empty (`if not` inverts); `#. ` auto-numbers;
+`{# … #}` is a comment; a line holding only tags vanishes with its line break. Each role file's
+header comment lists the placeholders each prompt accepts and requires (also in
+`mcpsim config --json`). Loading refuses unknown frontmatter keys, unknown or missing prompts,
+unknown placeholders and missing required ones (say a planner prompt without `{{ catalog }}`),
+naming the file and line; it refuses a `temperature` on a role whose resolved model rejects one
+(Claude Opus 5.5, Sonnet 5.5, Fable 5.1, Opus 4.7+). The bundled templates render the exact
+bytes the code used to build (`tests/test_prompt_golden.py` compares 882 prompts with a capture
+taken before the move); after a deliberate prompt change, regenerate the capture with
+`python -m tests.prompt_cases --write` and review it.
+
 ## Models and cost
 
 Defaults, all Anthropic API models: planner `claude-opus-5-5`, agent `claude-sonnet-5-5`,
@@ -562,8 +661,9 @@ with outcome `budget_exceeded` (a failed run with a reason, never a crash).
 Every `models` entry is `provider:model`; a bare name means `anthropic`. With `ollama:<model>`
 the planner, the agent, the simulated user and (with `allow_same_judge`) the judge run on a
 local [Ollama](https://ollama.com) server at `OLLAMA_HOST` (default `http://localhost:11434`)
-with zero API spend and no key. `--models` overrides a scenario's `models` block for one run, so
-scenario files stay provider-neutral:
+with zero API spend and no key. `--models` overrides everything else (a scenario's `models`
+block, `config.yaml`; see Configure the LLM roles) for one run, so scenario files stay
+provider-neutral:
 
 ```bash
 mcpsim plan scenarios/pantry/tomato-penne-boycott.yaml \

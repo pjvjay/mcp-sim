@@ -550,7 +550,6 @@ def test_report_events_round_trip_and_rebuild_flags_and_hard_failures(tmp_path: 
 
 from mcpsim.observers import (  # noqa: E402
     BUDGET_EXHAUSTED,
-    METHOD,
     OMITTED,
     REPORT_TOOL,
     ObserverRunner,
@@ -1024,7 +1023,8 @@ def test_llm_observer_prompt_carries_identity_method_conditions_and_only_the_wat
     assert [tool["name"] for tool in call["tools"]] == [REPORT_TOOL]
     system = call["system"]
     assert AUDITOR["identity"] in system
-    assert METHOD in system
+    assert "## The method\nYou are an informant." in system
+    assert "never take its own statements as proof of status" in system
     assert "- direct_match: find_product has returned a DIRECT match for penne" in system
     assert "- fabrication: the final answer names a product no tool result returned" in system
     user = call["messages"][0]["content"]

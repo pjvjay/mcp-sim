@@ -14,6 +14,11 @@ The first server it is pointed at is the pantry planner (`pjvjay/pantry-api`, to
 or the `pantry-mcp` stdio script). Nothing in the core knows about pantry; the pantry suite is
 a directory of scenario files.
 
+Every LLM call is packaged as one skill, `skills/simulate/` (§2c): its `config.yaml` chooses
+each role's model and the run settings, and its `roles/<role>.md` files hold each role's
+settings and prompt templates, read at run time, so models and prompts change without a code
+edit.
+
 ## 1. Vocabulary
 
 | Term | Meaning |
@@ -161,9 +166,80 @@ flowchart LR
   to `concurrency` (default 4), each with its own MCP session (stdio servers are launched per
   session; HTTP shares the URL).
 * **CLI** (`mcpsim/cli.py`, argparse, console script `mcpsim`): `plan`, `run`, `judge`
-  (re-judge saved transcripts, e.g. after a prompt change), `report`, `suite` (every scenario in a
-  directory, aggregated, `--threshold` for the exit code), `catalog` (print what the server
-  exposes — useful on its own).
+  (re-judge saved transcripts, e.g. after a prompt change), `report`, `suite` (every scenario of
+  the skill's `config.yaml`, or of a directory, run one after another into `runs_dir`, narrowed
+  by `--name` / `--category` globs, ending with a pass^k table; `--threshold` for the exit
+  code), `config` (the skill's resolved roles, models, prompts and run settings), `catalog`
+  (print what the server exposes — useful on its own). `plan`, `run`, `judge`, `suite` and
+  `config` take `--skill DIR` (§2c).
+
+### 2c. The simulate skill: roles, prompts and configuration
+
+Every LLM call of a simulation (hosted planner, local execution planner, agent under test,
+simulated user, LLM observers, judge) takes its settings and its prompt text from one skill
+directory, loaded at run time by `mcpsim/skill.py`. The directory is `--skill DIR`, else
+`MCPSIM_SKILL`, else the packaged copy (`skills/simulate/` ships in the wheel as
+`mcpsim/_skills/simulate`; a source checkout uses the repository's directory):
+
+```
+skills/simulate/
+  SKILL.md        name: simulate; how to run the flow end to end on this machine
+  config.yaml     roles_dir, defaults, run, scenarios, runs_dir, overrides
+  roles/planner.md  planner-local.md  agent.md  user.md  observer.md  judge.md
+  scripts/run.sh  preflight | scenarios | suite | ui | config | report | all
+```
+
+* **Role files.** YAML frontmatter: `role` (the file's stem), `provider` (`anthropic` or
+  `ollama`), `model`, optional `temperature` and `max_tokens`, optional `description`, and
+  role-specific keys (the judge's `votes`, the local planner's `policy_max_tokens`); anything else
+  is refused. The body holds the role's prompts, each opened by a `{% prompt NAME %}` line:
+  planner `system`, `user`, `reask`; planner-local `system`, `user`, `reask`, `policy_system`,
+  `policy_user`; agent `system` (rendered before every turn, since observers enable goals
+  mid-run) and `goal_note`; user `system`, `opening`, `silent_agent`, `fallback_reply`; observer
+  `system`, `user`; judge `system`, `user`.
+* **Templates** (`mcpsim/prompt_template.py`). `{{ name }}` inserts a value verbatim (never
+  re-parsed); `{% if name %}`, `{% if not name %}`, `{% elif %}`, `{% else %}`, `{% endif %}` keep
+  a block when the value is non-empty; `#. ` at the start of a line auto-numbers (the judge's
+  rules, whose numbering shifts with the SOP rule); `{# … #}` is a comment; a line holding only
+  tags vanishes with its line break; a rendered prompt never starts or ends with a line break.
+  The code computes the dynamic sections and passes them by name: the catalog digest, the
+  scenario's parts, informant reports, observations (trimmed to the prompt budget by rendering
+  until it fits), transcript excerpts, the numbered checklist, step and tool lists. The template
+  owns all wording and order. Each prompt declares the placeholders it accepts and those it must
+  insert (`mcpsim.skill.ROLE_SPECS`: the planner's `catalog`, the agent's `goal`,
+  `instructions`, `skill_text`, `goals`, `steps` and `final_result_name`, the judge's
+  `behaviors` and `transcript`, …); an unknown placeholder, a missing required one, an unknown
+  or missing prompt and a syntax error are load errors naming the file and line. The context
+  reaches the agent's template only when `context.agent_visible` (the code passes an empty value
+  otherwise), so a template cannot leak it.
+* **Byte-identical move.** The bundled templates render exactly the prompts the code built
+  before the move: `tests/prompt_cases.py` drives every call site with a recording LLM over the
+  pantry scenarios, an SOP variant and a minimal v1 scenario (882 system prompts, messages,
+  re-asks and `max_tokens`), and `tests/test_prompt_golden.py` compares them with
+  `tests/fixtures/prompts/golden.json.gz`, captured from the pre-move code.
+* **Model precedence**, lowest to highest: the built-in default (`DEFAULT_MODELS`) < the role
+  file's `provider:model` < `config.yaml` `defaults` < every override whose `match`
+  (`fnmatch` globs on `name` and/or `category`, both must match) fits, in file order < the
+  scenario file's own `models` (`Models.explicit()`) < the CLI's `--models`. A spec is stored
+  canonically (a bare name for Anthropic), so `anthropic:claude-opus-5-5` and `claude-opus-5-5`
+  are the same model for the judge-differs-from-agent check and the cost table. A per-observer
+  `model` still wins for that observer.
+* **Run settings** (`repeat`, `modes`, `judge_votes`, `concurrency`) follow the same ladder:
+  built-in (the `Scenario` defaults, both modes) < the judge file's `votes` < `config.yaml`
+  `run` < matching overrides' `run` < the scenario file's own fields < the CLI (`--repeat`,
+  `--mode` / `--modes`). `concurrency` is the number of runs of one scenario in flight; the
+  suite runs scenarios one after another (they may share a seeded database).
+* **Resolution** (`Skill.apply`) happens right after a scenario is loaded; the runner writes the
+  resolved scenario to `scenario.json`, so a re-judge (`mcpsim judge`) uses the models and votes
+  that actually ran, with the prompts of the skill it is given. `temperature` is sent only when
+  a role file sets one, and refused at resolution when the role's resolved model rejects
+  sampling parameters (Claude Opus 4.7+, Opus 5.x, Sonnet 5.x, Fable, Mythos answer 400).
+* **Scenario sources.** `config.yaml` `scenarios` lists directories, globs and files, relative
+  to the directory mcpsim runs in; `$NAME`, `${NAME}` and `${NAME:-default}` read the
+  environment, and an entry whose variable is unset (with no default) is skipped with a note.
+  `Skill.entries()` loads every file; one that does not load is kept with its error (the suite
+  and the runner UI show it), and a name defined twice is an error on the second file.
+  `runs_dir` is where `mcpsim suite` writes.
 
 ### Tool scoping and disclosure
 
@@ -449,11 +525,13 @@ without reaching the server), `usage` (per model: input/output tokens, cost esti
 Defaults (`mcpsim.scenario.DEFAULT_MODELS`), every one an Anthropic API model: planner
 `claude-opus-5-5`, agent `claude-sonnet-5-5`, simulated user `claude-haiku-4-5-20251001`,
 observers `claude-sonnet-5-5` (a per-observer `model` overrides `models.observer`), judge
-`claude-opus-5-5`. The judge must be a different model from the agent unless the scenario
+`claude-opus-5-5`; the simulate skill's role files and `config.yaml` name the same models, and
+§2c gives the precedence. The judge must be a different model from the agent unless the scenario
 overrides both deliberately (the runner warns). No scenario in the repository names a local
 model; the local planner profile (§2 "Planner", LOCAL_MODELS.md) is reached only by choosing an
-`ollama:` planner explicitly (`--models planner=ollama:command-r7b`). `Models.explicit()` says
-which roles a scenario file named itself, so configuration layers can sit underneath it. Every
+`ollama:` planner explicitly (`--models planner=ollama:command-r7b`, or in `config.yaml`), and
+then takes its prompts from `roles/planner-local.md`. `Models.explicit()` says which roles a
+scenario file named itself, so the configuration layers sit underneath it. Every
 LLM call goes through `mcpsim/llm.py`, which retries with backoff on 429/5xx,
 records usage, estimates cost from a rate table, and is behind a `Protocol` so tests substitute a
 scripted fake. `MCPSIM_DRY_RUN=1` makes the planner emit a one-path plan from the catalog without
@@ -502,5 +580,9 @@ a write, costly or open-world tool or of a call that sends a URL, no volatile bo
 malformed probe result costing only the variant, policy questions, the hosted profile untouched); executor loop (tool_use → MCP call →
 tool_result; error results; budget stop; final_result extraction, including a malformed block);
 judge majority and the "matcher failure overrides votes" rule; report aggregation and exit
-code; the CLI end-to-end on the fake server in dry-run mode. An `integration` marker runs one
+code; the CLI end-to-end on the fake server in dry-run mode; the simulate skill (§2c): the
+template language, every load error (frontmatter keys, prompts, placeholders, config), the
+model and run-setting precedence matrix, scenario sources and selection, `mcpsim config` and
+`mcpsim suite`, a byte-for-byte comparison of every rendered prompt with the pre-move capture,
+and a wheel built and installed outside the repository that finds its packaged skill. An `integration` marker runs one
 real scenario against the pantry server when `ANTHROPIC_API_KEY` is set; CI skips it.

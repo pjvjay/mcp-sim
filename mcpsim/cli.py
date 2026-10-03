@@ -1,6 +1,7 @@
 """``mcpsim`` command line (DESIGN §2 "CLI").
 
-``catalog`` works on its own. ``plan``, ``run``, ``judge``, ``report`` and ``suite`` call into
+``catalog`` works on its own; ``config`` prints what the simulate skill resolves to
+(:mod:`mcpsim.skill`). ``plan``, ``run``, ``judge``, ``report`` and ``suite`` call into
 ``mcpsim.runner``, which is imported lazily inside each subcommand so this module imports (and
 ``mcpsim catalog`` works) before the runner exists; until it does, those subcommands print
 "not yet wired" and exit 2.
@@ -19,6 +20,7 @@ the positional path(s), so keyword names are part of the contract::
         dry_run: bool = False,
         model_overrides: Mapping[str, str] | None = None,  # --models, only when given
         allow_same_judge: bool = False,                    # --allow-same-judge, only when given
+        skill: str | None = None,                          # --skill, only when given
     ) -> pathlib.Path:
         '''Load the scenario, discover the catalog, plan (LLM; or the one-path dry-run plan
         when dry_run), write <out_dir>/<scenario.name>/<timestamp>/plan.json and return
@@ -35,6 +37,7 @@ the positional path(s), so keyword names are part of the contract::
         dry_run: bool = False,
         model_overrides: Mapping[str, str] | None = None,  # --models, only when given
         allow_same_judge: bool = False,                    # --allow-same-judge, only when given
+        skill: str | None = None,                          # --skill, only when given
     ) -> pathlib.Path:
         '''plan -> runs -> judge -> report. Returns the run directory
         <out_dir>/<scenario.name>/<timestamp>/ holding plan.json, scenario.json (the validated
@@ -47,6 +50,7 @@ the positional path(s), so keyword names are part of the contract::
         run_dir: str | os.PathLike[str],
         *,
         votes: int | None = None,                          # override scenario.judge_votes
+        skill: str | None = None,                          # --skill, only when given
     ) -> list[pathlib.Path]:
         '''Re-judge every transcripts/*.jsonl in the run directory (scenario and plan are read
         from scenario.json and plan.json there), rewrite verdicts/*.json and report.json /
@@ -59,18 +63,24 @@ the positional path(s), so keyword names are part of the contract::
         (report.json path, report.md path).'''
 
     def run_suite(
-        scenario_dir: str | os.PathLike[str],
-        out_dir: str | os.PathLike[str],
+        scenario_dir: str | os.PathLike[str] | None,       # positional, None: config.yaml's
+        out_dir: str | os.PathLike[str] | None,            # --out, None: config.yaml's runs_dir
         *,
         threshold: float = 1.0,
         dry_run: bool = False,
         model_overrides: Mapping[str, str] | None = None,  # --models, only when given
         allow_same_judge: bool = False,                    # --allow-same-judge, only when given
+        skill: str | None = None,                          # --skill, only when given
+        names: list[str] | None = None,                    # --name GLOB (repeatable), when given
+        categories: list[str] | None = None,               # --category GLOB (repeatable)
+        repeat: int | None = None,                         # --repeat, only when given
+        modes: list[str] | None = None,                    # --modes, only when given
     ) -> int:
-        '''Run every *.yaml / *.yml / *.json scenario in the directory (sorted by name) with
-        run_scenario, write <out_dir>/suite-<timestamp>/suite.json and suite.md
-        (mcpsim.report.aggregate_suite / render_suite_markdown), print one summary line per
-        scenario, and return mcpsim.report.exit_code(suite_report, threshold).'''
+        '''Run every selected scenario (the directory's *.yaml / *.yml / *.json files, else
+        every scenarios entry of the skill's config.yaml, narrowed by the globs) with
+        run_scenario, one after another, write <out_dir>/suite-<timestamp>/suite.json and
+        suite.md, print one line per scenario and a summary table with pass^k, and return
+        mcpsim.report.exit_code(suite_report, threshold) (1 when a scenario could not run).'''
 
 Conventions the CLI relies on:
 
@@ -84,11 +94,12 @@ Conventions the CLI relies on:
   ``mcpsim.report.exit_code`` over the run directory's ``report.json``; ``suite`` returns the
   runner's exit code.
 * ``plan``, ``run`` and ``suite`` take ``--models key=value[,key=value]`` (keys ``planner`` /
-  ``agent`` / ``judge`` / ``user``, values ``provider:model`` such as ``ollama:command-r7b``;
-  see docs/LOCAL_MODELS.md) and ``--allow-same-judge``. The CLI passes ``model_overrides`` /
-  ``allow_same_judge`` **only when the flag was given**, so a plain call keeps the exact keyword
-  set above; the runner applies them with ``scenario.model_copy(update=...)`` so scenario files
-  stay provider-neutral.
+  ``agent`` / ``judge`` / ``user`` / ``observer``, values ``provider:model`` such as
+  ``ollama:command-r7b``; see docs/LOCAL_MODELS.md) and ``--allow-same-judge``; ``plan``,
+  ``run``, ``judge``, ``suite`` and ``config`` take ``--skill DIR``. The CLI passes these
+  keywords **only when the flag was given**, so a plain call keeps the exact keyword set above;
+  the runner resolves them through the skill (:meth:`mcpsim.skill.Skill.apply`: ``--models`` is
+  the top of the model precedence) so scenario files stay provider-neutral.
 """
 
 from __future__ import annotations
@@ -107,6 +118,7 @@ from mcpsim import __version__
 from mcpsim.mcpclient import Catalog, MCPClientError, connect
 from mcpsim.report import Report, exit_code, render_markdown, summary_line
 from mcpsim.scenario import MODEL_ROLES, Scenario, ScenarioError, load_scenario
+from mcpsim.skill import SKILL_ENV, Skill, SkillError, load_skill, one_line
 
 EXIT_OK = 0
 EXIT_FAILURE = 1
@@ -118,6 +130,7 @@ RUNNER_MODULE = "mcpsim.runner"
 
 _USER_ERRORS: tuple[type[Exception], ...] = (
     ScenarioError,
+    SkillError,
     MCPClientError,
     OSError,
     ValueError,
@@ -220,8 +233,11 @@ def _models_arg(text: str) -> dict[str, str]:
 
 
 def model_kwargs(args: argparse.Namespace) -> dict[str, Any]:
-    """``model_overrides`` / ``allow_same_judge`` keyword arguments, present only when given."""
+    """``model_overrides`` / ``allow_same_judge`` / ``skill`` keyword arguments, present only
+    when given."""
     kwargs: dict[str, Any] = {}
+    if getattr(args, "skill", None):
+        kwargs["skill"] = args.skill
     given: list[dict[str, str]] = getattr(args, "models", None) or []
     if given:
         merged: dict[str, str] = {}
@@ -315,7 +331,8 @@ def cmd_judge(args: argparse.Namespace) -> int:
         return EXIT_USAGE
 
     def body() -> int:
-        written = list(runner.judge_run_dir(args.run_dir, votes=args.votes))
+        extra = {"skill": args.skill} if args.skill else {}
+        written = list(runner.judge_run_dir(args.run_dir, votes=args.votes, **extra))
         print(f"judged {len(written)} transcript(s) in {args.run_dir}")
         return _exit_from_report(FsPath(args.run_dir), args.threshold)
 
@@ -340,7 +357,23 @@ def cmd_report(args: argparse.Namespace) -> int:
     return _guarded(args.command, body)
 
 
+def suite_kwargs(args: argparse.Namespace) -> dict[str, Any]:
+    """``names`` / ``categories`` / ``repeat`` / ``modes``, present only when given."""
+    kwargs: dict[str, Any] = {}
+    if args.name:
+        kwargs["names"] = list(args.name)
+    if args.category:
+        kwargs["categories"] = list(args.category)
+    if args.repeat is not None:
+        kwargs["repeat"] = args.repeat
+    if args.modes:
+        kwargs["modes"] = list(args.modes)
+    return kwargs
+
+
 def cmd_suite(args: argparse.Namespace) -> int:
+    if args.list:
+        return _guarded(args.command, lambda: list_suite(args))
     runner = _load_runner(args.command)
     if runner is None:
         return EXIT_USAGE
@@ -352,13 +385,163 @@ def cmd_suite(args: argparse.Namespace) -> int:
             threshold=args.threshold,
             dry_run=dry_run_requested(args.dry_run),
             **model_kwargs(args),
+            **suite_kwargs(args),
         )
         return int(code)
 
     return _guarded(args.command, body)
 
 
+def list_suite(args: argparse.Namespace) -> int:
+    """``suite --list``: the scenarios the suite would run, with their resolved models and run
+    settings, without running anything."""
+    from mcpsim.runner import suite_entries
+
+    skill = load_skill(args.skill)
+    entries = suite_entries(
+        args.scenario_dir,
+        skill=skill,
+        names=args.name or None,
+        categories=args.category or None,
+    )
+    if args.json:
+        rows = []
+        for entry in entries:
+            row = entry.to_json()
+            if entry.scenario is not None:
+                row["resolved"] = skill.resolve(
+                    entry.scenario,
+                    model_overrides=_merged_models(args),
+                    run_overrides=_run_overrides(args),
+                ).to_json()
+            rows.append(row)
+        print(json.dumps(rows, indent=2))
+        return EXIT_OK
+    width = max(len(e.name) for e in entries)
+    for entry in entries:
+        if entry.error is not None:
+            print(f"{entry.name.ljust(width)}  error: {one_line(entry.error)}")
+            continue
+        assert entry.scenario is not None
+        resolved = skill.resolve(
+            entry.scenario, model_overrides=_merged_models(args), run_overrides=_run_overrides(args)
+        )
+        run = resolved.run
+        print(
+            f"{entry.name.ljust(width)}  [{entry.category}] repeat {run['repeat'].value}, "
+            f"modes {'+'.join(run['modes'].value)}, judge_votes {run['judge_votes'].value}, "
+            f"judge {resolved.models['judge'].value}  ({entry.file})"
+        )
+    return EXIT_OK
+
+
+def _merged_models(args: argparse.Namespace) -> dict[str, str] | None:
+    given: list[dict[str, str]] = getattr(args, "models", None) or []
+    merged: dict[str, str] = {}
+    for chunk in given:
+        merged.update(chunk)
+    return merged or None
+
+
+def _run_overrides(args: argparse.Namespace) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    if getattr(args, "repeat", None) is not None:
+        out["repeat"] = args.repeat
+    if getattr(args, "modes", None):
+        out["modes"] = list(args.modes)
+    return out
+
+
+def render_config(info: dict[str, Any]) -> str:
+    """Plain-text ``mcpsim config``: the skill, each role's model (and where it came from),
+    settings and prompts, the run settings, the scenario sources, runs_dir and overrides."""
+    lines = [
+        f"skill: {info['skill']['name']}  ({info['skill']['path']})",
+        f"config: {info['config']}",
+    ]
+    if info.get("scenario"):
+        lines.append(f"resolved for scenario: {info['scenario']}")
+    lines += ["", "roles:"]
+    for name, role in info["roles"].items():
+        model = role.get("model")
+        if model is not None:
+            head = f"  {name}: {model}  (from {role['model_source']})"
+        else:
+            head = f"  {name}: {role['frontmatter_model']}  ({role['summary']})"
+        lines.append(head)
+        settings = [
+            f"{key} {role[key]}"
+            for key in ("max_tokens", "temperature", "votes", "policy_max_tokens")
+            if role.get(key) is not None
+        ]
+        prompts = ", ".join(role["prompts"])
+        lines.append(f"      {'; '.join(settings) or 'defaults'}; prompts: {prompts}")
+        lines.append(f"      {role['file']}")
+    lines += ["", "run:"]
+    for key, setting in info["run"].items():
+        value = setting["value"]
+        shown = ", ".join(value) if isinstance(value, list) else value
+        lines.append(f"  {key}: {shown}  (from {setting['source']})")
+    lines += ["", "scenarios:"]
+    for source in info["scenarios"]:
+        where = source["path"] or "-"
+        count = f"{len(source['files'])} file(s)"
+        note = f"; {source['note']}" if source["note"] else ""
+        lines.append(f"  {source['entry']} -> {where}: {count}{note}")
+    lines += ["", f"runs_dir: {info['runs_dir']}"]
+    if info["overrides"]:
+        lines += ["", "overrides:"]
+        for i, override in enumerate(info["overrides"], start=1):
+            match = ", ".join(f"{k}={v}" for k, v in override["match"].items() if v)
+            models = ", ".join(f"{k}={v}" for k, v in override["models"].items())
+            run = ", ".join(f"{k}={v}" for k, v in override["run"].items() if v is not None)
+            parts = [f"models {models}"] if models else []
+            parts += [f"run {run}"] if run else []
+            lines.append(f"  {i}. match {match}: {'; '.join(parts) or '(nothing)'}")
+    return "\n".join(lines)
+
+
+def cmd_config(args: argparse.Namespace) -> int:
+    def body() -> int:
+        skill = load_skill(args.skill)
+        scenario = None
+        if args.scenario:
+            scenario = _find_scenario(skill, args.scenario)
+        info = skill.describe(scenario=scenario)
+        if args.json:
+            print(json.dumps(info, indent=2))
+        else:
+            print(render_config(info))
+        return EXIT_OK
+
+    return _guarded(args.command, body)
+
+
+def _find_scenario(skill: Skill, name_or_file: str) -> Scenario:
+    """A scenario file path, or the name of a configured scenario."""
+    if FsPath(name_or_file).is_file():
+        return load_scenario(name_or_file)
+    for entry in skill.entries():
+        if entry.name == name_or_file:
+            if entry.scenario is None:
+                raise ValueError(f"scenario {name_or_file!r} does not load: {entry.error}")
+            return entry.scenario
+    raise ValueError(
+        f"no configured scenario named {name_or_file!r} (and no such file); "
+        "`mcpsim suite --list` shows the names"
+    )
+
+
+def _skill_arg(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--skill",
+        metavar="DIR",
+        help=f"the simulate skill directory (default: ${SKILL_ENV}, else the packaged one)",
+    )
+
+
 def _model_args(parser: argparse.ArgumentParser) -> None:
+    _skill_arg(parser)
     parser.add_argument(
         "--models",
         action="append",
@@ -421,6 +604,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("judge", help="re-judge the transcripts in a run directory")
     p.add_argument("run_dir", help="a run directory written by `mcpsim run`")
     p.add_argument("--votes", type=int, help="override judge_votes")
+    _skill_arg(p)
     _threshold_arg(p)
     p.set_defaults(func=cmd_judge)
 
@@ -430,14 +614,64 @@ def build_parser() -> argparse.ArgumentParser:
     _threshold_arg(p)
     p.set_defaults(func=cmd_report)
 
-    p = sub.add_parser("suite", help="run every scenario in a directory")
-    p.add_argument("scenario_dir", help="directory of scenario files")
-    p.add_argument("--out", default="runs", help="output root (default: runs)")
+    p = sub.add_parser(
+        "suite",
+        help="run every configured scenario (or every scenario in a directory)",
+        description=(
+            "Run the scenarios of the skill's config.yaml (or of SCENARIO_DIR), one after "
+            "another, into runs_dir, and print a summary table with pass^k."
+        ),
+    )
+    p.add_argument(
+        "scenario_dir",
+        nargs="?",
+        help="a directory of scenario files (default: the scenarios in the skill's config.yaml)",
+    )
+    p.add_argument("--out", help="output root (default: runs_dir from the skill's config.yaml)")
+    p.add_argument(
+        "--name", action="append", metavar="GLOB", help="only scenarios whose name matches "
+        "(repeatable; any matches)"
+    )
+    p.add_argument(
+        "--category", action="append", metavar="GLOB", help="only scenarios whose category "
+        "matches (repeatable; any matches)"
+    )
+    p.add_argument("--repeat", type=int, help="runs per path and mode (pass^k's k)")
+    p.add_argument(
+        "--modes",
+        type=_modes_arg,
+        metavar="guided,free",
+        help="the run modes to keep (default: from config.yaml)",
+    )
+    p.add_argument(
+        "--list", action="store_true", help="list the selected scenarios and their settings"
+    )
+    p.add_argument("--json", action="store_true", help="with --list: print JSON")
     _threshold_arg(p)
     p.add_argument("--dry-run", action="store_true", help="no LLM; see `run --dry-run`")
     _model_args(p)
     p.set_defaults(func=cmd_suite)
+
+    p = sub.add_parser(
+        "config", help="print the simulate skill's resolved roles, models and run settings"
+    )
+    _skill_arg(p)
+    p.add_argument(
+        "--scenario", metavar="NAME|FILE", help="resolve for this scenario (its overrides too)"
+    )
+    p.add_argument("--json", action="store_true", help="print JSON")
+    p.set_defaults(func=cmd_config)
     return parser
+
+
+def _modes_arg(text: str) -> list[str]:
+    modes = [m.strip() for m in text.split(",") if m.strip()]
+    bad = [m for m in modes if m not in ("guided", "free")]
+    if not modes or bad:
+        raise argparse.ArgumentTypeError(
+            f"--modes expects guided, free or guided,free; got {text!r}"
+        )
+    return modes
 
 
 def main(argv: Sequence[str] | None = None) -> int:

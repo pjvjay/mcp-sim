@@ -171,8 +171,19 @@ class ScenarioSummary(BaseModel):
     worst: str = ""
 
 
+class SuiteError(BaseModel):
+    """A scenario a suite could not run (it did not load, or its run raised)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    scenario: str
+    file: str = ""
+    error: str = ""
+
+
 class SuiteReport(BaseModel):
-    """Aggregation across scenarios (``suite.json``)."""
+    """Aggregation across scenarios (``suite.json``); ``errors`` lists the scenarios that could
+    not run."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -187,6 +198,7 @@ class SuiteReport(BaseModel):
     cost_usd: float = 0.0
     duration_s: float = 0.0
     cost_note: str = COST_NOTE
+    errors: list[SuiteError] = Field(default_factory=list)
 
     def save(self, path: str | FsPath) -> FsPath:
         fs_path = FsPath(path)
@@ -612,5 +624,10 @@ def render_suite_markdown(suite: SuiteReport) -> str:
         for s in suite.scenarios:
             if s.run_dir:
                 lines.append(f"- {_cell(s.scenario)}: `{s.run_dir}`")
+    if suite.errors:
+        lines += ["", "## Scenarios that could not run", ""]
+        for e in suite.errors:
+            text = "; ".join(x.strip() for x in e.error.splitlines() if x.strip()) or "error"
+            lines.append(f"- {_cell(e.scenario)} (`{e.file}`): {_cell(text)}")
     lines += ["", f"Cost is an {suite.cost_note}.", ""]
     return "\n".join(lines)

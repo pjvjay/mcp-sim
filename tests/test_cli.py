@@ -131,7 +131,9 @@ def test_no_subcommand_is_a_usage_error() -> None:
 def test_parser_has_every_subcommand() -> None:
     parser = build_parser()
     sub = next(a for a in parser._actions if a.dest == "command")
-    assert set(sub.choices) == {"catalog", "plan", "run", "judge", "report", "suite"}  # type: ignore[union-attr]
+    assert set(sub.choices) == {  # type: ignore[union-attr]
+        "catalog", "plan", "run", "judge", "report", "suite", "config"
+    }
 
 
 def test_render_catalog_without_server_name() -> None:
