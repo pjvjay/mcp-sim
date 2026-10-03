@@ -212,8 +212,17 @@ stays within `LOCAL_PROMPT_BUDGET` (4,000 characters); resource reads are left o
 can only call a tool. The grammar: 1 to `min(6, max_tool_calls)` steps, `tool` an enum of the
 disclosed tools (plus `discover_tools` when offered), `why` ≤ 120 and `expect` ≤ 160
 characters, and `answer_fields` with exactly the keys of `expected_outcome.json`, each matching
-`^step [1-6]: [A-Za-z0-9_.*\[\]]{1,80}$` (one pair of anchors around the whole pattern, which
-llama.cpp needs; a test guards it).
+`^step [1-6]: <path>$` where `<path>` has the structure the review checks (keys of letters,
+digits and `_` joined by `.`, each followed by at most two `[<index>]` or `[*]` steps; keys of
+at most 40 characters, at most six of them). One pair of anchors wraps the whole pattern, which
+llama.cpp needs, and literal `.`, `*` and brackets are character classes (`[.]`, `[*]`,
+`[\[]`), as in the earlier single-class pattern that ran live. That earlier pattern,
+`[A-Za-z0-9_.*\[\]]{1,80}`, also admitted `.price`, `a..b` and `items[any].id`, which the
+review rejects, so each cost a re-ask; a test now checks on 20,000 generated strings that every
+string the grammar admits passes the review's path check. The new pattern has not been run
+through llama.cpp's converter on this machine (no converter is installed and no live call was
+made for this change); it uses only groups, alternation, bounded repetition and character
+classes, which that converter supports.
 
 The answer is reviewed, and sent back once with every problem listed:
 
@@ -224,8 +233,17 @@ The answer is reviewed, and sent back once with every problem listed:
   declares (walking `$ref`, optionals and lists);
 * when the scout made the same call (arguments equal once schema defaults are filled in), the
   path must exist in the observed result and its value must satisfy the field's own
-  `expected_outcome.json` spec, with the matcher's operators (`query ← items[0].name` gives
-  "Penne Rigate 500g", which fails `equals penne`);
+  `expected_outcome.json` spec (`query ← items[0].name` gives "Penne Rigate 500g", which fails
+  `equals penne`). The check builds the `final_result` the lineage implies and runs the matcher
+  on it, so the quantifiers are the answer's own: a `[*]` field needs every value to pass, an
+  `[any]` field one, and a field without a list step read through `[*]` is a projection judged
+  as one list (`available_slugs ← result[*].slug` against `$len` and `$contains`). Checking
+  each value on its own sent correct projection and `[any]` lineage back and then dropped its
+  checkpoint;
+* a field over every element must not be read from one: `lines[*].price ←
+  summary.lines[0].price` would claim every line costs what the first does. Where the lineage
+  ends in the field's own path, each list step the field quantifies must be `[*]` there too,
+  and the `[*]` rewrite (`summary.lines[*].price`) is offered;
 * a lineage that reads a key of another name, or goes through a property the schema marks
   optional, is sent back when the result holds the field under its own name;
 * every lineage problem carries that path when there is one: searched in the lineage's own
@@ -257,10 +275,31 @@ and is recorded in `scout.json` with `probe: true`. If the server rejects it, th
 the original call, then the answer. If it answers, a **boundary** path: the mutated call, the
 original call, the answer, with checkpoints stating what the server really returned (only what
 differs from the scout's result for the original call: `tool_result[find_product]: match
-equals none when query is pene`) and that the answer does not come from it. A write tool or one
-whose description claims a cost is never probed; `scout.probe` refuses one before anything is
-sent. A probe the server cannot answer (an HTTP session dropped while the model was thinking)
-costs the variant, not the plan.
+equals none when query is pene`) and that the answer does not come from it. Boundary facts come
+from structured content only: a text answer gives `answers without an error`, never its words.
+A value that differs between identical calls (a key such as `request_id`, `created_at` or
+`took_ms`, an output-schema `format` such as `date-time` or `uuid`, a UUID, ISO timestamp, long
+hex token or epoch-sized number) is never a fact, since the boundary path would fail on its next
+run; keys an answer field reads come first, then a list or count that became empty or zero, a
+value that became null and `enum` keys such as `match`, then other values.
+
+What is never probed, each refused by `scout.probe` too before anything is sent:
+
+* a write tool, or one whose description claims a cost;
+* a tool the server marks `openWorldHint: true`, or, without the hint, one whose description
+  says it reaches the internet;
+* a call that sends a URL, host name, e-mail or IP address (an argument whose schema `format`
+  is `uri`, `hostname`, `email`, …, whose name is `url`, `link`, `email`, …, or whose value
+  looks like one). `mcp-server-fetch` behind ContextForge lists `annotations: {}` and a plain
+  description, and the probe would have mutated `https://omnivorescookbook.com/mala-chicken/`
+  into `https://omnivorescookook.com/mala-chicken/`, a request to somebody else's domain whose
+  page text would then have been quoted in a checkpoint;
+* a tool whose name cannot appear in `tool_result[<tool>]` (MCP names are letters of either
+  case, digits, `_`, `.` and `-`; the checkpoint shape now admits all of them, so camelCase
+  servers keep their variant).
+
+A probe the server cannot answer (an HTTP session dropped while the model was thinking, or a
+result the SDK cannot validate) costs the variant, not the plan; only a refusal is raised.
 
 **4. Policy paths (the model, one word at a time).** For up to three instructions with a
 prohibition cue (`do not`, `never`, `avoid`, `only`, …), one tiny call: "Rule: <instruction>.

@@ -427,9 +427,13 @@ def test_checkpoint_shapes_accepted(text: str) -> None:
 
 
 def test_gateway_tool_names_are_valid_in_checkpoints() -> None:
-    """ContextForge exposes ``find_product`` as ``pantry-find-product``."""
+    """ContextForge exposes ``find_product`` as ``pantry-find-product``; MCP tool names may be
+    camelCase (the SDK's TOOL_NAME_REGEX allows A-Z), and a plan for such a server must be able
+    to say ``tool_result[lookUp]``."""
     assert CHECKPOINT_PATTERN.match("tool_result[pantry-find-product]: match equals direct")
     assert CHECKPOINT_PATTERN.match("tool_result[svc.v2_lookup]: total is 2")
+    assert CHECKPOINT_PATTERN.match("tool_result[lookUp]: is an error when slug is pene")
+    assert CHECKPOINT_PATTERN.match("tool_result[GetWeather]: temperature is a number")
 
 
 @pytest.mark.parametrize(
@@ -438,7 +442,9 @@ def test_gateway_tool_names_are_valid_in_checkpoints() -> None:
         "the agent did well",
         "final_result:",
         "final_result:   ",
-        "tool_result[Lookup]: uppercase tool names are not allowed by the shape",
+        "tool_result[look up]: a space is not a tool-name character",
+        "tool_result[pantry/lookup]: nor is a slash",
+        "tool_result[]: the tool name is missing",
         "tool_result: needs the tool name in brackets",
         "Final_result: wrong case",
         "report: direct_match is true",

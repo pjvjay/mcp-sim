@@ -16,7 +16,11 @@ model gets the main call right. So the work is split:
    Arguments are schema-checked like any plan step (:func:`mcpsim.planner.validate_arguments`);
    lineage must name a step that exists and calls a tool, and a path that the tool's output
    schema declares and, when the scout made the same call, that the observed result has with a
-   value that satisfies the field's own expected-outcome spec. When the result holds the field
+   value that satisfies the field's own expected-outcome spec (put to the matcher as the final
+   result the lineage implies, so ``[*]``, ``[any]`` and a projection such as
+   ``available_slugs ← result[*].slug`` are judged as the answer will be). A field over every
+   element (``lines[*].price``) must not be read from one (``summary.lines[0].price``); the
+   ``[*]`` rewrite is offered. When the result holds the field
    under its own name nearby (:func:`nearest_field_path`: ``items[0].store`` for ``store`` read
    from ``items[0].brand``, the top-level ``query`` for ``query`` read from ``items[0].name``,
    the always-present ``summary.total_cost`` for ``total_cost`` read from the optional
@@ -31,8 +35,11 @@ model gets the main call right. So the work is split:
    (:func:`mcpsim.scout.probe`): the first happy step that calls a read-only, free tool with a
    string or integer argument is sent again with that argument mutated (a string loses one
    interior character, an integer becomes 999999). An error makes a *recovery* path that quotes
-   the server's real error; an answer makes a *boundary* path whose checkpoint states what the
-   server really returned. A write tool or one that claims a cost is never probed.
+   the server's real error; an answer makes a *boundary* path whose checkpoints state what the
+   server really returned, from structured content only and never a value that changes on
+   every call. A write tool, one that claims a cost, one that reaches outside the server
+   (``openWorldHint``, an internet description) and a call that sends a URL, host name or
+   e-mail address are never probed; a probe the server answers badly costs the variant only.
 4. **Policy paths from instructions**: for up to three instructions that prohibit something,
    one tiny constrained question, "which of these tools does this instruction forbid calling?"
    (an enum of the allowed tools plus ``none``), and a policy path per tool named, never one
@@ -47,13 +54,13 @@ from __future__ import annotations
 import json
 import re
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from mcpsim.llm import LLM, LLMResponse
-from mcpsim.matcher import MISSING, apply_operator, parse_path, resolve
+from mcpsim.matcher import MISSING, apply_operator, match, parse_path, resolve
 from mcpsim.mcpclient import Catalog, Session, ToolInfo
 from mcpsim.plan import ExecutionPlan, Path, Step, StepReference, parse_reference
 from mcpsim.planner import (
@@ -68,12 +75,20 @@ from mcpsim.planner import (
     resolve_ref,
     schema_types,
     validate_arguments,
+    validate_checkpoint,
     validate_draft,
 )
 from mcpsim.scenario import Scenario
 from mcpsim.scoping import DISCOVER_TOOL_NAME, discover_tool_definition, expected_top_level_keys
 from mcpsim.scoping import tokens as scoping_tokens
-from mcpsim.scout import Observation, ScoutResult, probe, probe_refusal
+from mcpsim.scout import (
+    Observation,
+    ProbeRefusedError,
+    ScoutResult,
+    probe,
+    probe_argument_refusal,
+    probe_refusal,
+)
 
 EXECUTION_TOOL_NAME = "tool_execution_plan"
 POLICY_TOOL_NAME = "forbidden_tool"
@@ -86,7 +101,11 @@ LOCAL_DESCRIPTION_LIMIT = 90
 LOCAL_MAX_OUTPUT_KEYS = 6
 WHY_CAP = 120
 EXPECT_CAP = 160
-LINEAGE_PATH_CAP = 80
+# What the lineage grammar admits per path: keys of at most 40 characters, at most two list
+# steps after a key, at most six keys, indices of at most three digits.
+LINEAGE_KEY_CAP = 40
+LINEAGE_LIST_STEPS_CAP = 2
+LINEAGE_KEYS_CAP = 6
 OBSERVATION_LINE_LIMIT = 260
 MAX_POLICY_QUESTIONS = 3
 POLICY_MAX_TOKENS = 40
@@ -108,8 +127,9 @@ FORMAT_FIELDS = (
     '"step <n>: <path in the result of step n, e.g. items[0].price>"}'
 )
 
-# What the validator accepts as lineage; the grammar pattern (lineage_grammar_pattern) admits a
-# subset of it (step numbers up to the plan's step cap).
+# What the validator accepts as lineage. The grammar pattern (lineage_grammar_pattern) admits
+# exactly the well-formed paths within its caps, with step numbers up to the plan's step cap, so
+# every string it lets the model write passes these two (a test checks it on generated paths).
 LINEAGE = re.compile(r"^step ([1-9]):\s*(\S+)$")
 WELL_FORMED_PATH = re.compile(
     r"^[A-Za-z0-9_]+(\[(\d+|\*)\])*(\.[A-Za-z0-9_]+(\[(\d+|\*)\])*)*$"
@@ -123,15 +143,24 @@ PROHIBITION = re.compile(
 def lineage_grammar_pattern(max_steps: int = LOCAL_MAX_STEPS) -> str:
     """The JSON-schema ``pattern`` every ``answer_fields`` value must match.
 
-    ``step <n>: <path>`` with ``n`` from 1 to ``max_steps`` and a dotted path of letters,
-    digits, ``_``, ``.``, ``*`` and brackets. llama.cpp converts a pattern only when ONE
-    ``^…$`` wraps the whole expression (an anchor inside an alternation is logged as
-    unsupported and the string goes unconstrained), so there is exactly one pair here.
+    ``step <n>: <path>`` with ``n`` from 1 to ``max_steps`` and the structure
+    :data:`WELL_FORMED_PATH` checks: keys of letters, digits and ``_`` joined by ``.``, each
+    followed by up to two list steps ``[<index>]`` or ``[*]`` (``items[0].price``,
+    ``summary.lines[*].origin_country``), within the ``LINEAGE_*`` caps. A character class
+    alone would admit ``.price``, ``a..b`` or ``items[any]``, each a wasted re-ask.
+
+    llama.cpp converts a pattern only when ONE ``^…$`` wraps the whole expression (an anchor
+    inside an alternation is logged as unsupported and the string goes unconstrained), so there
+    is exactly one pair here; literal ``.``, ``*`` and brackets are written as character classes
+    (``[.]``, ``[*]``, ``[\\[]``), the form the earlier single-class pattern used live.
     """
     if not 1 <= max_steps <= 9:
         raise ValueError(f"max_steps must be between 1 and 9, got {max_steps}")
     digits = "1" if max_steps == 1 else f"1-{max_steps}"
-    return f"^step [{digits}]: [A-Za-z0-9_.*\\[\\]]{{1,{LINEAGE_PATH_CAP}}}$"
+    key = "[A-Za-z0-9_]{1," + str(LINEAGE_KEY_CAP) + "}"
+    lists = "([\\[]([0-9]{1,3}|[*])[\\]]){0," + str(LINEAGE_LIST_STEPS_CAP) + "}"
+    more = "([.]" + key + lists + "){0," + str(LINEAGE_KEYS_CAP - 1) + "}"
+    return f"^step [{digits}]: {key}{lists}{more}$"
 
 
 def step_tool_names(view: PlannerView) -> list[str]:
@@ -486,20 +515,118 @@ def _leaf_key(path: str) -> str | None:
     return str(keys[-1]) if keys else None
 
 
-def expectation_failure(spec: Any, values: list[Any]) -> str | None:
-    """Why an observed value breaks a field's ``expected_outcome.json`` spec, or ``None``.
+def _quantifier(path: str) -> str:
+    """``every`` or ``any`` for a path with that list step, ``one`` otherwise."""
+    kinds = [s.kind for s in parse_path(path) if s.kind in ("every", "any")]
+    return kinds[0] if kinds else "one"
 
-    Every value must pass (a ``[*]`` lineage resolves to several); the matcher's own operators
-    decide, so the check is exactly the one the final answer will face.
+
+def _place(segments: list[Any], value: Any) -> Any:
+    """``value`` placed at ``segments`` in an otherwise empty result; at a ``[*]``/``[any]``
+    step ``value`` is the list of per-element values. A missing value leaves its key out."""
+    if not segments:
+        return value
+    seg, rest = segments[0], segments[1:]
+    if seg.kind in ("every", "any"):
+        return [_place(rest, v) for v in value]
+    inner = _place(rest, value)
+    if seg.kind == "index":
+        return [None] * seg.index + ([] if inner is MISSING else [inner])
+    return {} if inner is MISSING else {seg.key: inner}
+
+
+def final_from_lineage(name: str, observed: Any, path: str) -> Any | None:
+    """The ``final_result`` an answer built from this lineage would hold for field ``name``,
+    or ``None`` when ``path`` does not resolve in ``observed``.
+
+    A field over a list (``lines[*].price``, ``items[any].slug``) takes one element per value
+    the lineage resolves to (one element for a single value); a field without a list step takes
+    the lineage's value itself, so ``available_slugs ← result[*].slug`` is the list of slugs.
     """
-    ops = dict(spec) if _is_operator_spec(spec) else {"$eq": spec}
-    for value in values:
-        for op, expected in ops.items():
-            passed, _ = apply_operator(op, expected, value, present=value is not MISSING)
-            if not passed:
-                shown = "nothing" if value is MISSING else _clip(_plain(value), 60)
-                return f"{shown}, which fails '{describe_operator(op, expected)}'"
+    try:
+        found = resolve(observed, path)
+        segments = parse_path(name)
+    except ValueError:
+        return None
+    if not found.present or sum(s.kind in ("every", "any") for s in segments) > 1:
+        return None  # the matcher itself allows one [*] or [any] per path
+    if _quantifier(name) != "one":
+        elements = list(found.values) if found.quantifier != "one" else [found.single]
+        return _place(segments, elements)
+    if found.quantifier != "one":
+        return _place(segments, [v for v in found.values if v is not MISSING])
+    return _place(segments, found.single)
+
+
+def lineage_value_failure(name: str, spec: Any, observed: Any, path: str) -> str | None:
+    """Why the answer this lineage gives would fail field ``name``'s ``expected_outcome.json``
+    spec, or ``None``.
+
+    The final result the lineage implies (:func:`final_from_lineage`) is put to the matcher
+    itself, so the quantifiers are exactly the ones the final answer will face: every value
+    for a ``[*]`` field, at least one for an ``[any]`` field, the projected list as a whole for
+    a field without a list step (``$len`` and ``$contains`` on ``available_slugs``).
+    """
+    final = final_from_lineage(name, observed, path)
+    if final is None:
+        return None
+    for result in match({name: spec}, final):
+        if result.passed:
+            continue
+        words = describe_operator(result.op, result.expected)
+        quantifier = _quantifier(name)
+        if quantifier != "one" and isinstance(result.actual, list):
+            if quantifier == "any":
+                shown = ", ".join(_clip(_plain(v), 30) for v in result.actual[:4])
+                more = ", …" if len(result.actual) > 4 else ""
+                return f"{shown or 'no element'}{more}, none of which passes '{words}'"
+            for value in result.actual:
+                passed, _ = apply_operator(
+                    result.op, result.expected, value, present=value is not MISSING
+                )
+                if not passed:
+                    shown = "nothing" if value is MISSING else _clip(_plain(value), 60)
+                    return f"{shown}, which fails '{words}'"
+        shown = "nothing" if result.actual is MISSING else _clip(_plain(result.actual), 60)
+        return f"{shown}, which fails '{words}'"
     return None
+
+
+def quantifier_mismatch(name: str, path: str) -> tuple[str, str | None] | None:
+    """``(why, rewritten path or None)`` when a field over every (or any) element of a list is
+    read from a lineage that names one element, else ``None``.
+
+    ``lines[*].price ← summary.lines[0].price`` would claim every line costs what the first
+    one does: where the lineage ends in the field's own path, each list step the field
+    quantifies must be ``[*]`` in the lineage too, and the rewrite is the lineage with those
+    steps as ``[*]`` (``summary.lines[*].price``). A lineage that ends elsewhere needs a ``[*]``
+    somewhere. A field without a list step never mismatches (``available_slugs ←
+    result[*].slug`` is a projection).
+    """
+    field_segments = parse_path(name)
+    quantified = [i for i, s in enumerate(field_segments) if s.kind in ("every", "any")]
+    if not quantified:
+        return None
+    wanted = "every element" if field_segments[quantified[0]].kind == "every" else "any element"
+    segments = parse_path(path)
+    offset = len(segments) - len(field_segments)
+    if offset >= 0 and _normalised(segments[offset:]) == _normalised(field_segments):
+        single = [offset + i for i in quantified if segments[offset + i].kind != "every"]
+        if not single:
+            return None
+        rewritten = [
+            replace(s, kind="every", index=0) if i in single else s
+            for i, s in enumerate(segments)
+        ]
+        text = _rendered(rewritten)
+        one = _rendered(segments[: single[0] + 1])
+        return (
+            f"reads one element ({one}) where {name} is about {wanted} of the list",
+            text if text.count("[*]") <= 1 else None,
+        )
+    if any(s.kind == "every" for s in segments):
+        return None
+    return f"reads a single value where {name} is about {wanted} of a list", None
 
 
 def _observed_values(observed: Any, path: str) -> list[Any] | None:
@@ -600,28 +727,38 @@ def nearest_field_path(
     steps beyond the field's own, then the shorter path; a tie is no answer. A scope with only
     maybe-absent candidates is remembered while wider scopes are searched for a sure one.
     ``accept`` (a rendered path → bool) filters candidates, e.g. by the field's expected value.
+
+    A list step inside the field's own path is written as the field writes it: ``[*]`` for a
+    ``[*]`` or ``[any]`` field (``lines[*].price ← summary.lines[0].price`` finds
+    ``summary.lines[*].price``), the index for an indexed one. Any other list step keeps the
+    lineage's own inside the scope and is ``[0]`` beyond it.
     """
-    tail = _normalised(parse_path(name))
+    field_segments = parse_path(name)
+    tail = _normalised(field_segments)
     if not tail:
         return None
-    every = _LIST in tail
     segments = parse_path(lineage.path)
     fallback: Lineage | None = None
     for cut in range(len(segments), -1, -1):
         scope = _normalised(segments[:cut])
-        scope_text = _rendered(segments[:cut])
         options: list[tuple[tuple[bool, int, int], str]] = []
         for node in tree:
             if node.keys[: len(scope)] != scope or len(node.keys) < max(len(scope), len(tail)):
                 continue
             if node.keys[-len(tail):] != tail:
                 continue
-            path = scope_text
-            for key in node.keys[len(scope):]:
-                if key == _LIST:
-                    path += "[*]" if every else "[0]"
-                else:
+            start = len(node.keys) - len(tail)
+            path = ""
+            for position, key in enumerate(node.keys):
+                if key != _LIST:
                     path += f".{key}" if path else key
+                elif position >= start:
+                    own = field_segments[position - start]
+                    path += f"[{own.index}]" if own.kind == "index" else "[*]"
+                elif position < cut:
+                    path += _rendered([segments[position]])
+                else:
+                    path += "[0]"
             if accept is not None and not accept(path):
                 continue
             extra_lists = node.keys[len(scope):].count(_LIST) - tail.count(_LIST)
@@ -660,8 +797,10 @@ def review_execution(
     neither an answer field nor a later step uses) are reviewed but their problems are not sent
     back. A lineage must name a tool step, a path the tool's output schema declares and, when the
     scout made the same call, a path the observed result has, whose value satisfies the field's
-    own spec in ``expected`` (``expected_outcome.json``); one that reads a key of another name
-    while a key with the field's name is there gets that key as the correction.
+    own spec in ``expected`` (``expected_outcome.json``, :func:`lineage_value_failure`); a field
+    over every or any element must not be read from one element (:func:`quantifier_mismatch`);
+    one that reads a key of another name while a key with the field's name is there gets that
+    key as the correction.
     """
     review = Review()
     calls = draft.steps
@@ -741,9 +880,22 @@ def review_execution(
         )
         accept = None
         if observed is not None and spec is not None:
-            def accept(path: str, observed: Any = observed, spec: Any = spec) -> bool:
+            def accept(
+                path: str, observed: Any = observed, spec: Any = spec, name: str = name
+            ) -> bool:
                 values = _observed_values(observed, path)
-                return bool(values) and expectation_failure(spec, values or []) is None
+                return bool(values) and lineage_value_failure(name, spec, observed, path) is None
+
+        def holds(
+            path: str, tool: ToolInfo = tool, observed: Any = observed, accept: Any = accept
+        ) -> bool:
+            """Would this path pass the checks below (declared, observed, accepted)?"""
+            if tool.output_schema and schema_lookup(tool.output_schema, path)[0] is False:
+                return False
+            if observed is not None and not observed_lookup(observed, path):
+                return False
+            return accept is None or bool(accept(path))
+
         better = nearest_field_path(name, lineage, tree, accept)
         if better is not None and better.path == lineage.path:
             better = None
@@ -752,6 +904,7 @@ def review_execution(
             schema_lookup(tool.output_schema, lineage.path) if tool.output_schema else (None, "")
         )
         values = _observed_values(observed, lineage.path) if observed is not None else None
+        mismatch = quantifier_mismatch(name, lineage.path)
         if declared is False:
             problem = f"{where} cannot return {lineage.path}: {why}"
         elif observed is not None and not observed_lookup(observed, lineage.path):
@@ -759,13 +912,19 @@ def review_execution(
                 f"{lineage.path} is not in what {where} returned when the scout made that call: "
                 f"{_clip(result_shape(observed), 200)}"
             )
-        elif spec is not None and values and (failure := expectation_failure(spec, values)):
+        elif spec is not None and values and (
+            failure := lineage_value_failure(name, spec, observed, lineage.path)
+        ):
             problem = (
                 f"{lineage.text()} gives {failure} (the expected outcome for {name}) in what "
                 f"{where} returned when the scout made that call"
             )
         elif better is not None and _leaf_key(lineage.path) != _leaf_key(name):
             problem = f"{lineage.text()} reads {_leaf_key(lineage.path)!r}"
+        elif mismatch is not None:
+            problem = f"{lineage.text()} {mismatch[0]}"
+            if better is None and mismatch[1] is not None and holds(mismatch[1]):
+                better = Lineage(lineage.step, mismatch[1])
         elif better is not None and not _is_sure(tree, lineage.path):
             problem = (
                 f"{lineage.text()} goes through a value the output schema marks optional (null "
@@ -1064,11 +1223,14 @@ def choose_probe(
 ) -> tuple[ProbeChoice | None, list[str]]:
     """The first happy step whose tool may be probed and that has a mutable argument.
 
-    A tool is skipped when :func:`mcpsim.scout.probe_refusal` refuses it (a write tool, or one
-    whose description claims a cost) or when the step's arguments need an earlier result;
-    required arguments are tried before optional ones, and an ``enum`` argument is never
-    mutated (the planner's own validation would reject the value). Returns the reasons every
-    earlier step was skipped.
+    A step is skipped when :func:`mcpsim.scout.probe_refusal` refuses its tool (a write tool,
+    one whose description claims a cost, one that reaches outside the server), when
+    :func:`mcpsim.scout.probe_argument_refusal` refuses its arguments (a URL, host name or
+    e-mail address), when the tool's name cannot appear in a ``tool_result[<tool>]``
+    checkpoint (the variant would be dropped after the call was spent), or when the step's
+    arguments need an earlier result; required arguments are tried before optional ones, and an
+    ``enum`` argument is never mutated (the planner's own validation would reject the value).
+    Returns the reasons every earlier step was skipped.
     """
     reasons: list[str] = []
     for position, call in enumerate(calls, start=1):
@@ -1076,9 +1238,15 @@ def choose_probe(
             reasons.append(f"step {position} ({call.tool}) is not a server tool")
             continue
         tool = catalog.tool(call.tool)
-        refusal = probe_refusal(tool)
+        refusal = probe_refusal(tool) or probe_argument_refusal(tool, call.arguments)
         if refusal is not None:
             reasons.append(f"step {position} ({tool.name}): {refusal}")
+            continue
+        if validate_checkpoint(f"tool_result[{tool.name}]: is an error") is not None:
+            reasons.append(
+                f"step {position} ({tool.name}): its name cannot appear in a "
+                "tool_result[<tool>] checkpoint"
+            )
             continue
         if call.references():
             reasons.append(f"step {position} ({tool.name}) needs an earlier step's result")
@@ -1129,6 +1297,60 @@ def _path_id(prefix: str, tool: str) -> str:
     return f"{prefix}-{re.sub(r'[^A-Za-z0-9._-]', '-', tool)}"
 
 
+# Words of a result key whose value is new on every call (ids of the request, times, durations).
+VOLATILE_KEY_WORDS = frozenset({
+    "id", "ids", "uuid", "guid", "nonce", "etag", "trace", "span", "request", "correlation",
+    "timestamp", "ts", "time", "at", "ms", "took", "elapsed", "duration", "latency", "seconds",
+    "secs", "now", "date", "created", "updated", "generated", "expires",
+})
+VOLATILE_FORMATS = frozenset({"date-time", "date", "time", "duration", "uuid"})
+_KEY_WORD = re.compile(r"[A-Z]?[a-z]+|[A-Z]+(?![a-z])|[0-9]+")
+_VOLATILE_VALUES = (
+    re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.IGNORECASE),
+    re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}[T ][0-9]{2}:[0-9]{2}"),  # an ISO date-time
+    re.compile(r"^[0-9a-f]{16,}$", re.IGNORECASE),  # a hash or opaque token
+)
+# A number this size is an epoch timestamp (seconds since 2001, or milliseconds), not a count.
+_EPOCH_RANGE = (1_000_000_000, 100_000_000_000_000)
+
+
+def is_volatile(key: str, value: Any, prop: dict[str, Any] | None = None) -> bool:
+    """Is ``key``'s value likely to differ between two identical calls?
+
+    By the key's words (``request_id``, ``created_at``, ``tookMs``, ``id``), by the output
+    schema's ``format`` (``date-time``, ``uuid``), or by the value's shape (a UUID, an ISO
+    date-time, a long hex token, an epoch-sized number). A stable value judged volatile only
+    costs a boundary fact; a volatile one stated as a fact fails every later run.
+    """
+    words = {w.lower() for w in _KEY_WORD.findall(key)}
+    if words & VOLATILE_KEY_WORDS:
+        return True
+    fmt = (prop or {}).get("format")
+    if isinstance(fmt, str) and fmt in VOLATILE_FORMATS:
+        return True
+    if isinstance(value, str):
+        return any(p.match(value) for p in _VOLATILE_VALUES)
+    if isinstance(value, int | float) and not isinstance(value, bool):
+        return _EPOCH_RANGE[0] <= abs(value) < _EPOCH_RANGE[1]
+    return False
+
+
+_CATEGORICAL = frozenset({"null", "true", "false", "empty", "zero"})
+
+
+def _kind(value: Any) -> str:
+    """The kind of value a fact turns on: null, a boolean, empty/zero, or something."""
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, list | str | dict):
+        return "empty" if not value else type(value).__name__
+    if isinstance(value, int | float):
+        return "zero" if value == 0 else "number"
+    return type(value).__name__
+
+
 def boundary_facts(
     choice: ProbeChoice,
     probed: Observation,
@@ -1136,22 +1358,36 @@ def boundary_facts(
     lineage_keys: list[str],
 ) -> list[str]:
     """``tool_result[<tool>]: <key> equals <value> when <argument> is <mutated>`` for what the
-    probe returned, at most :data:`MAX_BOUNDARY_FACTS`.
+    probe returned, at most :data:`MAX_BOUNDARY_FACTS`, built only from structured content.
 
-    Keys that echo the mutated input are left out, and so are prose strings; when the scout's
+    A result without structured content (text, which may be anybody's words) gives only
+    ``answers without an error``. Keys that echo the mutated input are left out, and so are
+    prose strings and values that differ on every call (:func:`is_volatile`: a ``request_id``,
+    a timestamp), which would make the boundary path fail on its next run. When the scout's
     result for the original call is known only keys whose value (or list length) differs are
-    kept, so the fact is what the mutation changed. Keys an answer field reads come first.
+    kept, so the fact is what the mutation changed. Keys an answer field reads come first, then
+    keys whose kind of value changed (a list or count that became empty or zero, a value that
+    became null) or that the output schema declares an ``enum`` (``match``), then other scalars,
+    then other lists.
     """
     tool, when = choice.tool.name, choice.when()
     data = probed.structured
     if isinstance(data, list):
         return [f"tool_result[{tool}]: returns {_entries(len(data))} {when}"]
     if not isinstance(data, dict):
-        return [f"tool_result[{tool}]: returns {_clip(probed.summary, 80)} {when}"]
+        return [f"tool_result[{tool}]: answers without an error {when}"]
     before = original if isinstance(original, dict) else None
+    output = choice.tool.output_schema or {}
+    properties = _concrete(output, output).get("properties") if output else None
+    properties = properties if isinstance(properties, dict) else {}
     ranked: list[tuple[int, int, str]] = []
+    volatile: list[str] = []
     for order, (key, value) in enumerate(data.items()):
         if value == choice.mutated or isinstance(value, dict):
+            continue
+        prop = _concrete(properties.get(key), output) if key in properties else {}
+        if is_volatile(str(key), value, prop):
+            volatile.append(str(key))
             continue
         if isinstance(value, list):
             text, now = f"{key} has {_entries(len(value))}", len(value)
@@ -1164,14 +1400,24 @@ def boundary_facts(
             then = before.get(key) if before else None
         if before is not None and key in before and then == now:
             continue
-        rank = 0 if key in lineage_keys else (1 if not isinstance(value, list) else 2)
+        if key in lineage_keys:
+            rank = 0
+        elif (
+            enum_members(prop, output) is not None
+            or (before is not None and key in before and _kind(before[key]) != _kind(value))
+            or (before is None and _kind(value) in _CATEGORICAL)
+        ):
+            rank = 1
+        else:
+            rank = 2 if not isinstance(value, list) else 3
         ranked.append((rank, order, text))
     ranked.sort()
     if not ranked:
         if before is not None:
+            apart = f", apart from {', '.join(volatile)}" if volatile else ""
             return [
                 f"tool_result[{tool}]: returns the same result {when} as when {choice.argument} "
-                f"is {_plain(choice.original)}"
+                f"is {_plain(choice.original)}{apart}"
             ]
         return [f"tool_result[{tool}]: answers without an error {when}"]
     return [f"tool_result[{tool}]: {text} {when}" for _, _, text in ranked[:MAX_BOUNDARY_FACTS]]
@@ -1505,11 +1751,13 @@ async def ground_variant(
     )
     try:
         probed = await probe(scout, session, choice.tool, choice.arguments(call), why=why)
-    except ValueError:
-        raise  # a refused tool: choose_probe should never have picked it
+    except ProbeRefusedError:
+        raise  # choose_probe applies the same checks, so this is a bug to surface
     except Exception as exc:  # noqa: BLE001 - the probe is optional; the plan is not
         # The session has sat idle through minutes of local model calls; an HTTP server may
-        # have dropped it. Losing the variant is better than losing the plan.
+        # have dropped it, or answered the mutated input with a result the SDK cannot validate
+        # (a pydantic ValidationError, which is a ValueError). Losing the variant is better
+        # than losing the plan.
         notes.append(
             f"no probe: {choice.tool.name} could not be called ({type(exc).__name__}: "
             f"{_clip(str(exc), 160)})"

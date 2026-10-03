@@ -510,7 +510,8 @@ model wrote plans that validate and test almost nothing; asked to plan the tool 
 the user's request, it gets the main call right. So the local model writes only the steps and,
 for each expected-outcome field, which step's result it comes from; the framework builds the
 happy path and its checkpoints from that, grounds one recovery or boundary path in a live probe
-of a mutated read-only call on the scout's session (never a write or costly tool), and adds a
+of a mutated read-only call on the scout's session (never a write or costly tool, never one that
+reaches outside the server, never a call that sends a URL or e-mail address), and adds a
 policy path for each tool an instruction forbids (one tiny constrained question per
 instruction). Details and measurements: docs/LOCAL_MODELS.md, "The execution planner". How the protocol maps onto `/api/chat`, how an 8k context is respected, what to
 expect from a 7–8B model and the smoke sequence are in

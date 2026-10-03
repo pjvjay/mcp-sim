@@ -26,11 +26,12 @@ REFERENCE_KEY = "$from_step"
 
 # A checkpoint is ``<where>: <observable condition>`` with ``<where>`` one of ``final_result``,
 # ``tool_result[<tool>]`` or ``transcript`` (LOCAL_MODELS.md, "Checkpoints need a shape"), or
-# ``report: <observer>.<condition> is true|false`` over an informant report (DESIGN §2b). Tool
-# names are lowercase and may carry digits, dots and hyphens (a gateway prefixes them:
-# ``pantry-find-product``).
+# ``report: <observer>.<condition> is true|false`` over an informant report (DESIGN §2b). A tool
+# name is what MCP allows (the SDK's ``TOOL_NAME_REGEX``): letters of either case, digits, ``_``,
+# ``.`` and ``-`` (a gateway prefixes them: ``pantry-find-product``; some servers use camelCase:
+# ``lookUp``).
 CHECKPOINT_PATTERN = re.compile(
-    r"^(?:(final_result|tool_result\[[a-z0-9_][a-z0-9_.-]*\]|transcript):\s*\S"
+    r"^(?:(final_result|tool_result\[[A-Za-z0-9_.-]+\]|transcript):\s*\S"
     r"|report:\s*[a-z_][a-z0-9_]*\.[a-z_][a-z0-9_]*\s+is\s+(true|false)\s*$)"
 )
 CHECKPOINT_SHAPE = (

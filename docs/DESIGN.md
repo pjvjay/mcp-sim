@@ -61,7 +61,10 @@ flowchart LR
   key (`"price": "step 1: items[0].price"`, a single-anchored grammar pattern). Arguments are
   schema-checked like any step; lineage must name a tool step and a path the tool's output
   schema declares and, when the scout made the same call, a path the observed result has whose
-  value satisfies the field's own expected-outcome spec (the matcher's operators); a lineage
+  value satisfies the field's own expected-outcome spec (the matcher run on the final result
+  the lineage implies, so `[*]`, `[any]` and projections are judged as the answer will be); a
+  `[*]` field read from one element (`lines[*].price ← summary.lines[0].price`) is sent back
+  with the `[*]` rewrite; a lineage
   that reads another key while one with the field's own name is there (`store` from
   `items[0].brand` beside `items[0].store`, `query` from `items[0].name` under a top-level
   `query`) is sent back with that key; one re-ask. The framework then builds the tests: the **happy path** from the
@@ -71,7 +74,10 @@ flowchart LR
   live probe on the scout's read-only session (the first read-only, free happy step re-sent
   with one argument mutated, a string losing an interior character or an integer becoming
   999999: an error becomes a recovery path that quotes it, an answer a boundary path whose
-  checkpoint states what came back; never a write or costly tool; counted against the scout
+  checkpoints state what came back, from structured content only and never a value that
+  changes on every call; never a write or costly tool, never one that reaches outside the
+  server (`openWorldHint`, an internet description), never a call that sends a URL, host name
+  or e-mail address; a probe the server answers badly costs the variant; counted against the scout
   budget, which keeps one call back for it, and recorded in `scout.json`); and a **policy
   path** per tool that an instruction forbids, found by one tiny enum-constrained question per
   prohibiting instruction (at most three) and kept only when the prohibiting clause names the
@@ -397,7 +403,8 @@ matcher operator table (every operator, both outcomes, type strictness, `[*]`/`[
 plan validation (unknown tool rejected, re-ask once); the local execution planner (the exact
 prompt, the grammar and its single pair of anchors, each derived checkpoint, lineage checks and
 repairs, the recovery and boundary paths built from a real probe of the fake server, no probe of
-a write or costly tool, policy questions, the hosted profile untouched); executor loop (tool_use → MCP call →
+a write, costly or open-world tool or of a call that sends a URL, no volatile boundary fact, a
+malformed probe result costing only the variant, policy questions, the hosted profile untouched); executor loop (tool_use → MCP call →
 tool_result; error results; budget stop; final_result extraction, including a malformed block);
 judge majority and the "matcher failure overrides votes" rule; report aggregation and exit
 code; the CLI end-to-end on the fake server in dry-run mode. An `integration` marker runs one
