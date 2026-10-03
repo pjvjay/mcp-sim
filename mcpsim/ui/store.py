@@ -306,12 +306,27 @@ class Store:
         verdicts: dict[str, dict[str, Any]] | None = None,
         facts: dict[str, dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
-        """Status, pass rate, pass^k, cost and duration of one run directory."""
+        """Status, pass rate, pass^k, cost and duration of one run directory.
+
+        A run is finished when the runner wrote its ``report.json`` (it does so last) and that
+        report lists no unjudged transcript and no repeat that never ran. Anything else (a
+        cancelled or crashed run, a judge that failed mid-way, a run still being written) is
+        ``incomplete``: its counts describe what is on disk, but it is never ``passed`` and its
+        pass^k never holds, whatever the verdicts so far say. pass^k's ``k`` is the repeat the
+        run asked for (``scenario.json`` records it), not the number of runs that got done.
+        """
         report = self._small_json(run_dir, "report.json")
         report = report if isinstance(report, dict) else None
         verdicts = self.verdicts(run_dir) if verdicts is None else verdicts
         snapshot = self._small_json(run_dir, "scenario.json")
         snapshot = snapshot if isinstance(snapshot, dict) else {}
+        repeat = snapshot.get("repeat")
+        repeat = repeat if isinstance(repeat, int) and not isinstance(repeat, bool) else None
+        repeat = repeat if repeat is not None and repeat >= 1 else None
+        stems = (
+            set(facts) if facts is not None else {p.stem for p in self.transcript_files(run_dir)}
+        )
+        unjudged = sorted(stems - set(verdicts))
 
         if report is not None and isinstance(report.get("runs"), int):
             runs = int(report["runs"])
@@ -324,9 +339,18 @@ class Store:
         if mean_score is None and scores:
             mean_score = round(sum(scores) / len(scores), 4)
 
+        # A report rebuilt over a partial directory (`mcpsim report`) lists what is missing.
+        gaps = [
+            gap
+            for key in ("unjudged", "missing")
+            for gap in (report.get(key) if report and isinstance(report.get(key), list) else [])
+        ]
+        finished = report is not None and not gaps
         pass_k = report.get("pass_k") if report else None
         if not (isinstance(pass_k, dict) and "k" in pass_k):
-            pass_k = self._computed_pass_k(verdicts)
+            pass_k = self._computed_pass_k(verdicts, stems, repeat)
+        if not finished and pass_k is not None:
+            pass_k = {**pass_k, "all_passed": False}
 
         cost = _num(report.get("cost_usd")) if report else None
         duration = _num(report.get("duration_s")) if report else None
@@ -358,12 +382,15 @@ class Store:
             "run_id": run_id,
             "scenario": name,
             "started_at": started.isoformat() if started else None,
-            "status": status_of(runs, passed),
+            "status": status_of(runs, passed) if finished else "incomplete",
+            "finished": finished,
             "runs": runs,
             "passed": passed,
             "pass_rate": round(passed / runs, 4) if runs else None,
             "mean_score": mean_score,
             "pass_k": pass_k,
+            "repeat": repeat,
+            "unjudged": len(unjudged),
             "cost_usd": cost,
             "duration_s": duration,
             "judge_models": judge_models,
@@ -374,19 +401,28 @@ class Store:
         }
 
     @staticmethod
-    def _computed_pass_k(verdicts: dict[str, dict[str, Any]]) -> dict[str, Any] | None:
-        """pass^k from the verdicts when ``report.json`` predates it, the way the report computes
-        it: ``k`` is the most runs any path x mode cell has, ``all_passed`` that every cell has
-        ``k`` runs and every one passed."""
-        if not verdicts:
-            return None
-        cells: dict[tuple[str, str], list[bool]] = {}
+    def _computed_pass_k(
+        verdicts: dict[str, dict[str, Any]],
+        transcripts: set[str] | None = None,
+        repeat: int | None = None,
+    ) -> dict[str, Any] | None:
+        """pass^k from the run directory when ``report.json`` does not carry it, the way the
+        report computes it (:func:`mcpsim.report.pass_k`): ``k`` is ``repeat`` (the run's
+        recorded repeat) when known, else the most runs any path x mode cell has;
+        ``all_passed`` that every cell (from the verdicts and the transcripts) has ``k`` runs
+        and every one was judged and passed. A transcript without a verdict is not a pass."""
+        cells: dict[tuple[str, str], dict[str, bool]] = {}
+        for stem in transcripts or set():
+            path_id, mode, _ = split_stem(stem)
+            cells.setdefault((path_id, mode), {}).setdefault(stem, False)
         for stem, v in verdicts.items():
             path_id, mode, _ = split_stem(stem)
             key = (str(v.get("path_id", path_id)), str(v.get("mode", mode)))
-            cells.setdefault(key, []).append(v.get("passed") is True)
-        k = max(len(group) for group in cells.values())
-        all_passed = all(len(group) == k and all(group) for group in cells.values())
+            cells.setdefault(key, {})[stem] = v.get("passed") is True
+        if not cells:
+            return None
+        k = repeat if repeat is not None else max(len(group) for group in cells.values())
+        all_passed = all(len(group) >= k and all(group.values()) for group in cells.values())
         return {"k": k, "all_passed": all_passed, "computed": True}
 
     def in_progress(self, name: str, since: str | None) -> set[str]:
@@ -421,19 +457,37 @@ class Store:
     def last_judged(
         self, name: str, skip: set[str] | None = None
     ) -> tuple[dict[str, Any] | None, int]:
-        """The newest run that has a report or verdicts (ignoring ``skip``, the runs still
-        being written), and how many run directories exist."""
+        """The newest finished run (see :meth:`run_summary`: a ``report.json`` that lists no
+        gaps), ignoring ``skip`` (the runs still being written), and how many run directories
+        exist. A cancelled, crashed or half-judged directory never stands in for the
+        scenario's result; :meth:`latest_incomplete` names it instead."""
         ids = self.run_ids(name)
         for run_id in ids:
             run_dir = self.run_dir(name, run_id)
             if run_dir is None or (skip and run_id in skip):
                 continue
             report = run_dir / "report.json"
-            if (report.is_file() and self._inside(report)) or self._listed(
-                run_dir / "verdicts", VERDICT_RE
-            ):
-                return self.run_summary(name, run_id, run_dir), len(ids)
+            if not (report.is_file() and self._inside(report)):
+                continue
+            summary = self.run_summary(name, run_id, run_dir)
+            if summary["finished"]:
+                return summary, len(ids)
         return None, len(ids)
+
+    def latest_incomplete(
+        self, name: str, last: dict[str, Any] | None, skip: set[str] | None = None
+    ) -> str | None:
+        """The newest run directory newer than ``last`` (the newest finished run) that did not
+        finish and is not being written (``skip``): a run that was cancelled or crashed after
+        the result the list shows."""
+        newest_finished = run_sort_key(str(last["run_id"])) if last else None
+        for run_id in self.run_ids(name):
+            if newest_finished is not None and run_sort_key(run_id) <= newest_finished:
+                return None
+            if skip and run_id in skip:
+                continue
+            return run_id
+        return None
 
     def run_detail(self, name: str, run_id: str, run_dir: FsPath) -> dict[str, Any]:
         verdicts = self.verdicts(run_dir)

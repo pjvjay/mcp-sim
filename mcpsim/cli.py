@@ -40,6 +40,7 @@ the positional path(s), so keyword names are part of the contract::
         model_overrides: Mapping[str, str] | None = None,  # --models, only when given
         allow_same_judge: bool = False,                    # --allow-same-judge, only when given
         skill: str | None = None,                          # --skill, only when given
+        modes: list[str] | None = None,                    # --modes, only when given
     ) -> pathlib.Path:
         '''plan -> runs -> judge -> report. Returns the run directory
         <out_dir>/<scenario.name>/<timestamp>/ holding plan.json, scenario.json (the validated
@@ -120,7 +121,7 @@ from mcpsim import __version__
 from mcpsim.mcpclient import Catalog, MCPClientError, connect
 from mcpsim.report import Report, exit_code, render_markdown, summary_line
 from mcpsim.scenario import MODEL_ROLES, Scenario, ScenarioError, load_scenario
-from mcpsim.skill import SKILL_ENV, Skill, SkillError, load_skill, one_line
+from mcpsim.skill import SKILL_ENV, Resolved, Skill, SkillError, load_skill, one_line
 
 EXIT_OK = 0
 EXIT_FAILURE = 1
@@ -309,6 +310,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         return EXIT_USAGE
 
     def body() -> int:
+        extra: dict[str, Any] = {"modes": list(args.modes)} if args.modes else {}
         run_dir = FsPath(
             runner.run_scenario(
                 args.scenario,
@@ -319,6 +321,7 @@ def cmd_run(args: argparse.Namespace) -> int:
                 mode=args.mode,
                 dry_run=dry_run_requested(args.dry_run),
                 **model_kwargs(args),
+                **extra,
             )
         )
         print(f"run dir: {run_dir}")
@@ -406,28 +409,40 @@ def list_suite(args: argparse.Namespace) -> int:
         names=args.name or None,
         categories=args.category or None,
     )
+    # Resolve each scenario the way the suite will (Skill.apply): a temperature the resolved
+    # model rejects makes it an error row here too (not in dry run, which calls no model).
+    resolutions: dict[int, Resolved] = {}
+    errors: dict[int, str] = {}
+    for i, entry in enumerate(entries):
+        if entry.scenario is None:
+            errors[i] = entry.error or "does not load"
+            continue
+        try:
+            _, resolutions[i] = skill.apply(
+                entry.scenario,
+                model_overrides=_merged_models(args),
+                run_overrides=_run_overrides(args),
+                check_sampling=not dry_run_requested(args.dry_run),
+            )
+        except (SkillError, ValueError) as exc:
+            errors[i] = str(exc)
     if args.json:
         rows = []
-        for entry in entries:
+        for i, entry in enumerate(entries):
             row = entry.to_json()
-            if entry.scenario is not None:
-                row["resolved"] = skill.resolve(
-                    entry.scenario,
-                    model_overrides=_merged_models(args),
-                    run_overrides=_run_overrides(args),
-                ).to_json()
+            row["error"] = errors.get(i)
+            if i in resolutions:
+                row["resolved"] = resolutions[i].to_json()
             rows.append(row)
         print(json.dumps(rows, indent=2))
         return EXIT_OK
     width = max(len(e.name) for e in entries)
-    for entry in entries:
-        if entry.error is not None:
-            print(f"{entry.name.ljust(width)}  error: {one_line(entry.error)}")
+    for i, entry in enumerate(entries):
+        if i in errors:
+            where = f"[{entry.category}] " if entry.category else ""
+            print(f"{entry.name.ljust(width)}  {where}error: {one_line(errors[i])}")
             continue
-        assert entry.scenario is not None
-        resolved = skill.resolve(
-            entry.scenario, model_overrides=_merged_models(args), run_overrides=_run_overrides(args)
-        )
+        resolved = resolutions[i]
         run = resolved.run
         print(
             f"{entry.name.ljust(width)}  [{entry.category}] repeat {run['repeat'].value}, "
@@ -479,6 +494,8 @@ def render_config(info: dict[str, Any]) -> str:
         prompts = ", ".join(role["prompts"])
         lines.append(f"      {'; '.join(settings) or 'defaults'}; prompts: {prompts}")
         lines.append(f"      {role['file']}")
+        for note in role.get("shadowed") or []:
+            lines.append(f"      note: {note}")
     lines += ["", "run:"]
     for key, setting in info["run"].items():
         value = setting["value"]
@@ -500,6 +517,9 @@ def render_config(info: dict[str, Any]) -> str:
             parts = [f"models {models}"] if models else []
             parts += [f"run {run}"] if run else []
             lines.append(f"  {i}. match {match}: {'; '.join(parts) or '(nothing)'}")
+    if info.get("problems"):
+        lines += ["", "problems (a run with this resolution is refused):"]
+        lines += [f"  - {problem}" for problem in info["problems"]]
     return "\n".join(lines)
 
 
@@ -514,6 +534,10 @@ def cmd_config(args: argparse.Namespace) -> int:
             print(json.dumps(info, indent=2))
         else:
             print(render_config(info))
+        if info["problems"]:
+            for problem in info["problems"]:
+                print(f"mcpsim config: {problem}", file=sys.stderr)
+            return EXIT_FAILURE
         return EXIT_OK
 
     return _guarded(args.command, body)
@@ -555,12 +579,17 @@ def cmd_ui(args: argparse.Namespace) -> int:
     except ValueError as exc:
         print(f"mcpsim ui: {exc}", file=sys.stderr)
         return EXIT_USAGE
+    if args.allow_host and not args.allow_remote:
+        print("mcpsim ui: --allow-host only applies with --allow-remote", file=sys.stderr)
+        return EXIT_USAGE
     try:
         settings = resolve_settings(
             skill=args.skill,
             runs=args.runs,
             scenarios=args.scenarios,
             allow_remote=args.allow_remote,
+            allow_hosts=args.allow_host or [],
+            bind_host=args.host,
         )
     except SkillError as exc:
         print(f"mcpsim ui: {exc}", file=sys.stderr)
@@ -627,7 +656,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--plan", help="reuse an existing plan.json instead of planning")
     p.add_argument("--only-path", help="run only this path id")
     p.add_argument("--repeat", type=int, help="override the scenario's repeat count")
-    p.add_argument("--mode", choices=["guided", "free"], help="run only this mode")
+    which = p.add_mutually_exclusive_group()
+    which.add_argument("--mode", choices=["guided", "free"], help="run only this mode")
+    which.add_argument(
+        "--modes",
+        type=_modes_arg,
+        metavar="guided,free",
+        help="the run modes to keep (default: from config.yaml and the scenario)",
+    )
     p.add_argument("--dry-run", action="store_true", help="no LLM; call planned tools, match")
     _model_args(p)
     _threshold_arg(p)
@@ -710,7 +746,17 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--allow-remote",
         action="store_true",
-        help="allow a non-loopback --host (anyone who can reach it can read runs and start them)",
+        help=(
+            "allow a non-loopback --host: anyone who can reach it can read runs and start "
+            "them. Requests must still name this machine (an IP address, its host name or an "
+            "--allow-host name), so a web page you visit cannot rebind its domain to it"
+        ),
+    )
+    p.add_argument(
+        "--allow-host",
+        action="append",
+        metavar="NAME",
+        help="with --allow-remote: also answer requests for this host name (repeatable)",
     )
     p.set_defaults(func=cmd_ui)
     return parser

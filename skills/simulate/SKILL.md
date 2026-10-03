@@ -21,19 +21,27 @@ Every LLM call of a simulation is configured here, not in code:
 
 | file | what it holds |
 | --- | --- |
-| `config.yaml` | the model of each role, run defaults (repeat, modes, judge_votes, concurrency), the scenario sources, `runs_dir`, per-scenario overrides |
+| `config.yaml` | models and run defaults (repeat, modes, judge_votes, concurrency) that override the role files, the scenario sources, `runs_dir`, per-scenario overrides |
 | `roles/planner.md` | the hosted planner: system prompt, user prompt, re-ask |
 | `roles/planner-local.md` | the execution planner, used only for an `ollama:` planner |
 | `roles/agent.md` | the agent under test: system prompt (rendered each turn), the note an observer-enabled goal adds |
 | `roles/user.md` | the simulated user: system prompt, opening cue, fallbacks |
 | `roles/observer.md` | the LLM observers (Informant-Report Method) |
-| `roles/judge.md` | the judge: the rules, the evidence it is shown, `votes` |
+| `roles/judge.md` | the judge: the rules, the evidence it is shown, `votes` (the default judge_votes) |
 | `scripts/run.sh` | the steps below as one script |
 
 Each role file has YAML frontmatter (`role`, `provider`, `model`, optional `temperature` and
 `max_tokens`, plus `votes` for the judge and `policy_max_tokens` for the local planner) and a
 body of prompts, each starting with a `{% prompt NAME %}` line. They are read at run time, so a
 change takes effect on the next run, with no code edit and no reinstall.
+
+The prompts, `temperature` and `max_tokens` come only from the role file. Its `provider` /
+`model` and the judge's `votes` are the lowest configurable layer instead: they are the
+default, and anything above them wins (see [Change a model](#change-a-model)). The bundled
+`config.yaml` sets no models and no `judge_votes`, so the role files are live as shipped; once
+you set `defaults.judge` or `run.judge_votes` there, an override, a scenario's own `models` or
+`judge_votes`, or `--models`, the role file's value is shadowed. `mcpsim config` shows which
+layer each value came from and prints a `note:` under every role whose value is shadowed.
 
 ## Run it end to end
 
@@ -80,8 +88,9 @@ skills/simulate/scripts/run.sh report
    - `--list` shows what would run, with the resolved settings, and runs nothing.
    - `--dry-run` uses no LLM at all.
 
-   Each run makes live Claude API calls. The judge costs about $0.17 per Opus vote, so start
-   with `--name` on one scenario.
+   Each run makes live Claude API calls. A judge vote on Opus 5.5 costs about $0.05 (list
+   prices; `report.json` has the estimate per run), and every transcript gets `judge_votes`
+   of them, so start with `--name` on one scenario.
 4. **Test runner** (`run.sh ui`, which runs `mcpsim ui --skill <this skill>` on
    127.0.0.1:8765). The runner offers search, run all / run one / re-run, run history and
    settings. Its detail view shows the user instructions, the context, each expected-behaviour
@@ -97,31 +106,38 @@ skills/simulate/scripts/run.sh report
 
 ## Change a model
 
-Change it in `config.yaml`, not in the scenarios. Model precedence for each role, lowest to
+Change it in the skill, not in the scenarios. Model precedence for each role, lowest to
 highest:
 
 > built-in default < `roles/<role>.md` frontmatter < `config.yaml` `defaults` < every matching
 > `config.yaml` override (in file order) < the scenario file's own `models` < `--models`
 
-- **Every scenario:** edit `defaults` in `config.yaml`, e.g. `judge: anthropic:claude-opus-5`.
+- **Every scenario:** edit the role file's `model` (for example `model: claude-opus-5` in
+  `roles/judge.md`), or set it in `config.yaml` `defaults` (`judge: anthropic:claude-opus-5`),
+  which then wins over the role file.
 - **Some scenarios:** add an override, e.g.
   `{match: {category: "Recipe*"}, models: {judge: ...}, run: {judge_votes: 1}}`. `match` takes
   fnmatch globs on `name` and/or `category`.
 - **One run:** pass `--models role=provider:model` (roles: planner, agent, user, observer, judge).
 - **A local model:** use `ollama:<model>`. A local planner switches to `roles/planner-local.md`.
 
-Run settings (`repeat`, `modes`, `judge_votes`, `concurrency`) follow the same ladder. A value
+Run settings (`repeat`, `modes`, `judge_votes`, `concurrency`) follow the same ladder, with
+`roles/judge.md`'s `votes` as the layer of `judge_votes` above the built-in default. A value
 the scenario file sets itself (most pantry scenarios set `repeat` and `judge_votes`) wins over
-`config.yaml`.
+`config.yaml` and the role files.
 
-`mcpsim config` (or `run.sh config`) prints every role's model and the layer it came from, plus
-the run settings and the scenario sources. `mcpsim config --scenario NAME` shows the resolution
-for one scenario, its overrides included. `--json` gives the same as data.
+`mcpsim config` (or `run.sh config`) prints every role's model and the layer it came from, a
+`note:` for every role-file value that a higher layer shadows, the run settings and the
+scenario sources. `mcpsim config --scenario NAME` shows the resolution for one scenario, its
+overrides included. `--json` gives the same as data.
 
 Notes:
 
-- Claude Opus 5.5, Sonnet 5.5, Fable 5.1 and Opus 4.7 or later reject `temperature`, and the
-  loader refuses a temperature for a role resolved to one of them.
+- Claude Opus 5.5, Sonnet 5.5, Fable 5.1 and Opus 4.7 or later reject `temperature`. The
+  check runs whenever a scenario is resolved: `mcpsim config` (for the defaults, or for
+  `--scenario`) lists the conflict under `problems` and exits 1, `suite --list` shows the
+  scenario as an error row, and `run`, `plan` and `suite` refuse it before any call. A dry run
+  calls no model and skips the check.
 - The judge must differ from the agent unless the scenario sets `models.allow_same_judge`.
 
 ## Change a prompt
@@ -147,7 +163,8 @@ The loader refuses these mistakes with the file and line:
 - an unknown or missing prompt;
 - an unknown frontmatter key.
 
-Run `mcpsim config` after an edit; it loads every role and fails loudly on these errors.
+Run `mcpsim config` after an edit; it loads every role and fails loudly on these errors (and
+on a temperature the resolved model rejects).
 
 To experiment without touching the bundled files, copy the skill with
 `cp -R skills/simulate /tmp/my-skill`, edit the copy, and run with `--skill /tmp/my-skill` (or

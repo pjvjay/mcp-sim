@@ -3,8 +3,11 @@
 Security model (contract D):
 
 * The server binds 127.0.0.1 by default; :func:`serve` refuses a non-loopback host unless
-  ``allow_remote`` is set. Without it, a request whose ``Host`` is not a loopback name is
-  refused too, which stops DNS-rebinding pages from reading the API through the browser.
+  ``allow_remote`` is set. Every request's ``Host`` is checked too, which stops DNS-rebinding
+  pages (a site whose name the attacker points at this machine) from loading the page, its
+  token or the API through the browser: without ``allow_remote`` only loopback names pass;
+  with it, also IP addresses (a rebinding page always uses a name), this machine's host names,
+  the bound name and every ``--allow-host`` name (:func:`host_allowed`). Anything else is 421.
 * A random token is generated per process and embedded in the page; every POST must carry it
   in ``X-MCPSim-Token`` (a custom header, so a cross-site form or fetch cannot send it
   without a CORS preflight this server never answers). A POST with a foreign ``Origin`` is
@@ -25,7 +28,9 @@ import html
 import ipaddress
 import json
 import secrets
-from collections.abc import AsyncIterator, Awaitable, Callable, MutableMapping
+import socket
+import sys
+from collections.abc import AsyncIterator, Awaitable, Callable, MutableMapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path as FsPath
 from typing import Any
@@ -83,6 +88,42 @@ def is_loopback(host: str) -> bool:
         return False
 
 
+def is_ip_literal(host: str) -> bool:
+    try:
+        ipaddress.ip_address(host.strip().strip("[]"))
+    except ValueError:
+        return False
+    return True
+
+
+def remote_host_names(bind_host: str | None = None, extra: Sequence[str] = ()) -> frozenset[str]:
+    """The host names a remote request may use under ``--allow-remote``: this machine's name
+    (as ``gethostname`` reports it, and its first label), the bound name when it is one, and
+    ``extra`` (``--allow-host``). No DNS lookup: ``getfqdn`` can stall for half a minute, so a
+    fully qualified name the hostname does not show needs ``--allow-host``."""
+    names = {socket.gethostname(), *extra}
+    if bind_host and not is_ip_literal(bind_host):
+        names.add(bind_host)
+    out: set[str] = set()
+    for name in names:
+        name = name.strip().lower().rstrip(".")
+        if name:
+            out.add(name)
+            out.add(name.split(".", 1)[0])
+    return frozenset(out)
+
+
+def host_allowed(name: str, *, allow_remote: bool, names: frozenset[str] = frozenset()) -> bool:
+    """May a request with this ``Host`` name be served? Loopback always; with
+    ``allow_remote``, also any IP address and the ``names`` (:func:`remote_host_names`).
+    A DNS-rebinding page sends its own domain name, which is none of these."""
+    if is_loopback(name):
+        return True
+    if not allow_remote:
+        return False
+    return is_ip_literal(name) or name.strip().lower().rstrip(".") in names
+
+
 def host_name(header: str) -> str:
     """The host part of a ``Host`` header (``[::1]:8765`` -> ``::1``)."""
     header = header.strip()
@@ -102,6 +143,9 @@ class UISettings:
     allow_remote: bool = False
     command: list[str] | None = None
     cwd: FsPath = field(default_factory=FsPath.cwd)
+    # Under allow_remote: extra Host names to answer (--allow-host) and the bound --host.
+    allow_hosts: list[str] = field(default_factory=list)
+    bind_host: str | None = None
 
     @property
     def skill_dir(self) -> FsPath:
@@ -115,6 +159,8 @@ def resolve_settings(
     scenarios: list[str] | None = None,
     allow_remote: bool = False,
     cwd: FsPath | None = None,
+    allow_hosts: list[str] | None = None,
+    bind_host: str | None = None,
 ) -> UISettings:
     """The skill (``--skill``, else ``$MCPSIM_SKILL``, else the packaged copy), loaded and
     validated as every mcpsim command loads it; the runs directory (``--runs``, else the
@@ -133,6 +179,8 @@ def resolve_settings(
         scenario_sources=list(scenarios) if scenarios else None,
         allow_remote=allow_remote,
         cwd=base,
+        allow_hosts=list(allow_hosts or []),
+        bind_host=bind_host,
     )
 
 
@@ -156,11 +204,14 @@ def _error(status: int, message: str, **extra: Any) -> JSONResponse:
 
 
 class SecurityMiddleware:
-    """Refuse non-loopback ``Host`` headers (unless remote is allowed); add security headers."""
+    """Refuse a ``Host`` that :func:`host_allowed` rejects (421); add security headers."""
 
-    def __init__(self, app: Any, *, allow_remote: bool) -> None:
+    def __init__(
+        self, app: Any, *, allow_remote: bool, names: frozenset[str] = frozenset()
+    ) -> None:
         self.app = app
         self.allow_remote = allow_remote
+        self.names = names
 
     async def __call__(
         self,
@@ -171,12 +222,18 @@ class SecurityMiddleware:
         if scope["type"] != "http":
             await self.app(scope, receive, send)
             return
-        if not self.allow_remote:
-            headers = {k.decode("latin-1"): v.decode("latin-1") for k, v in scope["headers"]}
-            if not is_loopback(host_name(headers.get("host", ""))):
-                response = _error(421, "this server only answers requests for a loopback host")
-                await response(scope, receive, send)
-                return
+        headers = {k.decode("latin-1"): v.decode("latin-1") for k, v in scope["headers"]}
+        name = host_name(headers.get("host", ""))
+        if not host_allowed(name, allow_remote=self.allow_remote, names=self.names):
+            message = (
+                "this server answers loopback, IP-address and allowed host names only "
+                "(mcpsim ui --allow-host NAME adds one)"
+                if self.allow_remote
+                else "this server only answers requests for a loopback host"
+            )
+            response = _error(421, message)
+            await response(scope, receive, send)
+            return
 
         async def send_with_headers(message: MutableMapping[str, Any]) -> None:
             if message["type"] == "http.response.start":
@@ -293,6 +350,7 @@ class RunnerUI:
             described = skill.describe(base=self.settings.cwd)
         except SkillError as exc:  # runs_dir names an unset environment variable
             return _error(500, str(exc))
+        warnings += described.get("problems", [])
         _, notes = self.store.files()
         warnings += notes
         return JSONResponse(
@@ -330,7 +388,8 @@ class RunnerUI:
         rows: list[dict[str, Any]] = []
         categories: dict[str, dict[str, Any]] = {}
         for name, view in sorted(index.views.items(), key=lambda kv: (kv[1].category, kv[1].title)):
-            last, count = self.store.last_judged(name, self._in_progress(name, since))
+            writing = self._in_progress(name, since)
+            last, count = self.store.last_judged(name, writing)
             status = self._scenario_status(name, last, active)
             rows.append(
                 {
@@ -344,6 +403,8 @@ class RunnerUI:
                     "pass_rate": last["pass_rate"] if last else None,
                     "pass_k": last["pass_k"] if last else None,
                     "last_run": last,
+                    # A newer run that was cancelled or crashed: last_run is still the result.
+                    "latest_incomplete": self.store.latest_incomplete(name, last, writing),
                     "run_count": count,
                 }
             )
@@ -373,9 +434,8 @@ class RunnerUI:
         view = index.views.get(name)
         if view is None:
             return _error(404, "unknown scenario")
-        last, count = self.store.last_judged(
-            name, self._in_progress(name, self.jobs.running_since())
-        )
+        writing = self._in_progress(name, self.jobs.running_since())
+        last, count = self.store.last_judged(name, writing)
         models: dict[str, Any] | None = None
         run: dict[str, Any] | None = None
         warnings: list[str] = []
@@ -394,6 +454,7 @@ class RunnerUI:
                 "scenario": view.to_json(),
                 "status": self._scenario_status(name, last, self.jobs.active_scenarios()),
                 "last_run": last,
+                "latest_incomplete": self.store.latest_incomplete(name, last, writing),
                 "run_count": count,
                 "models": models,
                 "run_settings": run,
@@ -527,7 +588,12 @@ def create_app(
         Route("/api/jobs/{job_id}/cancel", ui.cancel_job, methods=["POST"]),
     ]
     app = Starlette(routes=routes, lifespan=lifespan)
-    app.add_middleware(SecurityMiddleware, allow_remote=settings.allow_remote)
+    names = (
+        remote_host_names(settings.bind_host, settings.allow_hosts)
+        if settings.allow_remote
+        else frozenset()
+    )
+    app.add_middleware(SecurityMiddleware, allow_remote=settings.allow_remote, names=names)
     app.state.ui = ui
     return app
 
@@ -546,9 +612,21 @@ def serve(settings: UISettings, *, host: str = DEFAULT_HOST, port: int = DEFAULT
     check_bind(host, allow_remote=settings.allow_remote)
     import uvicorn
 
+    if settings.allow_remote and settings.bind_host is None:
+        settings.bind_host = host
     app = create_app(settings)
     shown = f"[{host}]" if ":" in host else host
     print(f"mcpsim ui: http://{shown}:{port}/", flush=True)
+    if settings.allow_remote:
+        names = sorted(remote_host_names(settings.bind_host, settings.allow_hosts))
+        print(
+            "mcpsim ui: warning: --allow-remote: anyone who can reach this port can read every "
+            "transcript and start runs that spend API credit. Requests are answered for "
+            f"loopback, IP addresses and the host names {', '.join(names)} (add one with "
+            "--allow-host NAME); any other Host gets 421.",
+            file=sys.stderr,
+            flush=True,
+        )
     sources = settings.scenario_sources or settings.skill.config.scenarios
     print(f"  scenarios: {', '.join(sources) or '(none configured)'}", flush=True)
     print(f"  runs:      {settings.runs_dir}", flush=True)

@@ -555,3 +555,42 @@ def test_reports_and_verdicts_written_before_v2_still_load(tmp_path: Path) -> No
         0.0,
         {},
     )
+
+
+# --- incomplete run directories -----------------------------------------------------------
+
+
+def test_missing_repeats_are_listed_against_the_asked_repeat_and_fail_the_exit_code() -> None:
+    """A repeat-3 run that stopped early: index 0 of two cells ran (one judged and passing,
+    one unjudged). pass^k keeps k = 3, lists what never ran, and the directory fails."""
+    verdicts = [_verdict("happy", "guided", 0, passed=True, score=1.0)]
+    transcripts = [_transcript("happy", "guided", 0), _transcript("2", "guided", 0)]
+    report = aggregate(verdicts, transcripts, repeat=3)
+    assert report.pass_k.model_dump() == {"k": 3, "all_passed": False}
+    assert report.unjudged == ["2-guided-0"]
+    assert report.missing == [
+        "2-guided-1",
+        "2-guided-2",
+        "happy-guided-1",
+        "happy-guided-2",
+    ]
+    assert not report.complete
+    assert (report.runs, report.passed) == (1, 1)
+    assert exit_code(report, threshold=0.0) == 1, "a partial run never exits 0"
+    assert summary_line(report).endswith(
+        "; incomplete: 1 transcript(s) not judged, 4 repeat(s) never ran"
+    )
+    md = render_markdown(report)
+    assert "## Repeats that never ran" in md and "- `happy-guided-2`" in md
+    assert "## Unjudged transcripts" in md
+
+
+def test_a_complete_run_lists_nothing_missing_and_an_inferred_k_lists_nothing() -> None:
+    full = [_verdict("happy", "guided", i, passed=True, score=1.0) for i in range(3)]
+    done = aggregate(full, [_transcript("happy", "guided", i) for i in range(3)], repeat=3)
+    assert done.missing == [] and done.unjudged == [] and done.complete
+    assert exit_code(done) == 0 and "incomplete" not in summary_line(done)
+    # Without the repeat (a caller that does not know it) k is inferred and nothing is
+    # declared missing; pass^k still compares every cell against the largest one.
+    uneven = aggregate([*full, _verdict("happy", "free", 0, passed=True, score=1.0)])
+    assert uneven.missing == [] and uneven.pass_k.model_dump() == {"k": 3, "all_passed": False}

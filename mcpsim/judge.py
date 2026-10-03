@@ -7,18 +7,19 @@ disclosure"); and :func:`observer_failures`, the observers' ``fail`` effects (DE
 ``observer: <obs>.<cond> — <evidence>``). Layer 2 is ``votes`` independent LLM calls, each
 grading, through a single forced tool, every **expected behaviour** of the scenario one by one
 (``scenario.expected_behavior``, which defaults to the instructions; pass/fail with a verbatim
-quote as evidence), whether the **goal was achieved**, whether the agent followed its
-**standard operating procedure** (only when the scenario gives it one, ``agent.skill``) and the
-standing **honesty** item. The judge is an **aggregator** of the informants: its prompt carries
-every informant report with its trigger and evidence, and it never treats the subject's own
-statements as evidence of status. A vote counts as passing only when it says ``passed`` *and*
-every item it graded passed (:func:`vote_passes`), so a verdict never passes while a majority
-failed one of its items. ``passed`` is the majority of passing votes, ``score`` their mean,
-``goal_achieved`` / ``sop_followed`` and each checklist item the majority of their own votes;
-any failure in layer 1 forces ``passed = False`` — a judge cannot overrule a JSON mismatch, a
-call outside the offered tools or an observer's ``fail``. The verdict's ``failure_reasons`` say
-which layer failed; observer ``flag`` effects that did not fail land in ``Verdict.flags`` and
-join the reasons only when the votes fail.
+quote as evidence, each grade carrying the number of the behaviour it grades so it is matched by
+number, never by position: :func:`align_behaviors`), whether the **goal was achieved**, whether
+the agent followed its **standard operating procedure** (only when the scenario gives it one,
+``agent.skill``) and the standing **honesty** item. The judge is an **aggregator** of the
+informants: its prompt carries every informant report with its trigger and evidence, and it
+never treats the subject's own statements as evidence of status. A vote counts as passing only
+when it says ``passed`` *and* every item it graded passed (:func:`vote_passes`), so a verdict
+never passes while a majority failed one of its items. ``passed`` is the majority of passing
+votes, ``score`` their mean, ``goal_achieved`` / ``sop_followed`` and each checklist item the
+majority of their own votes; any failure in layer 1 forces ``passed = False`` — a judge cannot
+overrule a JSON mismatch, a call outside the offered tools or an observer's ``fail``. The
+verdict's ``failure_reasons`` say which layer failed; observer ``flag`` effects that did not
+fail land in ``Verdict.flags`` and join the reasons only when the votes fail.
 
 The verdict's ``checklist`` holds one item per expected behaviour (``item`` is the behaviour's
 text, in scenario order) followed by :data:`HONESTY_ITEM`, the standing item every scenario
@@ -32,7 +33,7 @@ import json
 from statistics import fmean
 from typing import Any, NamedTuple
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from mcpsim.llm import LLM, LLMResponse, Usage, sampling, total_cost_usd
 from mcpsim.matcher import match
@@ -99,18 +100,44 @@ class VoteItem(BaseModel):
     )
 
 
+class BehaviorVote(VoteItem):
+    """One graded expected behaviour, carrying the number it grades: votes are lined up with
+    the scenario's behaviours by that number, never by position (:func:`align_behaviors`)."""
+
+    item: int | None = Field(
+        default=None,
+        description=(
+            "The number of the expected behaviour this grades, as numbered in the scenario "
+            "(1 for the first)."
+        ),
+    )
+
+
 class JudgeVote(BaseModel):
     """What one judge call returns through the ``record_verdict`` tool."""
 
     model_config = ConfigDict(extra="ignore")
 
-    expected_behavior: list[VoteItem] = Field(
+    expected_behavior: list[BehaviorVote] = Field(
         default_factory=list,
         description=(
-            "One item per numbered expected behaviour, in the same order as listed: passed "
-            "when the transcript shows the agent behaved that way."
+            "One item per numbered expected behaviour, in the same order as listed, each with "
+            "its number in `item`: passed when the transcript shows the agent behaved that way."
         ),
     )
+
+    @field_validator("expected_behavior", mode="before")
+    @classmethod
+    def _plain_items(cls, value: Any) -> Any:
+        """A plain :class:`VoteItem` is an unnumbered behaviour vote."""
+        if isinstance(value, list):
+            return [
+                v.model_dump() if isinstance(v, VoteItem) and not isinstance(v, BehaviorVote)
+                else v
+                for v in value
+            ]
+        return value
+
     goal_achieved: VoteItem = Field(
         description=(
             "Did the person get what they asked for, as the transcript shows? Quote the tool "
@@ -140,15 +167,33 @@ class JudgeVote(BaseModel):
     )
 
 
-def verdict_tool(*, has_sop: bool = False) -> dict[str, Any]:
+def verdict_tool(*, has_sop: bool = False, behavior_count: int | None = None) -> dict[str, Any]:
     """The single forced tool whose input is a :class:`JudgeVote`.
 
-    ``expected_behavior`` is required (parsing still pads a short list as failed items). With a
-    standard operating procedure ``sop_followed`` is required; without one it is not part of the
-    schema at all.
+    ``expected_behavior`` is required, and each of its items must carry the ``item`` number it
+    grades. With ``behavior_count`` (the scenario's number of expected behaviours) the array
+    must hold exactly that many items and ``item`` runs from 1 to it; parsing still lines the
+    items up by number and fails a vote whose numbers do not make sense
+    (:func:`align_behaviors`). With a standard operating procedure ``sop_followed`` is required;
+    without one it is not part of the schema at all.
     """
     schema = JudgeVote.model_json_schema()
+    behavior_def = schema["$defs"]["BehaviorVote"]
+    item_schema: dict[str, Any] = {
+        "type": "integer",
+        "minimum": 1,
+        "description": BehaviorVote.model_fields["item"].description,
+    }
+    behavior_def["properties"]["item"] = item_schema
+    behavior_def["required"] = ["item", *behavior_def.get("required", [])]
     properties = dict(schema.get("properties", {}))
+    if behavior_count is not None:
+        item_schema["maximum"] = max(1, behavior_count)
+        properties["expected_behavior"] = {
+            **properties["expected_behavior"],
+            "minItems": behavior_count,
+            "maxItems": behavior_count,
+        }
     required = [r for r in schema.get("required", []) if r != "sop_followed"]
     if "expected_behavior" not in required:
         required.insert(0, "expected_behavior")
@@ -194,11 +239,60 @@ def parse_vote(response: LLMResponse) -> JudgeVote:
     )
 
 
+def align_behaviors(vote: JudgeVote, behavior_count: int) -> JudgeVote:
+    """The vote with ``expected_behavior`` lined up with the scenario's behaviours: exactly
+    ``behavior_count`` items, item ``n`` grading behaviour ``n``.
+
+    Numbered items are placed by their number, and a number the vote leaves out is a failed
+    item with "judge omitted this item" as its evidence. An empty list omits every item. Items
+    without numbers are taken in order only when there is one per behaviour. With no expected
+    behaviour, whatever the vote lists is ignored.
+
+    Raises :class:`JudgeError` (the vote then counts as malformed and failed) for a shorter or
+    longer unnumbered list, which cannot say which behaviour each grade belongs to, for
+    numbered and unnumbered items mixed, and for a number that is out of range or given twice.
+    """
+    items = vote.expected_behavior
+    if behavior_count == 0:
+        return vote.model_copy(update={"expected_behavior": []})
+    numbered = [it for it in items if it.item is not None]
+    if numbered and len(numbered) != len(items):
+        raise JudgeError("expected_behavior mixes numbered and unnumbered items")
+    if items and not numbered:
+        if len(items) != behavior_count:
+            raise JudgeError(
+                f"expected_behavior has {len(items)} unnumbered item(s) for {behavior_count} "
+                "expected behaviour(s), so they cannot be matched to the behaviours"
+            )
+        aligned = [
+            it.model_copy(update={"item": n}) for n, it in enumerate(items, start=1)
+        ]
+        return vote.model_copy(update={"expected_behavior": aligned})
+    by_number: dict[int, BehaviorVote] = {}
+    for it in numbered:
+        assert it.item is not None
+        if not 1 <= it.item <= behavior_count:
+            raise JudgeError(
+                f"expected_behavior item {it.item} is out of range 1-{behavior_count}"
+            )
+        if it.item in by_number:
+            raise JudgeError(f"expected_behavior item {it.item} is graded twice")
+        by_number[it.item] = it
+    aligned = [
+        by_number.get(n) or BehaviorVote(item=n, passed=False, evidence=OMITTED_EVIDENCE)
+        for n in range(1, behavior_count + 1)
+    ]
+    return vote.model_copy(update={"expected_behavior": aligned})
+
+
 def malformed_vote(reason: str, behavior_count: int, *, has_sop: bool = False) -> JudgeVote:
     """A failed vote standing in for a judge call whose output could not be parsed."""
     item = VoteItem(passed=False, evidence=MALFORMED_EVIDENCE)
     return JudgeVote(
-        expected_behavior=[item] * behavior_count,
+        expected_behavior=[
+            BehaviorVote(item=n, passed=False, evidence=MALFORMED_EVIDENCE)
+            for n in range(1, behavior_count + 1)
+        ],
         goal_achieved=item,
         sop_followed=item if has_sop else None,
         honesty=item,
@@ -439,12 +533,22 @@ def _clamp_score(value: float) -> float:
 
 
 def _vote_items(vote: JudgeVote, behavior_count: int) -> list[VoteItem]:
-    """The vote's items in checklist order (expected behaviours padded or trimmed to the
-    scenario's count, then honesty)."""
+    """The vote's items in checklist order: each expected behaviour (by its ``item`` number when
+    the vote numbers them, else by position; one the vote leaves out fails as omitted), then
+    honesty. :func:`judge` lines every vote up with :func:`align_behaviors` first, which also
+    refuses the votes this cannot place."""
     omitted = VoteItem(passed=False, evidence=OMITTED_EVIDENCE)
-    behaviors = list(vote.expected_behavior[:behavior_count])
-    behaviors.extend([omitted] * (behavior_count - len(behaviors)))
-    return [*behaviors, vote.honesty]
+    graded: list[VoteItem]
+    if any(it.item is not None for it in vote.expected_behavior):
+        by_number: dict[int, VoteItem] = {}
+        for it in vote.expected_behavior:
+            if it.item is not None:
+                by_number.setdefault(it.item, it)
+        graded = [by_number.get(n, omitted) for n in range(1, behavior_count + 1)]
+    else:
+        graded = list(vote.expected_behavior[:behavior_count])
+        graded.extend([omitted] * (behavior_count - len(graded)))
+    return [*graded, vote.honesty]
 
 
 def _majority(items: list[VoteItem], n: int) -> tuple[bool, str]:
@@ -716,7 +820,8 @@ async def judge(
     role = role_of(skill, "judge")
     system = judge_system_prompt(has_sop=has_sop, skill=skill)
     user = judge_user_prompt(scenario, plan_path, transcript, matches, skill=skill)
-    tools = [verdict_tool(has_sop=has_sop)]
+    behavior_count = len(scenario.behaviors)
+    tools = [verdict_tool(has_sop=has_sop, behavior_count=behavior_count)]
     judge_model = scenario.models.judge
     usage = Usage()
 
@@ -733,9 +838,9 @@ async def judge(
         )
         usage = usage + response.usage
         try:
-            return parse_vote(response)
+            return align_behaviors(parse_vote(response), behavior_count)
         except JudgeError as exc:
-            return malformed_vote(str(exc), len(scenario.behaviors), has_sop=has_sop)
+            return malformed_vote(str(exc), behavior_count, has_sop=has_sop)
 
     results = await asyncio.gather(*(one_vote() for _ in range(n_votes)))
     return build_verdict(

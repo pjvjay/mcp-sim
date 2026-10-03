@@ -215,6 +215,50 @@ def test_report_run_dir_lists_unjudged_transcripts(quick_path: FsPath, out_dir: 
     assert report.unjudged == [f"{DRY_RUN_PATH_ID}-guided-0"]
 
 
+def _stop_early(run_dir: FsPath) -> None:
+    """Make a finished repeat-3 run directory look like one that was cancelled (or whose judge
+    failed) part-way: only index 0 of each cell ran, the free run was never judged, and the
+    runner never got to write the report."""
+    for folder, suffix in (("transcripts", ".jsonl"), ("verdicts", ".json")):
+        for path in (run_dir / folder).glob(f"*{suffix}"):
+            if not path.stem.endswith("-0"):
+                path.unlink()
+    (run_dir / "verdicts" / f"{DRY_RUN_PATH_ID}-free-0.json").unlink()
+    (run_dir / "report.json").unlink()
+    (run_dir / "report.md").unlink()
+
+
+def test_report_and_judge_of_a_run_that_stopped_early_keep_the_recorded_repeat(
+    quick_path: FsPath, out_dir: FsPath, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from mcpsim.cli import main
+
+    run_dir = runner.run_scenario(quick_path, out_dir, dry_run=True, repeat=3)
+    assert json.loads((run_dir / "scenario.json").read_text())["repeat"] == 3, "--repeat recorded"
+    _stop_early(run_dir)
+
+    report = Report.load(runner.report_run_dir(run_dir)[0])
+    assert report.pass_k.model_dump() == {"k": 3, "all_passed": False}, "not pass^1"
+    assert report.unjudged == [f"{DRY_RUN_PATH_ID}-free-0"]
+    assert report.missing == [
+        f"{DRY_RUN_PATH_ID}-free-1",
+        f"{DRY_RUN_PATH_ID}-free-2",
+        f"{DRY_RUN_PATH_ID}-guided-1",
+        f"{DRY_RUN_PATH_ID}-guided-2",
+    ]
+    assert main(["report", str(run_dir)]) == 1, "an unjudged transcript is not a pass"
+    assert "pass^3 no" in capsys.readouterr().out
+
+    # Judged again, every recorded transcript has a verdict and all pass: still pass^3 no, and
+    # still exit 1, because four of the six asked-for runs never happened.
+    runner.judge_run_dir(run_dir)
+    report = Report.load(run_dir / "report.json")
+    assert (report.runs, report.passed, report.unjudged) == (2, 2, [])
+    assert report.pass_k.model_dump() == {"k": 3, "all_passed": False}
+    assert len(report.missing) == 4
+    assert main(["judge", str(run_dir)]) == 1
+
+
 def test_judge_and_report_refuse_a_directory_that_is_not_a_run(tmp_path: FsPath) -> None:
     with pytest.raises(FileNotFoundError, match="scenario.json"):
         runner.judge_run_dir(tmp_path)
@@ -318,7 +362,7 @@ def test_judge_run_dir_uses_the_llm_judge_for_real_transcripts(
     assert len(llm.calls) == 3 and all(c["model"] == scenario.models.judge for c in llm.calls)
     # Three judge calls of 10 input / 5 output tokens each, at the Opus rate.
     assert verdict.judge_usage == {"claude-opus-5-5": Usage(input_tokens=30, output_tokens=15)}
-    assert verdict.judge_cost_usd == pytest.approx((30 * 15 + 15 * 75) / 1_000_000)
+    assert verdict.judge_cost_usd == pytest.approx((30 * 4 + 15 * 20) / 1_000_000)
     report = Report.load(run_dir / "report.json")
     assert (report.runs, report.passed, report.judge_models) == (1, 1, [scenario.models.judge])
     assert report.judge_cost_usd == pytest.approx(verdict.judge_cost_usd)
@@ -818,3 +862,22 @@ def test_a_session_that_fails_to_open_becomes_an_error_run(
     report = Report.load(run_dir / "report.json")
     assert report.outcomes == {"error": 2}
     assert report.worst_failures[0].outcome == "error"
+
+
+def test_a_model_without_a_price_is_warned_about_before_a_live_run(
+    quick_path: FsPath, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Its calls would cost $0 in the report and escape budgets.max_cost_usd: say so."""
+    scenario, resolved, skill = runner.prepare_scenario(
+        quick_path, model_overrides={"agent": "claude-imaginary-9", "user": "ollama:llama3.2:3b"}
+    )
+    runner._log_resolution(scenario, resolved, skill)
+    err = capsys.readouterr().err
+    assert "warning: no price is known for claude-imaginary-9" in err
+    assert "budgets.max_cost_usd does not limit them" in err
+    assert "llama3.2" not in err.split("warning:")[1], "a local model is free by design"
+    runner._log_resolution(scenario, resolved, skill, dry_run=True)
+    assert "warning" not in capsys.readouterr().err, "a dry run calls no model"
+    plain, resolved, skill = runner.prepare_scenario(quick_path)
+    runner._log_resolution(plain, resolved, skill)
+    assert "warning" not in capsys.readouterr().err, "every default model is priced"

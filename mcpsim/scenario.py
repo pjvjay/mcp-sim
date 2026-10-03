@@ -56,6 +56,10 @@ SKILL_ENV_PREFIX = "env:"
 # The validation-context key :func:`load_scenario` sets so a relative ``agent.skill`` resolves
 # against the scenario file's directory.
 BASE_DIR_CONTEXT = "base_dir"
+# Set to False in the validation context to validate a scenario without reading any file: an
+# ``agent.skill`` without ``skill_text`` then stays unresolved (a run's ``scenario.json`` read
+# for display, where the path is data, not something to open).
+READ_SKILL_CONTEXT = "read_skill"
 
 
 class ScenarioError(ValueError):
@@ -688,6 +692,8 @@ class AgentSpec(_Strict):
     it is read and ``skill_path`` / ``skill_name`` / ``skill_text`` are filled, so the
     ``scenario.json`` of a run records the exact procedure the agent ran on (and a re-judge
     never re-reads the file). ``skill_text`` may also be given inline instead of ``skill``.
+    With ``read_skill: False`` in the validation context (:data:`READ_SKILL_CONTEXT`) nothing
+    is read and a ``skill`` without ``skill_text`` stays unresolved.
     ``notes`` is extra system text for the agent, such as the limits of this environment.
     """
 
@@ -705,8 +711,12 @@ class AgentSpec(_Strict):
             raise ValueError("agent.notes must not be blank")
         if self.skill_text is not None and not self.skill_text.strip():
             raise ValueError("agent.skill_text must not be blank")
-        if self.skill is not None and self.skill_text is None:
-            context = info.context if isinstance(info.context, dict) else {}
+        context = info.context if isinstance(info.context, dict) else {}
+        if (
+            self.skill is not None
+            and self.skill_text is None
+            and context.get(READ_SKILL_CONTEXT, True) is not False
+        ):
             path = resolve_skill_path(self.skill, context.get(BASE_DIR_CONTEXT))
             name, body = read_skill(path)
             self.skill_path = str(path)
@@ -877,6 +887,19 @@ def parse_scenario(
         return Scenario.model_validate(data, context=context)
     except ValidationError as exc:
         raise ScenarioError(_format_validation_error(FsPath(source), exc)) from exc
+
+
+def read_scenario_mapping(path: str | FsPath) -> dict[str, Any] | None:
+    """A scenario file's top-level mapping as plain YAML / JSON, without validating it, or
+    ``None`` when it cannot be read or parsed. For showing and selecting a file that does not
+    load: its ``name``, ``title`` and ``category`` say where it belongs."""
+    fs_path = FsPath(path)
+    try:
+        text = fs_path.read_text(encoding="utf-8")
+        data = json.loads(text) if fs_path.suffix.lower() == ".json" else yaml.safe_load(text)
+    except (OSError, UnicodeDecodeError, yaml.YAMLError, json.JSONDecodeError):
+        return None
+    return data if isinstance(data, dict) else None
 
 
 def load_scenario(path: str | FsPath) -> Scenario:

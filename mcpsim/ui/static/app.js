@@ -49,6 +49,26 @@
   }
   function clear(el) { while (el.firstChild) el.removeChild(el.firstChild); return el; }
 
+  // Re-rendering replaces elements. Controls that can hold focus carry a stable key
+  // (data-fk, with an optional data-fk-alt fallback, e.g. a row's Run button falls back to the
+  // row once it is disabled), so keyboard and screen-reader focus stays on the same control
+  // across a re-render instead of dropping to <body> (WCAG 2.4.3).
+  function focusKeys(el) {
+    const keyed = el && el.closest ? el.closest('[data-fk]') : null;
+    return keyed ? [keyed.getAttribute('data-fk'), keyed.getAttribute('data-fk-alt')] : null;
+  }
+  function keepFocus(render) {
+    const active = document.activeElement;
+    const keys = active && active !== document.body ? focusKeys(active) : null;
+    render();
+    if (!keys || (active.isConnected && document.activeElement === active)) return;
+    for (const key of keys) {
+      if (!key) continue;
+      const next = document.querySelector(`[data-fk="${CSS.escape(key)}"]`);
+      if (next && !next.disabled && !next.closest('[hidden]')) { next.focus({ preventScroll: true }); return; }
+    }
+  }
+
   const SVG_NS = 'http://www.w3.org/2000/svg';
   const ICONS = {
     play: 'M6 4l10 6-10 6z',
@@ -346,7 +366,8 @@
         STATUS[k].glyph, String(counts[k]))));
   }
 
-  function renderList() {
+  function renderList() { keepFocus(renderListNow); }
+  function renderListNow() {
     const host = $('#scenario-list');
     const runBtn = $('#run-filtered');
     if (!state.list) return;
@@ -383,6 +404,7 @@
       const countText = Object.entries(counts).filter(([, n]) => n).map(([k, n]) => `${n} ${STATUS[k].label.toLowerCase()}`).join(', ');
       const head = h('button', {
         class: 'group-head', type: 'button', 'aria-expanded': String(!collapsed), 'aria-controls': id,
+        'data-fk': `group:${category}`,
         'aria-label': `${category}: ${items.length} scenario${items.length === 1 ? '' : 's'}${countText ? `, ${countText}` : ''}`,
         onclick: () => {
           state.collapsed[category] = !state.collapsed[category];
@@ -401,11 +423,15 @@
     const st = STATUS[s.status] || STATUS.never;
     const selected = s.name === state.sel.name;
     const rate = s.error ? 'invalid' : (s.last_run ? `${s.last_run.passed}/${s.last_run.runs}` : '');
-    const said = [s.error ? 'invalid file' : st.label.toLowerCase()];
+    // A newer run that was cancelled or crashed never stands in for the result; say it exists.
+    const stopped = !s.error && s.latest_incomplete && s.status !== 'running';
+    const label = s.status === 'never' && stopped ? 'No finished run' : st.label;
+    const said = [s.error ? 'invalid file' : label.toLowerCase()];
     if (!s.error && s.last_run && s.last_run.runs) said.push(`${s.last_run.passed} of ${s.last_run.runs} runs passed`);
     if (!s.error && s.pass_k && s.pass_k.k) said.push(`pass^${s.pass_k.k} ${s.pass_k.all_passed ? 'held' : 'not held'}`);
+    if (stopped) said.push('a later run did not finish');
     const main = h('button', {
-      class: 'row-main', type: 'button', 'data-name': s.name,
+      class: 'row-main', type: 'button', 'data-name': s.name, 'data-fk': `row:${s.name}`,
       'aria-current': selected ? 'true' : null,
       'aria-label': `${s.title} (${s.name}): ${said.join(', ')}`,
       onclick: () => { go(s.name).then(focusDetailIfNarrow); },
@@ -413,10 +439,11 @@
     h('span', { class: `dot ${s.error ? 'd-error' : st.dot}`, 'aria-hidden': 'true' }),
     h('span', { class: 'row-title', text: s.title }),
     h('span', { class: 'row-rate', text: rate }),
-    h('span', { class: 'row-sub' }, h('span', { class: 'sr-only', text: `${s.error ? 'Invalid file' : st.label}. ` }), s.name,
-      s.pass_k ? ` · ${passK(s.pass_k)}` : ''));
+    h('span', { class: 'row-sub' }, h('span', { class: 'sr-only', text: `${s.error ? 'Invalid file' : label}. ` }), s.name,
+      s.pass_k ? ` · ${passK(s.pass_k)}` : '', stopped ? ' · later run incomplete' : ''));
     const run = h('button', {
       class: 'row-run', type: 'button', 'aria-label': `Run ${s.title}`, title: `Run ${s.title}`,
+      'data-fk': `run:${s.name}`, 'data-fk-alt': `row:${s.name}`,
       disabled: Boolean(s.error) || s.status === 'running',
       onclick: () => startRun([s.name], s.title),
     }, icon('play', 13));
@@ -470,7 +497,8 @@
     return (state.run && state.run.scenario) || (state.scenario && state.scenario.scenario) || {};
   }
 
-  function renderDetail() {
+  function renderDetail() { keepFocus(renderDetailNow); }
+  function renderDetailNow() {
     const data = state.scenario;
     const s = data.scenario;
     const d = clear($('#detail'));
@@ -478,6 +506,7 @@
     const rs = data.run_settings || {};
     const runBtn = h('button', {
       class: 'btn btn-primary', type: 'button', disabled: Boolean(s.error) || data.status === 'running',
+      'data-fk': 'detail-run',
       onclick: () => startRun([s.name], s.title),
     }, icon('play', 12), hasRuns ? 'Re-run' : 'Run');
     d.append(
@@ -519,8 +548,11 @@
   }
 
   function renderRunParts(runLoading = false, transcriptLoading = false) {
+    keepFocus(() => renderRunPartsNow(runLoading, transcriptLoading));
+  }
+  function renderRunPartsNow(runLoading, transcriptLoading) {
     if (!state.scenario || !$('#d-history')) return;
-    renderHistory();
+    renderHistoryNow();
     renderRunSummary(runLoading);
     renderUser();
     renderExpected();
@@ -531,7 +563,8 @@
     renderConversation(transcriptLoading || runLoading);
   }
 
-  function renderHistory() {
+  function renderHistory() { keepFocus(renderHistoryNow); }
+  function renderHistoryNow() {
     const host = clear($('#d-history'));
     const runs = state.runs || [];
     $('#hist-count').textContent = runs.length ? `${runs.length} run director${runs.length === 1 ? 'y' : 'ies'}` : '';
@@ -542,11 +575,11 @@
     const shown = state.showAllRuns ? runs : runs.slice(0, 12);
     const strip = h('div', { class: 'history', role: 'group', 'aria-label': 'Runs, newest first' },
       shown.map((r) => h('button', {
-        class: 'hist', type: 'button', 'aria-pressed': String(r.run_id === state.sel.run),
+        class: 'hist', type: 'button', 'aria-pressed': String(r.run_id === state.sel.run), 'data-fk': `hist:${r.run_id}`,
         onclick: () => { setHash({ name: state.sel.name, run: r.run_id }, true); selectRun(r.run_id, null, state.seq); },
       },
       h('span', { class: 'when', text: when(r.started_at) || r.run_id }),
-      h('span', { class: 'line' }, statusPill(r.status), r.status === 'running' ? 'in progress' : r.runs ? `${r.passed}/${r.runs}` : 'no verdicts'),
+      h('span', { class: 'line' }, statusPill(r.status), r.status === 'running' ? 'in progress' : r.runs ? `${r.passed}/${r.runs}${r.status === 'incomplete' ? ' so far' : ''}` : 'no verdicts'),
       h('span', { class: 'line' }, passK(r.pass_k), ' · ', money(r.cost_usd), ' · ', dur(r.duration_s)))));
     host.append(strip);
     if (runs.length > shown.length) {
@@ -610,6 +643,7 @@
         v.agent_skill || v.agent_skill_text ? [h('dt', { text: 'Agent SOP' }), h('dd', null,
           h('span', { class: 'mono', text: sop }),
           v.agent_skill && v.agent_skill !== sop ? h('span', { class: 'muted mono', text: ` (${v.agent_skill})` }) : null,
+          v.agent_skill && !v.agent_skill_text ? h('span', { class: 'muted small', text: ' – procedure text not recorded in this run' }) : null,
           v.agent_skill_text ? h('details', null, h('summary', { class: 'small', text: 'Procedure the agent ran on' }),
             v.agent_skill_path ? h('p', { class: 'muted small mono', text: v.agent_skill_path }) : null,
             h('pre', { text: v.agent_skill_text })) : null)] : null,
@@ -811,7 +845,7 @@
     host.append(h('div', { class: 'sims', role: 'group', 'aria-label': 'Transcripts in this run' }, rows.map((t) => {
       const status = t.judged ? (t.passed ? 'passed' : 'failed') : 'never';
       return h('button', {
-        class: 'sim', type: 'button', 'aria-pressed': String(t.stem === state.sel.stem), disabled: !t.file,
+        class: 'sim', type: 'button', 'aria-pressed': String(t.stem === state.sel.stem), disabled: !t.file, 'data-fk': `sim:${t.stem}`,
         onclick: () => selectTranscript(t.stem, state.seq),
       }, h('span', { class: `dot ${STATUS[status].dot}`, 'aria-hidden': 'true' }),
       h('span', { class: 'sr-only', text: `${t.judged ? STATUS[status].label : 'Not judged'}: ` }),
@@ -1081,10 +1115,43 @@
   }
 
   let jobsHidden = false;
+  let jobsShape = '';
+  function jobsShown() {
+    return [...state.jobs.values()].sort((a, b) => String(b.created_at || '').localeCompare(String(a.created_at || ''))).slice(0, 6);
+  }
+  function jobLogText(j) { return (j.log_tail || []).join('\n') || 'waiting for output…'; }
   function renderJobs() {
+    // Polling brings a longer log every 1.5 s; when nothing else changed, only the logs are
+    // updated in place, so no control is replaced under the keyboard focus.
+    const jobs = jobsShown();
+    const shape = JSON.stringify([jobsHidden, jobs.map((j) => [j.job_id, j.status, j.error || null, j.created_at || null,
+      j.options || null, (j.scenarios || []).map((t) => [t.name, t.status, t.run_id || null])])]);
+    if (shape === jobsShape && $('#jobs-body').childElementCount === jobs.length) {
+      for (const j of jobs) {
+        const log = document.querySelector(`[data-fk="${CSS.escape(`job:${j.job_id}:log`)}"]`);
+        const text = jobLogText(j);
+        if (!log || log.textContent === text) continue;
+        const atEnd = log.scrollTop + log.clientHeight >= log.scrollHeight - 4;
+        log.textContent = text;
+        if (atEnd) log.scrollTop = log.scrollHeight;
+      }
+      return;
+    }
+    jobsShape = shape;
+    keepFocus(() => renderJobsNow(jobs));
+  }
+  function dismissJob(jobId) {
+    state.jobs.delete(jobId);
+    renderJobs();
+    // The dismissed job's controls are gone: focus the next job's action, else the search.
+    if (document.activeElement === document.body || !document.activeElement) {
+      const next = [...document.querySelectorAll('#jobs-body [data-fk$=":action"]')].find((b) => !b.closest('[hidden]'));
+      (next || $('#search')).focus();
+    }
+  }
+  function renderJobsNow(jobs) {
     const section = $('#jobs');
     const body = clear($('#jobs-body'));
-    const jobs = [...state.jobs.values()].sort((a, b) => String(b.created_at || '').localeCompare(String(a.created_at || ''))).slice(0, 6);
     section.hidden = jobs.length === 0;
     const active = jobs.filter((j) => j.status === 'queued' || j.status === 'running').length;
     $('#jobs-count').textContent = active ? `${active} in progress` : 'all finished';
@@ -1095,9 +1162,11 @@
       const running = j.status === 'queued' || j.status === 'running';
       const opts = j.options || {};
       const optText = [opts.dry_run ? 'dry run' : null, opts.repeat ? `repeat ${opts.repeat}` : null,
-        (opts.modes || []).length === 1 ? opts.modes[0] : null,
+        (opts.modes || []).length ? opts.modes.join('+') : null,
         Object.keys(opts.models || {}).length ? Object.entries(opts.models).map(([k, v]) => `${k}=${v}`).join(', ') : null].filter(Boolean).join(' · ');
-      const log = h('pre', { class: 'job-log', 'aria-label': 'Log tail', tabindex: '0', text: (j.log_tail || []).join('\n') || 'waiting for output…' });
+      const log = h('pre', { class: 'job-log', 'aria-label': 'Log tail', tabindex: '0', 'data-fk': `job:${j.job_id}:log`, text: jobLogText(j) });
+      // Stop and Dismiss share a key: when the job ends, focus moves from one to the other.
+      const action = `job:${j.job_id}:action`;
       body.append(h('div', { class: 'job' },
         h('div', { class: 'job-head' },
           statusPill(j.status),
@@ -1105,10 +1174,10 @@
           h('span', { class: 'muted small', text: j.created_at ? when(j.created_at) : '' }),
           optText ? h('span', { class: 'muted small', text: optText }) : null,
           h('span', { class: 'grow' }),
-          running ? h('button', { class: 'btn btn-sm btn-danger', type: 'button', onclick: () => cancelJob(j.job_id) }, 'Stop') : null,
-          !running ? h('button', { class: 'btn btn-sm btn-quiet', type: 'button', onclick: () => { state.jobs.delete(j.job_id); renderJobs(); } }, 'Dismiss') : null),
+          running ? h('button', { class: 'btn btn-sm btn-danger', type: 'button', 'data-fk': action, onclick: () => cancelJob(j.job_id) }, 'Stop') : null,
+          !running ? h('button', { class: 'btn btn-sm btn-quiet', type: 'button', 'data-fk': action, onclick: () => dismissJob(j.job_id) }, 'Dismiss') : null),
         h('div', { class: 'job-tasks' }, (j.scenarios || []).map((t) => h('button', {
-          class: 'job-task', type: 'button', onclick: () => go(t.name, t.run_id || null),
+          class: 'job-task', type: 'button', 'data-fk': `job:${j.job_id}:task:${t.name}`, 'data-fk-alt': action, onclick: () => go(t.name, t.run_id || null),
         }, statusPill(t.status), t.name))),
         j.error ? h('p', { class: 'error-text', text: j.error }) : null,
         log));

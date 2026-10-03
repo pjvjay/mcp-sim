@@ -615,6 +615,37 @@ def one_line(message: str) -> str:
     return "; ".join(line.strip() for line in message.strip().splitlines() if line.strip())
 
 
+def _raw_text(raw: Mapping[str, Any] | None, key: str) -> str | None:
+    value = raw.get(key) if raw is not None else None
+    return value.strip() if isinstance(value, str) and value.strip() else None
+
+
+def invalid_entry(file: FsPath, source: str, error: str) -> ScenarioEntry:
+    """The entry of a file that does not load. Its name, title and category come from the raw
+    file when it states them (the name falls back to the file stem; a parsed file without a
+    category is in the default one), so ``--name`` and ``--category`` still select it and the
+    suite reports it. ``category`` is ``""`` when the file cannot be parsed at all: unknown, so
+    every category filter keeps it."""
+    from mcpsim.scenario import DEFAULT_CATEGORY, default_title, read_scenario_mapping
+
+    raw = read_scenario_mapping(file)
+    name = _raw_text(raw, "name") or file.stem
+    if raw is None:
+        category = ""
+    elif "category" not in raw:
+        category = DEFAULT_CATEGORY
+    else:
+        category = _raw_text(raw, "category") or ""  # "" when it is not a usable string
+    return ScenarioEntry(
+        file=file,
+        source=source,
+        name=name,
+        title=_raw_text(raw, "title") or default_title(name),
+        category=category,
+        error=error,
+    )
+
+
 def load_entries(files: Sequence[tuple[FsPath, str]]) -> list[ScenarioEntry]:
     """Load every ``(file, source)``; a file that does not load is an entry with ``error``.
     A scenario name defined twice is an error on the second file."""
@@ -628,10 +659,7 @@ def load_entries(files: Sequence[tuple[FsPath, str]]) -> list[ScenarioEntry]:
         except (ScenarioError, ValueError, OSError) as exc:
             first = str(exc).strip().splitlines()
             entries.append(
-                ScenarioEntry(
-                    file=file, source=source, name=file.stem,
-                    error="\n".join(first) or type(exc).__name__,
-                )
+                invalid_entry(file, source, "\n".join(first) or type(exc).__name__)
             )
             continue
         entry = ScenarioEntry(
@@ -660,14 +688,19 @@ def select_entries(
     categories: Sequence[str] | None = None,
 ) -> list[ScenarioEntry]:
     """The entries whose name matches any ``names`` glob and whose category matches any
-    ``categories`` glob (no globs: everything). An entry that failed to load has no category,
-    so a category filter leaves it out."""
+    ``categories`` glob (no globs: everything). An entry that failed to load is matched on the
+    name and category its file states (:func:`invalid_entry`), so a broken scenario inside the
+    selection is reported, not silently dropped; one whose category is unknown (the file does
+    not parse) is kept by every category filter."""
     selected: list[ScenarioEntry] = []
     for entry in entries:
         if names and not any(fnmatchcase(entry.name, g) for g in names):
             continue
-        if categories and (
-            entry.error is not None or not any(fnmatchcase(entry.category, g) for g in categories)
+        unknown_category = entry.error is not None and not entry.category
+        if (
+            categories
+            and not unknown_category
+            and not any(fnmatchcase(entry.category, g) for g in categories)
         ):
             continue
         selected.append(entry)
@@ -829,10 +862,12 @@ class Skill:
         model_overrides: Mapping[str, str] | None = None,
         run_overrides: Mapping[str, Any] | None = None,
         allow_same_judge: bool = False,
+        check_sampling: bool = True,
     ) -> tuple[Scenario, Resolved]:
         """The scenario with every model and run setting resolved (what ``scenario.json``
         records), plus the resolution with its sources. Raises :class:`SkillError` when a role
-        sets a temperature its resolved model rejects."""
+        sets a temperature its resolved model rejects, unless ``check_sampling`` is false (a
+        dry run, which calls no model)."""
         resolved = self.resolve(
             scenario, model_overrides=model_overrides, run_overrides=run_overrides
         )
@@ -850,34 +885,49 @@ class Skill:
                 "concurrency": resolved.run["concurrency"].value,
             }
         )
-        self.check_sampling(updated)
+        if check_sampling:
+            self.check_sampling(updated)
         return updated, resolved
 
     def check_sampling(self, scenario: Scenario) -> None:
         """A role whose frontmatter sets ``temperature`` must resolve to a model that accepts
-        it (Claude Opus 5.5, Sonnet 5.5, Fable and Opus 4.7+ answer 400)."""
-        local = parse_model_spec(scenario.models.planner)[0] == OLLAMA
+        it (Claude Opus 5.5, Sonnet 5.5, Fable and Opus 4.7+ answer 400); raises
+        :class:`SkillError` with the first :meth:`sampling_errors` entry."""
+        errors = self.sampling_errors(scenario)
+        if errors:
+            raise SkillError(errors[0])
+
+    def sampling_errors(self, scenario: Scenario) -> list[str]:
+        """Every role that sets ``temperature`` while the model it resolves to for this
+        (resolved) scenario rejects it."""
+        observers = [
+            scenario.models.model_for_observer(o) for o in scenario.observers if o.kind == "llm"
+        ]
+        return self._sampling_errors(scenario.models, observers, f"scenario {scenario.name!r}")
+
+    def _sampling_errors(self, models: Models, observers: list[str], label: str) -> list[str]:
+        local = parse_model_spec(models.planner)[0] == OLLAMA
         calls: dict[str, list[str]] = {
-            "planner": [] if local else [scenario.models.planner],
-            "planner-local": [scenario.models.planner] if local else [],
-            "agent": [scenario.models.agent],
-            "user": [scenario.models.user],
-            "observer": [
-                scenario.models.model_for_observer(o) for o in scenario.observers if o.kind == "llm"
-            ],
-            "judge": [scenario.models.judge],
+            "planner": [] if local else [models.planner],
+            "planner-local": [models.planner] if local else [],
+            "agent": [models.agent],
+            "user": [models.user],
+            "observer": observers,
+            "judge": [models.judge],
         }
+        errors: list[str] = []
         for role_name, role in self.roles.items():
             if role.temperature is None:
                 continue
-            for spec in calls.get(role_name, []):
+            for spec in dict.fromkeys(calls.get(role_name, [])):
                 provider, model = parse_model_spec(spec)
                 if provider == ANTHROPIC and rejects_sampling(model):
-                    raise SkillError(
+                    errors.append(
                         f"{role.path}: temperature {role.temperature} is set, but the {role_name} "
-                        f"model for scenario {scenario.name!r} is {model}, which rejects it "
+                        f"model for {label} is {model}, which rejects it "
                         "(the API answers 400); remove temperature or choose another model"
                     )
+        return errors
 
     # -- scenarios ----------------------------------------------------------------------------
 
@@ -907,16 +957,17 @@ class Skill:
         resolution."""
         name = scenario.name if scenario is not None else ""
         category = scenario.category if scenario is not None else ""
-        models = (
-            self.resolve(scenario).models
-            if scenario is not None
-            else self.resolve_models(name, category)
-        )
-        run = (
-            self.resolve(scenario).run
-            if scenario is not None
-            else self.resolve_run(name, category)
-        )
+        if scenario is not None:
+            applied, resolution = self.apply(scenario, check_sampling=False)
+            models, run = resolution.models, resolution.run
+            problems = self.sampling_errors(applied)
+        else:
+            models = self.resolve_models(name, category)
+            run = self.resolve_run(name, category)
+            plain = Models.model_validate({role: s.value for role, s in models.items()})
+            problems = self._sampling_errors(
+                plain, [plain.observer], "any scenario that does not choose its own"
+            )
         roles: dict[str, Any] = {}
         for role_name, role in self.roles.items():
             spec = ROLE_SPECS[role_name]
@@ -936,9 +987,22 @@ class Skill:
                 },
                 **role.extra,
             }
+            shadowed: list[str] = []
             if spec.model_role is not None:
-                entry["model"] = models[spec.model_role].value
-                entry["model_source"] = models[spec.model_role].source
+                setting = models[spec.model_role]
+                entry["model"] = setting.value
+                entry["model_source"] = setting.source
+                if setting.source != f"roles/{role.path.name}":
+                    shadowed.append(
+                        f"its model {role.spec} is not used: {setting.source} sets "
+                        f"{spec.model_role}"
+                    )
+            votes = role.extra.get("votes")
+            if votes is not None and run["judge_votes"].source != f"roles/{role.path.name}":
+                shadowed.append(
+                    f"its votes {votes} is not used: {run['judge_votes'].source} sets judge_votes"
+                )
+            entry["shadowed"] = shadowed
             roles[role_name] = entry
         sources = self.sources(base)
         return {
@@ -949,6 +1013,8 @@ class Skill:
             "scenarios": [s.to_json() for s in sources],
             "runs_dir": str(self.runs_dir(base)),
             "overrides": [o.model_dump(mode="json") for o in self.config.overrides],
+            # What a run would refuse with this resolution (a temperature the model rejects).
+            "problems": problems,
             **({"scenario": name} if scenario is not None else {}),
         }
 

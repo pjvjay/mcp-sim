@@ -59,6 +59,7 @@ from mcpsim.llm import (
     is_local_model,
     make_llm,
     parse_model_spec,
+    unpriced_models,
 )
 from mcpsim.mcpclient import Catalog, Session, connect
 from mcpsim.observers import ObserverRunner
@@ -532,9 +533,9 @@ def _write_report(
     *,
     repeat: int | None = None,
 ) -> tuple[FsPath, FsPath]:
-    """``report.json`` and ``report.md``; ``repeat`` is pass^k's ``k`` when the caller knows how
-    many runs per path × mode were asked for (a re-judge or re-report infers it from the
-    transcripts)."""
+    """``report.json`` and ``report.md``; ``repeat`` is pass^k's ``k``: how many runs per
+    path × mode were asked for (the run's resolved repeat, which ``scenario.json`` records for a
+    re-judge or re-report). Without it ``k`` is inferred from the runs on disk."""
     report = aggregate(
         list(verdicts),
         list(transcripts),
@@ -643,9 +644,12 @@ def prepare_scenario(
     allow_same_judge: bool = False,
     repeat: int | None = None,
     modes: Sequence[Mode] | None = None,
+    check_sampling: bool = True,
 ) -> tuple[Scenario, Resolved, Skill]:
     """Load a scenario and resolve it against the skill (:meth:`mcpsim.skill.Skill.apply`):
-    ``(the scenario as it will run, the resolution with its sources, the skill)``."""
+    ``(the scenario as it will run, the resolution with its sources, the skill)``.
+    ``check_sampling=False`` (a dry run, which calls no model) skips the refusal of a
+    temperature the resolved model rejects."""
     loaded = load_skill(skill)
     if repeat is not None and repeat < 1:
         raise ValueError(f"repeat must be >= 1, got {repeat}")
@@ -661,11 +665,14 @@ def prepare_scenario(
         model_overrides=model_overrides,
         run_overrides=run_overrides,
         allow_same_judge=allow_same_judge,
+        check_sampling=check_sampling,
     )
     return scenario, resolved, loaded
 
 
-def _log_resolution(scenario: Scenario, resolved: Resolved, skill: Skill) -> None:
+def _log_resolution(
+    scenario: Scenario, resolved: Resolved, skill: Skill, *, dry_run: bool = False
+) -> None:
     models = ", ".join(f"{role}={s.value}" for role, s in resolved.models.items())
     run = resolved.run
     _log(
@@ -673,6 +680,17 @@ def _log_resolution(scenario: Scenario, resolved: Resolved, skill: Skill) -> Non
         f"modes {'+'.join(run['modes'].value)}, judge_votes {run['judge_votes'].value}, "
         f"concurrency {run['concurrency'].value}"
     )
+    if dry_run:
+        return
+    m = scenario.models
+    specs = [m.planner, m.agent, m.user, m.judge]
+    specs += [m.model_for_observer(o) for o in llm_observers(scenario)]
+    unpriced = unpriced_models(specs)
+    if unpriced:
+        _log(
+            f"warning: no price is known for {', '.join(unpriced)}: the report counts its calls "
+            "as $0 and budgets.max_cost_usd does not limit them (mcpsim.llm.RATE_TABLE)"
+        )
 
 
 def plan_scenario(
@@ -690,8 +708,9 @@ def plan_scenario(
         skill=skill,
         model_overrides=model_overrides,
         allow_same_judge=allow_same_judge,
+        check_sampling=not dry_run,
     )
-    _log_resolution(scenario, resolved, loaded)
+    _log_resolution(scenario, resolved, loaded, dry_run=dry_run)
     run_setup(scenario)
 
     async def body() -> tuple[ExecutionPlan, ScoutResult | None]:
@@ -734,10 +753,11 @@ def run_scenario(
         allow_same_judge=allow_same_judge,
         repeat=repeat,
         modes=[mode] if mode is not None else modes,
+        check_sampling=not dry_run,
     )
     if plan_path is not None and not FsPath(plan_path).is_file():
         raise FileNotFoundError(f"plan file not found: {plan_path}")
-    _log_resolution(scenario, resolved, loaded)
+    _log_resolution(scenario, resolved, loaded, dry_run=dry_run)
     run_setup(scenario)
     run_dir = new_run_dir(out_dir, scenario.name)
     _write_scenario(scenario, run_dir)
@@ -811,19 +831,22 @@ def judge_run_dir(
         v.save(folder / VERDICTS_DIR / f"{t.stem}.json")
         for t, v in zip(transcripts, verdicts, strict=True)
     ]
-    _write_report(folder, scenario, verdicts, transcripts)
+    # scenario.json records the repeat the run resolved (--repeat included): pass^k's k.
+    _write_report(folder, scenario, verdicts, transcripts, repeat=scenario.repeat)
     return written
 
 
 def report_run_dir(
     run_dir: str | os.PathLike[str],
 ) -> tuple[FsPath, FsPath]:
-    """Rebuild ``report.json`` and ``report.md`` from ``verdicts/`` and ``transcripts/``."""
+    """Rebuild ``report.json`` and ``report.md`` from ``verdicts/`` and ``transcripts/``.
+    pass^k's ``k`` is the repeat ``scenario.json`` records (what the run asked for, ``--repeat``
+    included), so a run that stopped early reports its missing repeats instead of a smaller k."""
     folder = FsPath(run_dir)
     scenario = _load_scenario_json(folder)
     transcripts = _read_transcripts(folder)
     verdicts = _read_verdicts(folder)
-    return _write_report(folder, scenario, verdicts, transcripts)
+    return _write_report(folder, scenario, verdicts, transcripts, repeat=scenario.repeat)
 
 
 def scenario_files(scenario_dir: str | os.PathLike[str]) -> list[FsPath]:

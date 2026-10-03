@@ -11,23 +11,23 @@ for display: its name, title, category and persona next to the error.
 
 from __future__ import annotations
 
-import json
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
 from pathlib import Path as FsPath
 from typing import Any
 
-import yaml
 from pydantic import ValidationError
 
 from mcpsim.scenario import (
     DEFAULT_CATEGORY,
+    READ_SKILL_CONTEXT,
     Context,
     Scenario,
     ScenarioError,
     default_title,
     default_user_instructions,
     load_scenario,
+    read_scenario_mapping,
 )
 
 
@@ -104,12 +104,7 @@ def _text(value: Any) -> str:
 
 def read_raw(path: FsPath) -> dict[str, Any] | None:
     """The file's top-level mapping, or ``None`` when it cannot be read or parsed."""
-    try:
-        text = path.read_text(encoding="utf-8")
-        data = json.loads(text) if path.suffix.lower() == ".json" else yaml.safe_load(text)
-    except (OSError, UnicodeDecodeError, yaml.YAMLError, json.JSONDecodeError):
-        return None
-    return data if isinstance(data, dict) else None
+    return read_scenario_mapping(path)
 
 
 def view_from_scenario(
@@ -208,9 +203,12 @@ def load_view(
 
 def snapshot_view(data: Mapping[str, Any], *, fallback_name: str) -> ScenarioView:
     """A run's ``scenario.json`` (the scenario as it ran: models and SOP resolved), validated
-    the way the runner reads it back for ``mcpsim judge``."""
+    the way the runner reads it back for ``mcpsim judge``, except that no file is read: the
+    runner records the SOP's text in ``agent.skill_text``, and a snapshot without it (edited,
+    or copied from elsewhere) shows ``agent.skill`` as a name only, never the file it points
+    at, so the run directory cannot make the server read and serve another file."""
     try:
-        scenario = Scenario.model_validate(dict(data))
+        scenario = Scenario.model_validate(dict(data), context={READ_SKILL_CONTEXT: False})
     except (ValidationError, ValueError) as exc:
         return view_from_invalid(
             data, file="scenario.json", error=str(exc), fallback_name=fallback_name

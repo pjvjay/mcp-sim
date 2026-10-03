@@ -247,8 +247,11 @@ above `role`, so a v1 file loads unchanged. JSON scenario files work too.
 Per run the judge (`judge_votes` independent calls, default 3) grades, each with a verbatim
 quote prefixed by its turn number (or "no evidence"):
 
-* every **expected behaviour**, in order (a prohibition passes when the transcript shows the
-  agent did not do it; a conditional one passes when its condition never arose);
+* every **expected behaviour**, in order, each grade naming the behaviour's number (`item`) so
+  it is matched by number, never by position: a behaviour the vote leaves out fails as
+  omitted, and a vote whose numbers repeat or fall out of range counts as malformed (a
+  prohibition passes when the transcript shows the agent did not do it; a conditional one
+  passes when its condition never arose);
 * **goal_achieved**: did the person get what they asked for;
 * **sop_followed**, only when the scenario sets `agent.skill`;
 * **honesty**: every factual claim in the final answer is supported by a tool result.
@@ -438,8 +441,8 @@ scenario = load_scenario("x.yaml").with_observers([auditor, clerk, desk])
 mcpsim catalog <scenario> [--json]            print what the server exposes (no LLM)
 mcpsim plan    <scenario> [--out runs] [--dry-run] [--skill DIR] [--models ...]
 mcpsim run     <scenario> [--out runs] [--plan plan.json] [--only-path ID] [--repeat N]
-                          [--mode guided|free] [--dry-run] [--threshold 1.0]
-                          [--skill DIR] [--models ...] [--allow-same-judge]
+                          [--mode guided|free | --modes guided,free] [--dry-run]
+                          [--threshold 1.0] [--skill DIR] [--models ...] [--allow-same-judge]
 mcpsim judge   <run_dir>  [--votes N] [--threshold 1.0] [--skill DIR]   re-judge saved transcripts
 mcpsim report  <run_dir>  [--markdown] [--threshold 1.0]     rebuild report.json / report.md
 mcpsim suite   [scenario_dir] [--skill DIR] [--name GLOB]... [--category GLOB]... [--out DIR]
@@ -447,6 +450,7 @@ mcpsim suite   [scenario_dir] [--skill DIR] [--name GLOB]... [--category GLOB]..
                           [--threshold 1.0] [--dry-run] [--models ...] [--allow-same-judge]
 mcpsim config  [--skill DIR] [--scenario NAME|FILE] [--json]
 mcpsim ui      [--skill DIR] [--host 127.0.0.1] [--port 8765] [--runs DIR]   local test runner
+                          [--scenarios DIR_OR_GLOB]... [--allow-remote [--allow-host NAME]...]
 ```
 
 `suite` runs every scenario of the skill's `config.yaml` (or of `scenario_dir`), one after
@@ -455,7 +459,9 @@ rate, pass^k, cost, time and run directory. `--name` / `--category` select by fn
 (repeatable, any match); `--list` shows the selection with its resolved settings and runs
 nothing. A scenario that does not load or cannot run (an unset `env:` skill, an unreachable
 server) is reported in the table and in `suite.json`'s `errors`, the others still run, and the
-suite exits 1. `config` prints every role's model and the layer it came from, its settings and
+suite exits 1. A file that does not load is selected by the `name` and `category` it states
+(a file that does not even parse is kept by every `--category`), so a filter never hides a
+broken scenario that belongs to it. `config` prints every role's model and the layer it came from, its settings and
 prompts, the run settings, the scenario sources and `runs_dir`; `--scenario` resolves for one
 scenario (its overrides included), `--json` prints the same as data.
 
@@ -464,8 +470,9 @@ category with their status, search, run all / one / re-run, run history, the con
 its tool calls, and the judge's per-item verdicts. See [docs/RUNNER_UI.md](docs/RUNNER_UI.md).
 
 `run`, `judge`, `report` and `suite` exit 0 when the overall pass rate reaches `--threshold`
-(a threshold of 0.8 with 4 of 5 runs passing is on the boundary and passes), 1 otherwise, and 1
-when nothing was judged. Usage errors and a missing runner exit 2. User-facing failures (bad
+(a threshold of 0.8 with 4 of 5 runs passing is on the boundary and passes), 1 otherwise, 1
+when nothing was judged, and 1 for an incomplete run directory (a transcript without a verdict,
+or a repeat that never ran; `report.json` lists them under `unjudged` and `missing`). Usage errors and a missing runner exit 2. User-facing failures (bad
 scenario, unreachable server, unknown path id, planner gave up) print one line to stderr and
 exit 1; set `MCPSIM_DEBUG=1` for the traceback.
 
@@ -475,8 +482,10 @@ across runs, a pass-rate table per path × mode with run time and cost, the wors
 their reasons and transcript paths, and token usage with an estimated cost (from a rate table;
 the report says "estimate", and it covers the agent, simulated-user and observer calls recorded
 in transcripts and the judge calls recorded in verdicts, not the planner). `report.json` holds
-the same: `pass_k: {k, all_passed}` (`k` is the repeat count; pass^k holds only when every
-repeat of every path and mode was judged and passed), `cost_usd` (= `run_cost_usd` +
+the same: `pass_k: {k, all_passed}` (`k` is the repeat the run asked for, which
+`scenario.json` records, so `mcpsim report` and `mcpsim judge` over a run that stopped early
+keep it; pass^k holds only when every repeat of every path and mode was judged and passed),
+`unjudged` and `missing`, `cost_usd` (= `run_cost_usd` +
 `judge_cost_usd`), `duration_s` (runs summed) and `wall_clock_s`, `goal_achieved` /
 `sop_followed` tallies and `behavior: [{item, passed, graded}]`.
 
@@ -597,9 +606,12 @@ skills/simulate/
 **Models.** Precedence for each role, lowest to highest: the built-in default < the role
 file's frontmatter (`provider`, `model`) < `config.yaml` `defaults` < every `config.yaml`
 override whose `match` (fnmatch globs on `name` and/or `category`) fits the scenario, in file
-order < the scenario file's own `models` < `--models`. The bundled config puts every role on the
-Anthropic API (planner `claude-opus-5-5`, agent `claude-sonnet-5-5`, user
-`claude-haiku-4-5-20251001`, observer `claude-sonnet-5-5`, judge `claude-opus-5-5`):
+order < the scenario file's own `models` < `--models`. The bundled role files put every role on
+the Anthropic API (planner `claude-opus-5-5`, agent `claude-sonnet-5-5`, user
+`claude-haiku-4-5-20251001`, observer `claude-sonnet-5-5`, judge `claude-opus-5-5`), and the
+bundled `config.yaml` sets no `defaults`, so editing a role file's `model` takes effect. A value
+set in a higher layer shadows the role file; `mcpsim config` prints a `note:` for each one.
+For example:
 
 ```yaml
 defaults:
@@ -613,7 +625,8 @@ overrides:
 **Run settings.** `repeat`, `modes`, `judge_votes` and `concurrency` follow the same ladder
 (built-in < the judge file's `votes` < `config.yaml` `run` < matching overrides < the scenario
 file < `--repeat` and `--mode` / `--modes`; `mcpsim judge --votes` for a re-judge). The bundled defaults are repeat 1, modes guided and
-free, three judge votes, two runs in flight. The `scenario.json` of each run records the
+free, two runs in flight (`config.yaml` `run`) and three judge votes (`roles/judge.md`'s
+`votes`, which `config.yaml` leaves live). The `scenario.json` of each run records the
 resolved models and settings, so a re-judge uses what actually ran.
 
 **Prompts.** Each role file is YAML frontmatter (`role`, `provider`, `model`, optional
@@ -646,8 +659,10 @@ Rules:
 header comment lists the placeholders each prompt accepts and requires (also in
 `mcpsim config --json`). Loading refuses unknown frontmatter keys, unknown or missing prompts,
 unknown placeholders and missing required ones (say a planner prompt without `{{ catalog }}`),
-naming the file and line; it refuses a `temperature` on a role whose resolved model rejects one
-(Claude Opus 5.5, Sonnet 5.5, Fable 5.1, Opus 4.7+). The bundled templates render the exact
+naming the file and line. A `temperature` on a role whose resolved model rejects one (Claude
+Opus 5.5, Sonnet 5.5, Fable 5.1, Opus 4.7+) is refused wherever a scenario is resolved:
+`mcpsim config` lists it under `problems` and exits 1, `suite --list` shows an error row, and
+`run` / `plan` / `suite` stop before any call (a dry run calls no model and skips the check). The bundled templates render the exact
 bytes the code used to build (`tests/test_prompt_golden.py` compares 882 prompts with a capture
 taken before the move); after a deliberate prompt change, regenerate the capture with
 `python -m tests.prompt_cases --write` and review it.
@@ -657,9 +672,12 @@ taken before the move); after a deliberate prompt change, regenerate the capture
 Defaults, all Anthropic API models: planner `claude-opus-5-5`, agent `claude-sonnet-5-5`,
 simulated user `claude-haiku-4-5-20251001`, observers `claude-sonnet-5-5`, judge
 `claude-opus-5-5`. Also accepted: `claude-fable-5-1`. Every call retries with backoff on 429/5xx (max
-5 attempts) and records usage; cost is estimated from a rate table (USD per million tokens
-in/out: sonnet-5-5 3/15, opus-5-5 15/75, fable-5-1 15/75, haiku-4-5 1/5). Budgets end a run
-with outcome `budget_exceeded` (a failed run with a reason, never a crash).
+5 attempts) and records usage; cost is estimated from a rate table of list prices (USD per
+million tokens in/out: opus-5-5 4/20, sonnet-5-5 2/10, fable-5-1 10/50, haiku-4-5 1/5; also
+opus-5 5/25, sonnet-5 2/10, fable-5 10/50; cache and batch discounts are not modelled). A model
+the table does not price costs 0, and the run logs a warning, because `budgets.max_cost_usd`
+cannot limit it. Budgets end a run with outcome `budget_exceeded` (a failed run with a reason,
+never a crash).
 
 ## Local models
 

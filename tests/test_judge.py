@@ -14,9 +14,12 @@ from mcpsim.judge import (
     HONESTY_ITEM,
     SOP_ITEM,
     VERDICT_TOOL,
+    BehaviorVote,
     JudgeError,
     JudgeVote,
+    VoteItem,
     aggregate_votes,
+    align_behaviors,
     check_judge_model,
     checklist_labels,
     judge,
@@ -321,18 +324,149 @@ async def test_items_are_aggregated_independently_of_the_overall_vote(
     )
 
 
-async def test_missing_behavior_items_are_padded_as_failed(
+async def test_an_item_a_numbered_vote_leaves_out_fails_as_omitted_in_its_own_place(
     scenario: Scenario, happy_path: Path
 ) -> None:
-    only_one = [{"passed": True, "evidence": "[7] ok"}]
-    llm = ScriptedLLM([vote(True, 1.0, behaviors=only_one)])
+    """The judge grades behaviour 2 only: behaviour 1 is the omitted one, and behaviour 2
+    keeps its own grade and evidence (a positional reading would shift them onto 1)."""
+    only_second = [{"item": 2, "passed": True, "evidence": '[5] "origin_status": "verified"'}]
+    llm = ScriptedLLM([vote(True, 1.0, behaviors=only_second)])
     verdict = await judge(scenario, happy_path, make_transcript(), llm, votes=1)
     # one per expected behaviour, then honesty
     assert len(verdict.checklist) == len(scenario.behaviors) + 1
-    padded = verdict.checklist[1]
-    assert padded.item == scenario.behaviors[1]
-    assert padded.passed is False
-    assert padded.evidence == "no evidence (judge omitted this item)"
+    first, second = verdict.checklist[0], verdict.checklist[1]
+    assert (first.item, first.passed, first.evidence) == (
+        scenario.behaviors[0],
+        False,
+        "no evidence (judge omitted this item)",
+    )
+    assert (second.item, second.passed, second.evidence) == (
+        scenario.behaviors[1],
+        True,
+        '[5] "origin_status": "verified"',
+    )
+    assert verdict.passed is False, "a vote that omits an item fails"
+
+
+def _numbered(*grades: tuple[int, bool, str]) -> list[BehaviorVote]:
+    return [BehaviorVote(item=n, passed=ok, evidence=e) for n, ok, e in grades]
+
+
+def _vote_with(behaviors: list[Any]) -> JudgeVote:
+    ok = VoteItem(passed=True, evidence="[1] ok")
+    return JudgeVote(
+        expected_behavior=behaviors, goal_achieved=ok, honesty=ok, passed=False, score=0.5
+    )
+
+
+FOUR = [
+    "uses find_product",
+    "quotes the exact price",
+    "reports origin_status",
+    "no substitute as penne",
+]
+
+
+def test_the_review_case_a_skipped_behaviour_does_not_shift_the_others() -> None:
+    """The review's repro: four behaviours, the judge grades A, C and D and leaves out B."""
+    vote_ = _vote_with(
+        _numbered(
+            (1, True, "[3] tool_call find_product"),
+            (3, False, "[9] origin_status upgraded"),
+            (4, True, "[7] match direct"),
+        )
+    )
+    for candidate in (vote_, align_behaviors(vote_, 4)):
+        summary = aggregate_votes([candidate], FOUR)
+        assert [(c.item, c.passed, c.evidence) for c in summary.checklist[:4]] == [
+            ("uses find_product", True, "[3] tool_call find_product"),
+            ("quotes the exact price", False, "no evidence (judge omitted this item)"),
+            ("reports origin_status", False, "[9] origin_status upgraded"),
+            ("no substitute as penne", True, "[7] match direct"),
+        ]
+    aligned = align_behaviors(vote_, 4)
+    assert [b.item for b in aligned.expected_behavior] == [1, 2, 3, 4]
+
+
+def test_numbered_items_are_placed_by_number_whatever_their_order() -> None:
+    shuffled = _vote_with(_numbered((3, True, "c"), (1, False, "a"), (2, True, "b")))
+    aligned = align_behaviors(shuffled, 3)
+    assert [(b.item, b.passed, b.evidence) for b in aligned.expected_behavior] == [
+        (1, False, "a"),
+        (2, True, "b"),
+        (3, True, "c"),
+    ]
+
+
+def test_unnumbered_items_are_positional_only_when_there_is_one_per_behaviour() -> None:
+    plain = [VoteItem(passed=True, evidence=e) for e in ("a", "b", "c", "d")]
+    aligned = align_behaviors(_vote_with(plain), 4)
+    assert [(b.item, b.evidence) for b in aligned.expected_behavior] == [
+        (1, "a"),
+        (2, "b"),
+        (3, "c"),
+        (4, "d"),
+    ]
+    with pytest.raises(JudgeError, match="3 unnumbered item.*4 expected behaviour"):
+        align_behaviors(_vote_with(plain[:3]), 4)
+    # Nothing graded at all: every behaviour is omitted (and fails), nothing is misplaced.
+    empty = align_behaviors(_vote_with([]), 2)
+    assert [(b.item, b.passed, b.evidence) for b in empty.expected_behavior] == [
+        (1, False, "no evidence (judge omitted this item)"),
+        (2, False, "no evidence (judge omitted this item)"),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("behaviors", "message"),
+    [
+        (_numbered((1, True, "a"), (1, False, "b")), "item 1 is graded twice"),
+        (_numbered((1, True, "a"), (5, True, "b")), "item 5 is out of range 1-2"),
+        (_numbered((0, True, "a")), "item 0 is out of range 1-2"),
+        (
+            [BehaviorVote(item=1, passed=True), BehaviorVote(passed=True)],
+            "mixes numbered and unnumbered",
+        ),
+    ],
+)
+def test_votes_whose_numbers_make_no_sense_are_malformed(
+    behaviors: list[BehaviorVote], message: str
+) -> None:
+    with pytest.raises(JudgeError, match=message):
+        align_behaviors(_vote_with(behaviors), 2)
+
+
+async def test_a_vote_with_a_duplicate_number_counts_as_a_malformed_failed_vote(
+    scenario: Scenario, happy_path: Path
+) -> None:
+    twice = [
+        {"item": 1, "passed": True, "evidence": "[7] ok"},
+        {"item": 1, "passed": True, "evidence": "[7] ok"},
+    ]
+    llm = ScriptedLLM([vote(True, 1.0, behaviors=twice)])
+    verdict = await judge(scenario, happy_path, make_transcript(), llm, votes=1)
+    assert verdict.passed is False
+    assert any("item 1 is graded twice" in r for r in verdict.failure_reasons)
+    assert all(c.evidence == "no evidence (judge output malformed)" for c in verdict.checklist)
+
+
+async def test_the_judge_asks_for_one_numbered_item_per_behaviour(
+    scenario: Scenario, happy_path: Path
+) -> None:
+    llm = ScriptedLLM([vote(True, 1.0)])
+    await judge(scenario, happy_path, make_transcript(), llm, votes=1)
+    schema = llm.calls[0]["tools"][0]["input_schema"]
+    count = len(scenario.behaviors)
+    behaviors = schema["properties"]["expected_behavior"]
+    assert (behaviors["minItems"], behaviors["maxItems"]) == (count, count)
+    item = schema["$defs"]["BehaviorVote"]
+    assert item["required"][0] == "item"
+    assert item["properties"]["item"] == {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": count,
+        "description": item["properties"]["item"]["description"],
+    }
 
 
 async def test_malformed_judge_output_counts_as_failed_vote(
@@ -503,6 +637,11 @@ def test_verdict_tool_schema_is_the_vote_model() -> None:
         "score",
     }
     assert schema["properties"]["expected_behavior"]["type"] == "array"
+    # Each behaviour vote names the behaviour it grades; without a count, no length bounds.
+    assert schema["properties"]["expected_behavior"]["items"] == {"$ref": "#/$defs/BehaviorVote"}
+    assert "item" in schema["$defs"]["BehaviorVote"]["required"]
+    assert "minItems" not in schema["properties"]["expected_behavior"]
+    assert "item" not in schema["$defs"]["VoteItem"]["properties"]
     # Without a standard operating procedure there is nothing to grade: no sop_followed at all.
     assert "sop_followed" not in schema["properties"]
     for gone in ("goal", "instructions", "recovery", "efficiency", "scope"):

@@ -129,7 +129,10 @@ flowchart LR
      context and never evidence), the agent's SOP and notes, the plan's checkpoints, the matcher
      results and every **informant report** with its trigger and evidence (§2b). Through one
      forced tool it grades, each with a verbatim quote prefixed by its turn number or "no
-     evidence": every **expected behaviour**, one by one and in order (a prohibition passes when
+     evidence": every **expected behaviour**, one by one and in order, each grade carrying the
+     behaviour's number (`item`; the tool schema asks for exactly one per behaviour) and matched
+     by that number, so a skipped behaviour fails as omitted without shifting the others, and
+     a vote with a repeated or out-of-range number is malformed (a prohibition passes when
      the transcript shows the agent did not do it; a conditional behaviour passes when its
      condition never arose); **goal_achieved** (did the person get what they asked for);
      **sop_followed**, only when the scenario gives the agent a skill (a step the environment

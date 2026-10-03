@@ -15,6 +15,7 @@ import os
 import re
 import shutil
 import signal
+import socket
 import sys
 import time
 from collections.abc import Iterator
@@ -28,13 +29,16 @@ from starlette.testclient import TestClient
 
 from mcpsim.cli import EXIT_FAILURE, EXIT_USAGE, main
 from mcpsim.judge import HONESTY_ITEM
+from mcpsim.scenario import load_scenario
 from mcpsim.skill import CHECKOUT_DIR, SKILL_ENV, SkillError, load_skill
 from mcpsim.ui.app import (
     TOKEN_HEADER,
     UISettings,
     create_app,
+    host_allowed,
     host_name,
     is_loopback,
+    remote_host_names,
     resolve_settings,
     serve,
 )
@@ -380,7 +384,10 @@ def env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Env:
             ),
         ],
         report=None,
-        scenario=_scenario("v2-shopper", **V2_EXTRA),
+        # As the runner writes it: the resolved scenario, the SOP's text included.
+        scenario=json.loads(
+            load_scenario(scenarios / "nested" / "v2-shopper.yaml").model_dump_json()
+        ),
     )
 
     # A copy of the real simulate skill with its own config.yaml and two frontmatter edits.
@@ -574,9 +581,12 @@ def test_scenarios_grouped_with_status_and_last_run(client: TestClient) -> None:
 
     shopper = by_name["v2-shopper"]
     assert (shopper["title"], shopper["category"]) == ("Weekly shop on a phone", "Shopping")
-    assert shopper["status"] == "partial"
-    # One run per path x mode cell (the scenario says repeat 2, but the cells decide).
-    assert shopper["pass_k"] == {"k": 1, "all_passed": False, "computed": True}
+    # Its only run directory has verdicts but no report.json: it never finished, so it is not
+    # the scenario's result (no status, no pass^k), only a pointer to an incomplete run.
+    assert shopper["status"] == "never" and shopper["last_run"] is None
+    assert shopper["pass_k"] is None
+    assert shopper["latest_incomplete"] == "20250905T120000Z" and shopper["run_count"] == 1
+    assert lookup["latest_incomplete"] == "20250903T100000Z", "the newer plan-only directory"
     assert shopper["user_instructions"].startswith("You are a parent in Lyon")
 
     broken = by_name["broken-one"]
@@ -584,7 +594,7 @@ def test_scenarios_grouped_with_status_and_last_run(client: TestClient) -> None:
     assert broken["status"] == "never" and broken["last_run"] is None
 
     groups = {g["name"]: g for g in data["categories"]}
-    assert groups["Shopping"]["total"] == 1 and groups["Shopping"]["counts"]["partial"] == 1
+    assert groups["Shopping"]["total"] == 1 and groups["Shopping"]["counts"]["never"] == 1
     assert groups["Uncategorized"]["total"] == 2
     assert groups["Uncategorized"]["counts"] == {
         "passed": 1,
@@ -731,7 +741,11 @@ def test_run_detail_has_plan_verdicts_transcripts(client: TestClient) -> None:
 
     shopper = client.get("/api/runs/v2-shopper/20250905T120000Z").json()
     summary = shopper["summary"]
-    assert (summary["status"], summary["runs"], summary["passed"]) == ("partial", 2, 1)
+    # No report.json: what is on disk is shown, but the run is incomplete, never partial or
+    # passed, and pass^k's k is the repeat scenario.json records (2), not the cells' 1 run.
+    assert (summary["status"], summary["runs"], summary["passed"]) == ("incomplete", 2, 1)
+    assert summary["finished"] is False and summary["repeat"] == 2
+    assert summary["pass_k"] == {"k": 2, "all_passed": False, "computed": True}
     # No report.json: cost and duration come from the transcripts themselves.
     assert summary["cost_usd"] == 0.0246 and summary["duration_s"] == 4.5
     assert shopper["scenario"]["context"]["location"] == "Lyon, FR"
@@ -815,6 +829,106 @@ def test_non_loopback_host_header_is_refused(env: Env) -> None:
     remote = create_app(env.settings(allow_remote=True), token=TOKEN)
     with TestClient(remote, base_url="http://10.0.0.5:8765") as c:
         assert c.get("/api/config").status_code == 200
+
+
+def test_config_warns_about_a_temperature_the_resolved_model_rejects(env: Env) -> None:
+    set_frontmatter(env.skill / "roles" / "judge.md", temperature=0.3)
+    app = create_app(env.settings(), token=TOKEN)
+    with TestClient(app, base_url=BASE) as c:
+        warnings = c.get("/api/config").json()["warnings"]
+    assert any(
+        "judge.md: temperature 0.3 is set" in w and "claude-opus-5-5, which rejects it" in w
+        for w in warnings
+    ), warnings
+
+
+def test_allow_remote_still_refuses_a_dns_rebinding_host(env: Env) -> None:
+    """Under --allow-remote a page that rebinds its own domain to this machine sends that
+    domain as Host: it can neither load the page (and its token) nor read or post."""
+    settings = env.settings(allow_remote=True, allow_hosts=["runner.team.example"])
+    app = create_app(settings, token=TOKEN)
+    rebound = "rebind.attacker.test:8765"
+    with TestClient(app, base_url=f"http://{rebound}") as c:
+        page = c.get("/")
+        assert page.status_code == 421 and TOKEN not in page.text
+        assert c.get("/api/scenarios").status_code == 421
+        res = _post(c, "/api/run", {"scenarios": ["fake-lookup"]}, origin=f"http://{rebound}")
+        assert res.status_code == 421
+    # IP addresses, this machine's name and --allow-host names are still answered.
+    hostname = socket.gethostname().lower()
+    for base in (
+        "http://10.0.0.5:8765",
+        "http://[fd00::5]:8765",
+        f"http://{hostname}:8765",
+        "http://runner.team.example:8765",
+        "http://RUNNER.team.example.:8765",
+        "http://localhost:8765",
+    ):
+        with TestClient(app, base_url=base) as c:
+            assert c.get("/api/config").status_code == 200, base
+
+
+def test_host_allowed_rules() -> None:
+    names = remote_host_names("runner.lan", ["extra.example"])
+    assert {"runner.lan", "runner", "extra.example", "extra"} <= names
+    assert socket.gethostname().lower() in names
+    assert "0.0.0.0" not in remote_host_names("0.0.0.0")
+    assert host_allowed("127.0.0.1", allow_remote=False)
+    assert not host_allowed("10.0.0.5", allow_remote=False)
+    assert host_allowed("10.0.0.5", allow_remote=True)
+    assert host_allowed("Extra.Example", allow_remote=True, names=names)
+    for bad in ("rebind.attacker.test", "runner.lan.attacker.test", "", "extra.example.evil"):
+        assert not host_allowed(bad, allow_remote=True, names=names), bad
+
+
+def test_cli_ui_allow_host_needs_allow_remote_and_reaches_the_settings(
+    env: Env, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(env.root)
+    assert main(["ui", "--skill", str(env.skill), "--allow-host", "x.example"]) == EXIT_USAGE
+    assert "--allow-host only applies with --allow-remote" in capsys.readouterr().err
+    seen: dict[str, Any] = {}
+
+    def fake_serve(settings: UISettings, *, host: str, port: int) -> None:
+        seen.update(settings=settings, host=host)
+
+    monkeypatch.setattr("mcpsim.ui.app.serve", fake_serve)
+    args = ["ui", "--skill", str(env.skill), "--host", "0.0.0.0", "--allow-remote"]
+    assert main([*args, "--allow-host", "a.example", "--allow-host", "b.example"]) == 0
+    assert seen["settings"].allow_hosts == ["a.example", "b.example"]
+    assert seen["settings"].bind_host == "0.0.0.0"
+
+
+def test_serve_warns_about_allow_remote(env: Env, monkeypatch: pytest.MonkeyPatch,
+                                        capsys: pytest.CaptureFixture[str]) -> None:
+    import uvicorn
+
+    monkeypatch.setattr(uvicorn, "run", lambda *a, **k: None)
+    serve(env.settings(allow_remote=True, allow_hosts=["team.example"]), host="0.0.0.0", port=1)
+    err = capsys.readouterr().err
+    assert "warning: --allow-remote" in err and "team.example" in err and "421" in err
+
+
+def test_a_run_snapshot_never_makes_the_server_read_another_file(
+    client: TestClient, env: Env
+) -> None:
+    """scenario.json is data: an agent.skill without skill_text (edited, or copied from a
+    teammate) is shown as a name, and the file it points at is never read or served."""
+    secret = env.outside / "secret.txt"
+    secret.write_text("TOP-SECRET-OUTSIDE-RUNS-DIR", encoding="utf-8")
+    snapshot = {**_scenario("fake-lookup"), "agent": {"skill": str(secret)}}
+    run = env.runs / "fake-lookup" / "20250907T000000Z"
+    _write_run(run, verdicts=[_verdict("happy", "guided", 0, True)], report=None,
+               scenario=snapshot)
+    for skill in (str(secret), "../../../outside/secret.txt", "env:RECIPE_SHOPPER_SKILL"):
+        snapshot["agent"] = {"skill": skill}
+        (run / "scenario.json").write_text(json.dumps(snapshot), encoding="utf-8")
+        res = client.get("/api/runs/fake-lookup/20250907T000000Z")
+        assert res.status_code == 200
+        assert "TOP-SECRET" not in res.text and "Look the product up" not in res.text, skill
+        view = res.json()["scenario"]
+        assert view["agent_skill"] == skill and view["error"] is None
+        assert view["agent_skill_text"] is None and view["agent_skill_path"] is None
 
 
 def test_post_requires_the_token(client: TestClient) -> None:
@@ -940,7 +1054,7 @@ def test_job_lifecycle_runs_each_scenario_and_records_status(
         "agent=claude-haiku-4-5-20251001,judge=anthropic:claude-opus-5-5"
     )
     assert argv[argv.index("--repeat") + 1] == "2"
-    assert argv[argv.index("--mode") + 1] == "guided"
+    assert argv[argv.index("--modes") + 1] == "guided"
     assert "--dry-run" in argv and "--allow-same-judge" not in argv
 
     listing = {s["name"]: s for s in client.get("/api/scenarios").json()["scenarios"]}
@@ -951,6 +1065,117 @@ def test_job_lifecycle_runs_each_scenario_and_records_status(
     history = client.get("/api/scenarios/fake-lookup/runs").json()["runs"]
     assert history[0]["run_id"] == run_id and history[0]["duration_s"] == 1.5
     assert client.get("/api/jobs").json()["jobs"][0]["job_id"] == job_id
+
+
+def _finished_failing_run(env: Env) -> str:
+    """A complete, failing repeat-2 run of fake-lookup, newer than the fixture's passing one."""
+    run_id = "20250904T000000Z"
+    _write_run(
+        env.runs / "fake-lookup" / run_id,
+        verdicts=[_verdict("happy", "guided", 0, False), _verdict("happy", "guided", 1, False)],
+        report={
+            "scenario": "fake-lookup",
+            "runs": 2,
+            "passed": 0,
+            "pass_rate": 0.0,
+            "pass_k": {"k": 2, "all_passed": False},
+            "judge_models": ["claude-opus-5-5"],
+        },
+        scenario=_scenario("fake-lookup"),
+        plan=PLAN,
+    )
+    return run_id
+
+
+@pytest.mark.parametrize("job_client", [{"fake-lookup": "stall"}], indirect=True)
+def test_a_cancelled_rerun_with_a_passing_verdict_does_not_replace_the_failing_result(
+    job_client: tuple[TestClient, Env],
+) -> None:
+    """The review's case: the last complete run failed; a re-run is stopped after its first
+    (passing) verdict. The list keeps the failure, and the stopped run is incomplete with
+    pass^3 (the repeat it asked for) not held, never "passed" with pass^1."""
+    client, env = job_client
+    finished = _finished_failing_run(env)
+    listing = {s["name"]: s for s in client.get("/api/scenarios").json()["scenarios"]}
+    assert listing["fake-lookup"]["status"] == "failed"
+    job_id = _post(client, "/api/run", {"scenarios": ["fake-lookup"]}).json()["job_id"]
+
+    def stopped() -> list[Path]:
+        return [
+            d
+            for d in (env.runs / "fake-lookup").iterdir()
+            if (d / "verdicts" / "happy-guided-0.json").is_file()
+            and not (d / "report.json").is_file()
+        ]
+
+    for _ in range(500):
+        if stopped():
+            break
+        time.sleep(0.02)
+    [stopped_dir] = stopped()
+    assert _post(client, f"/api/jobs/{job_id}/cancel", {}).status_code == 200
+    done = _wait(client, job_id)
+    assert done["scenarios"][0]["status"] == "cancelled"
+
+    listing = {s["name"]: s for s in client.get("/api/scenarios").json()["scenarios"]}
+    row = listing["fake-lookup"]
+    assert row["status"] == "failed"
+    assert row["last_run"]["run_id"] == finished
+    assert row["pass_k"] == {"k": 2, "all_passed": False}
+    assert row["latest_incomplete"] == stopped_dir.name
+    detail = client.get("/api/scenarios/fake-lookup").json()
+    assert detail["status"] == "failed" and detail["latest_incomplete"] == stopped_dir.name
+    history = client.get("/api/scenarios/fake-lookup/runs").json()["runs"]
+    assert history[0]["run_id"] == stopped_dir.name
+    assert (history[0]["status"], history[0]["runs"], history[0]["passed"]) == (
+        "incomplete",
+        1,
+        1,
+    )
+    assert history[0]["pass_k"] == {"k": 3, "all_passed": False, "computed": True}
+
+
+def test_a_crashed_run_or_a_report_listing_gaps_is_incomplete_never_passed(env: Env) -> None:
+    """Without the job manager: a crashed run (passing verdicts, no report.json) and a report
+    rebuilt over a partial directory (it lists unjudged / missing runs) are both incomplete;
+    the scenario's result stays the newest finished run."""
+    finished = _finished_failing_run(env)
+    crashed = env.runs / "fake-lookup" / "20250906T000000Z"
+    _write_run(
+        crashed,
+        verdicts=[_verdict("happy", "guided", 0, True)],
+        report=None,
+        scenario={**_scenario("fake-lookup"), "repeat": 3},
+    )
+    rebuilt = env.runs / "fake-lookup" / "20250905T000000Z"
+    _write_run(
+        rebuilt,
+        verdicts=[_verdict("happy", "guided", 0, True)],
+        report={
+            "scenario": "fake-lookup",
+            "runs": 1,
+            "passed": 1,
+            "pass_rate": 1.0,
+            "pass_k": {"k": 3, "all_passed": False},
+            "unjudged": [],
+            "missing": ["happy-guided-1", "happy-guided-2"],
+        },
+        scenario={**_scenario("fake-lookup"), "repeat": 3},
+    )
+    app = create_app(env.settings(), token=TOKEN)
+    with TestClient(app, base_url=BASE) as client:
+        row = {s["name"]: s for s in client.get("/api/scenarios").json()["scenarios"]}[
+            "fake-lookup"
+        ]
+        assert (row["status"], row["last_run"]["run_id"]) == ("failed", finished)
+        assert row["latest_incomplete"] == crashed.name
+        runs = client.get("/api/scenarios/fake-lookup/runs").json()["runs"]
+        history = {r["run_id"]: r for r in runs}
+        for run in (crashed.name, rebuilt.name):
+            assert history[run]["status"] == "incomplete", run
+            assert history[run]["pass_k"]["k"] == 3, run
+            assert history[run]["pass_k"]["all_passed"] is False, run
+        assert history[finished]["status"] == "failed" and history[finished]["finished"] is True
 
 
 @pytest.mark.parametrize("job_client", [{"fake-lookup": "error"}], indirect=True)
@@ -1101,10 +1326,14 @@ def test_build_command_maps_options_to_cli_flags(tmp_path: Path) -> None:
         "--out",
         str(out),
     ]
+    # Both modes asked for are passed on (the command line's layer), so a config.yaml or an
+    # override that narrows modes cannot silently drop the free runs the request asked for.
     both = parse_run_options({"modes": ["guided", "free"], "models": {"user": ""}})
     assert both.modes == ["guided", "free"] and both.models == {}
     cmd = build_command(prefix, file, out, both)
-    assert "--mode" not in cmd and "--models" not in cmd
+    assert cmd[cmd.index("--modes") + 1] == "guided,free" and "--models" not in cmd
+    # No modes: the skill and the scenario decide.
+    assert "--modes" not in build_command(prefix, file, out, parse_run_options({}))
     opts = parse_run_options(
         {"models": {"planner": "ollama:llama3.2:3b"}, "allow_same_judge": True, "modes": ["free"]}
     )
@@ -1112,10 +1341,34 @@ def test_build_command_maps_options_to_cli_flags(tmp_path: Path) -> None:
     assert cmd[-5:] == [
         "--models",
         "planner=ollama:llama3.2:3b",
-        "--mode",
+        "--modes",
         "free",
         "--allow-same-judge",
     ]
+
+
+def test_requested_modes_reach_the_run_even_when_the_skill_narrows_them(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The review's repro: config.yaml's override narrows Shopping scenarios to [guided]; an
+    API request for both modes must run both (the command line's layer), as the job says."""
+    from mcpsim.cli import build_parser
+    from mcpsim.runner import prepare_scenario
+
+    monkeypatch.chdir(env.root)
+    file = env.scenarios / "nested" / "v2-shopper.yaml"
+    opts = parse_run_options({"modes": ["guided", "free"]})
+    cmd = build_command(["mcpsim"], file, env.runs, opts, env.skill)
+    args = build_parser().parse_args(cmd[1:])
+    _, resolved, _ = prepare_scenario(
+        args.scenario, skill=args.skill, modes=[args.mode] if args.mode else args.modes
+    )
+    assert opts.to_json()["modes"] == resolved.run["modes"].value == ["guided", "free"]
+    assert resolved.run["modes"].source == "command line"
+    # Without a request the override still decides.
+    plain = build_parser().parse_args(build_command(["m"], file, env.runs, RunOptions())[1:])
+    _, resolved, _ = prepare_scenario(plain.scenario, skill=env.skill, modes=plain.modes)
+    assert resolved.run["modes"].value == ["guided"]
 
 
 def test_loopback_detection() -> None:

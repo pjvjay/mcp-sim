@@ -16,6 +16,7 @@ from mcpsim.llm import (
     is_retryable,
     rate_for,
     total_cost_usd,
+    unpriced_models,
 )
 from tests.fake_llm import ScriptedLLM, structured_response, text_response, tool_use_response
 
@@ -26,20 +27,43 @@ def test_usage_add_and_total() -> None:
 
 
 def test_rate_for_prefix_match() -> None:
-    assert rate_for("claude-sonnet-5-5") == (3.0, 15.0)
-    assert rate_for("claude-opus-5-5") == (15.0, 75.0)
-    assert rate_for("claude-fable-5-1") == (15.0, 75.0)
+    # Anthropic list prices, USD per million tokens (input, output).
+    assert rate_for("claude-opus-5-5") == (4.0, 20.0)
+    assert rate_for("claude-sonnet-5-5") == (2.0, 10.0)
+    assert rate_for("claude-fable-5-1") == (10.0, 50.0)
     assert rate_for("claude-haiku-4-5-20251001") == (1.0, 5.0)
+    # The previous generation, which the docs use as an override example, has its own price
+    # (and the longest prefix keeps claude-opus-5-5 off claude-opus-5's row).
+    assert rate_for("claude-opus-5") == (5.0, 25.0)
+    assert rate_for("anthropic:claude-opus-5") == (5.0, 25.0)
+    assert rate_for("claude-sonnet-5") == (2.0, 10.0)
+    assert rate_for("claude-fable-5") == (10.0, 50.0)
     assert rate_for("gpt-9") is None
+    assert rate_for("ollama:command-r7b") is None
 
 
 def test_estimate_cost() -> None:
     usage = Usage(input_tokens=1_000_000, output_tokens=100_000)
-    assert estimate_cost_usd("claude-sonnet-5-5", usage) == pytest.approx(3.0 + 1.5)
+    assert estimate_cost_usd("claude-sonnet-5-5", usage) == pytest.approx(2.0 + 1.0)
+    assert estimate_cost_usd("claude-opus-5-5", usage) == pytest.approx(4.0 + 2.0)
+    # The review's judge example: 10 input and 5 output tokens on Opus 5.5.
+    tiny = Usage(input_tokens=10, output_tokens=5)
+    assert estimate_cost_usd("claude-opus-5-5", tiny) == pytest.approx(0.00014)
     assert estimate_cost_usd("unknown-model", usage) == 0.0
     assert total_cost_usd({"claude-sonnet-5-5": usage, "claude-haiku-4-5-20251001": usage}) == (
-        pytest.approx(4.5 + 1.5)
+        pytest.approx(3.0 + 1.5)
     )
+
+
+def test_unpriced_models_names_hosted_models_without_a_rate() -> None:
+    specs = [
+        "claude-opus-5-5",
+        "anthropic:claude-opus-5",
+        "claude-imaginary-9",
+        "anthropic:claude-imaginary-9",
+        "ollama:command-r7b",
+    ]
+    assert unpriced_models(specs) == ["claude-imaginary-9"]
 
 
 def test_llm_response_helpers() -> None:
@@ -155,7 +179,7 @@ async def test_retries_on_429_and_5xx_then_succeeds() -> None:
     assert sleeps == [1.0, 2.0]
     assert (llm.calls, llm.retries) == (3, 2)
     assert llm.usage == {"claude-sonnet-5-5": Usage(input_tokens=100, output_tokens=20)}
-    assert llm.cost_usd() == pytest.approx((100 * 3 + 20 * 15) / 1_000_000)
+    assert llm.cost_usd() == pytest.approx((100 * 2 + 20 * 10) / 1_000_000)
     sent = client.messages.kwargs[-1]
     assert sent["max_tokens"] == 99 and sent["tool_choice"] == {"type": "auto"}
     assert sent["tools"][0]["name"] == "t" and sent["system"] == "sys"

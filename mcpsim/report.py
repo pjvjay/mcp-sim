@@ -141,7 +141,16 @@ class Report(BaseModel):
     behavior: list[BehaviorStats] = Field(default_factory=list)
     cells: list[CellStats] = Field(default_factory=list)
     worst_failures: list[Failure] = Field(default_factory=list)
+    # Transcripts without a verdict, and the repeats (``<path>-<mode>-<i>`` with ``i < k``) of
+    # a path × mode that has runs but never recorded this one: either makes the run directory
+    # incomplete, so pass^k does not hold and :func:`exit_code` fails.
     unjudged: list[str] = Field(default_factory=list)
+    missing: list[str] = Field(default_factory=list)
+
+    @property
+    def complete(self) -> bool:
+        """Every recorded run was judged and every asked-for repeat was recorded."""
+        return not self.unjudged and not self.missing
 
     def save(self, path: str | FsPath) -> FsPath:
         fs_path = FsPath(path)
@@ -279,6 +288,31 @@ def pass_k(
     return PassK(k=k, all_passed=all_passed)
 
 
+def missing_runs(
+    verdicts: Sequence[Verdict], transcripts: Sequence[Transcript], k: int
+) -> list[str]:
+    """For every path × mode with fewer than ``k`` recorded runs (transcripts or verdicts), the
+    stems ``<path>-<mode>-<i>`` of the repeats that never ran (a cancelled or crashed run),
+    lowest free indices first: as many as the cell is short of ``k``, matching :func:`pass_k`.
+    A path or mode with no run at all is not listed: the run may have been narrowed on purpose
+    (``--only-path``, ``--mode``)."""
+    seen: dict[tuple[str, str], set[int]] = {}
+    for t in transcripts:
+        seen.setdefault((t.path_id, t.mode), set()).add(t.index)
+    for v in verdicts:
+        seen.setdefault((v.path_id, v.mode), set()).add(v.index)
+    missing: list[str] = []
+    for (path_id, mode), indices in sorted(seen.items()):
+        short = k - len(indices)
+        i = 0
+        while short > 0:
+            if i not in indices:
+                missing.append(run_stem(path_id, mode, i))
+                short -= 1
+            i += 1
+    return missing
+
+
 def behavior_stats(verdicts: Sequence[Verdict]) -> list[BehaviorStats]:
     """Every checklist item across the verdicts, in first-seen order, with how many runs met
     it out of how many graded it."""
@@ -321,9 +355,10 @@ def aggregate(
     are matched to verdicts by ``<path>-<mode>-<i>``. A transcript without a verdict is listed
     under ``unjudged``, still counts towards cost (the money was spent) and keeps pass^k from
     holding. The judge's cost and usage come from the verdicts. ``repeat`` is the ``k`` of
-    pass^k (see :func:`pass_k`; inferred from the runs when not given). Transcript and verdict
-    paths in ``worst_failures`` are relative to the run directory, or absolute when ``run_dir``
-    is given.
+    pass^k (see :func:`pass_k`; inferred from the runs when not given); with it, every
+    path × mode that has fewer runs than that lists the absent ones under ``missing``.
+    Transcript and verdict paths in ``worst_failures`` are relative to the run directory, or
+    absolute when ``run_dir`` is given.
     """
     by_stem: dict[str, Transcript] = {t.stem: t for t in transcripts}
     name = scenario or next((t.scenario for t in transcripts if t.scenario), "")
@@ -392,6 +427,7 @@ def aggregate(
         )
 
     passed = sum(1 for v in ordered if v.passed)
+    reliability = pass_k(ordered, transcripts, repeat=repeat)
     run_cost = round(sum(t.cost_usd for t in transcripts), 6)
     judge_cost = round(sum(v.judge_cost_usd for v in ordered), 6)
     return Report(
@@ -401,7 +437,7 @@ def aggregate(
         passed=passed,
         pass_rate=_rate(passed, len(ordered)),
         mean_score=_mean([v.score for v in ordered]),
-        pass_k=pass_k(ordered, transcripts, repeat=repeat),
+        pass_k=reliability,
         cost_usd=round(run_cost + judge_cost, 6),
         run_cost_usd=run_cost,
         judge_cost_usd=judge_cost,
@@ -416,6 +452,8 @@ def aggregate(
         cells=cells,
         worst_failures=failures,
         unjudged=sorted(stem for stem in by_stem if stem not in judged),
+        # Only against a known repeat: an inferred k says nothing about what was asked for.
+        missing=missing_runs(ordered, list(transcripts), repeat) if repeat is not None else [],
     )
 
 
@@ -454,7 +492,9 @@ def aggregate_suite(reports: Sequence[Report]) -> SuiteReport:
 
 
 def exit_code(report: Report | SuiteReport, threshold: float = 1.0) -> int:
-    """0 when ``passed / runs >= threshold``, else 1. No judged runs is always 1.
+    """0 when ``passed / runs >= threshold``, else 1. No judged runs is always 1, and so is a
+    scenario report that is not :attr:`~Report.complete` (a transcript without a verdict, or a
+    repeat that never ran): the pass rate of a partial run says nothing about the rest.
 
     The comparison is done on the counts (``passed >= threshold * runs``) so a threshold such
     as 0.8 with 4 of 5 passes is exactly on the boundary and passes.
@@ -462,6 +502,8 @@ def exit_code(report: Report | SuiteReport, threshold: float = 1.0) -> int:
     if not 0.0 <= threshold <= 1.0:
         raise ValueError(f"threshold must be between 0 and 1, got {threshold}")
     if report.runs == 0:
+        return EXIT_FAIL
+    if isinstance(report, Report) and not report.complete:
         return EXIT_FAIL
     return EXIT_PASS if report.passed + 1e-9 >= threshold * report.runs else EXIT_FAIL
 
@@ -492,10 +534,23 @@ def summary_line(report: Report | SuiteReport) -> str:
         reliability = (
             f"pass^k held in {report.pass_k_scenarios}/{len(report.scenarios)} scenario(s)"
         )
-    return (
+    line = (
         f"{head}, {reliability}, mean score {report.mean_score:.2f}, "
         f"est. cost ${report.cost_usd:.4f}, run time {report.duration_s:.1f}s"
     )
+    if isinstance(report, Report) and not report.complete:
+        line += f"; incomplete: {incomplete_text(report)}"
+    return line
+
+
+def incomplete_text(report: Report) -> str:
+    """``1 transcript(s) not judged, 4 repeat(s) never ran``."""
+    parts = []
+    if report.unjudged:
+        parts.append(f"{len(report.unjudged)} transcript(s) not judged")
+    if report.missing:
+        parts.append(f"{len(report.missing)} repeat(s) never ran")
+    return ", ".join(parts)
 
 
 def _pass_k_bullet(report: Report) -> str:
@@ -586,6 +641,15 @@ def render_markdown(report: Report) -> str:
         lines += ["", "## Unjudged transcripts", ""]
         for stem in report.unjudged:
             lines.append(f"- `{transcript_relpath(stem)}`")
+    if report.missing:
+        lines += ["", "## Repeats that never ran", ""]
+        lines.append(
+            f"pass^{report.pass_k.k} asks for {report.pass_k.k} run(s) of every path and mode; "
+            "these were never recorded (the run stopped early):"
+        )
+        lines.append("")
+        for stem in report.missing:
+            lines.append(f"- `{stem}`")
     lines += ["", "## Cost and usage", ""]
     lines.append(f"Cost is an {report.cost_note}.")
     if report.usage:

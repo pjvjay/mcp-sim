@@ -82,7 +82,7 @@ def test_parse_model_spec_rejects_empty_name(spec: str) -> None:
 def test_is_local_model_and_rates() -> None:
     assert is_local_model("ollama:command-r7b") is True
     assert is_local_model("claude-sonnet-5-5") is False
-    assert rate_for("anthropic:claude-sonnet-5-5") == (3.0, 15.0)
+    assert rate_for("anthropic:claude-sonnet-5-5") == (2.0, 10.0)
     assert rate_for("ollama:claude-sonnet-5-5") is None  # local, whatever it is called
 
 

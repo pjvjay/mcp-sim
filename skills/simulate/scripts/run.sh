@@ -165,7 +165,7 @@ case "$command" in
   scenarios) scenarios ;;
   suite) load_env; cd "$MCPSIM_HOME"; exec "$MCPSIM" suite --skill "$SKILL_DIR" "$@" ;;
   ui) load_env; cd "$MCPSIM_HOME"; exec "$MCPSIM" ui --skill "$SKILL_DIR" "$@" ;;
-  config) cd "$MCPSIM_HOME"; exec "$MCPSIM" config --skill "$SKILL_DIR" "$@" ;;
+  config) load_env; cd "$MCPSIM_HOME"; exec "$MCPSIM" config --skill "$SKILL_DIR" "$@" ;;
   report) report "$@" ;;
   all)
     preflight || { echo "preflight failed; fix the FAIL lines first" >&2; exit 1; }

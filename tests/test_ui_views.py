@@ -312,3 +312,17 @@ def test_computed_pass_k_matches_the_report_definition() -> None:
     failed = {**full, "a-guided-1": v("a", "guided", False)}
     assert Store._computed_pass_k(failed) == {"k": 2, "all_passed": False, "computed": True}
     assert Store._computed_pass_k({}) is None
+    # k is the repeat the run recorded, and a transcript without a verdict is not a pass: the
+    # review's stopped run (repeat 3; path 1 judged and passing, path 2 never judged).
+    stopped = {"1-guided-0": v("1", "guided", True)}
+    assert Store._computed_pass_k(stopped, {"1-guided-0", "2-guided-0"}, 3) == {
+        "k": 3,
+        "all_passed": False,
+        "computed": True,
+    }
+    assert Store._computed_pass_k(full, {"a-guided-0", "a-guided-1"}, 2)["all_passed"] is True
+    assert Store._computed_pass_k({}, {"a-guided-0"}, None) == {
+        "k": 1,
+        "all_passed": False,
+        "computed": True,
+    }

@@ -16,7 +16,7 @@ from mcpsim.agent import build_agent_system_prompt
 from mcpsim.judge import VERDICT_TOOL, judge
 from mcpsim.plan import Path as PlanPath
 from mcpsim.plan import Step
-from mcpsim.scenario import DEFAULT_MODELS, MODEL_ROLES, parse_scenario
+from mcpsim.scenario import DEFAULT_CATEGORY, DEFAULT_MODELS, MODEL_ROLES, parse_scenario
 from mcpsim.skill import (
     BUILTIN,
     CHECKOUT_DIR,
@@ -30,6 +30,7 @@ from mcpsim.skill import (
     canonical_spec,
     expand_env,
     expand_source,
+    load_entries,
     load_role,
     load_skill,
     select_entries,
@@ -521,11 +522,13 @@ def test_entries_load_every_configured_scenario_and_keep_load_errors(
     write_config(skill_copy, {"scenarios": ["s1", "$S2_DIR", "${UNSET_DIR}"]})
     skill = load_skill(skill_copy)
     entries = skill.entries(tmp_path)
+    # A file that does not load keeps the name and category it states, so filters still
+    # select it (and the suite reports it) instead of dropping it.
     assert [(e.name, e.category, e.error is None) for e in entries] == [
         ("alpha", "Lookup", True),
         ("beta", "Planning", True),
         ("alpha", "Lookup", False),
-        ("gamma", "", False),
+        ("gamma", "Lookup", False),
     ]
     assert "also defined by" in (entries[2].error or "")
     assert "NOT_SET_SKILL is not set" in (entries[3].error or "")
@@ -535,10 +538,50 @@ def test_entries_load_every_configured_scenario_and_keep_load_errors(
         return [e.name for e in select_entries(entries, **kwargs)]
 
     assert names(names=["al*"]) == ["alpha", "alpha"]
-    assert names(categories=["Look*"]) == ["alpha"], "a broken entry has no category"
+    assert names(categories=["Look*"]) == ["alpha", "alpha", "gamma"]
+    assert names(categories=["Plan*"]) == ["beta"]
     assert names(names=["beta", "gam*"]) == ["beta", "gamma"]
     assert names(names=["*a"], categories=["Planning"]) == ["beta"]
     assert names() == ["alpha", "beta", "alpha", "gamma"]
+
+
+def test_broken_scenarios_are_selected_by_the_name_and_category_their_file_states(
+    tmp_path: Path,
+) -> None:
+    """A gateway copy whose file stem differs from its name, a broken file without a category
+    and one that does not even parse: name and category filters keep each one they could
+    match, so a filtered suite reports it and exits 1 instead of going green."""
+    folder = tmp_path / "s"
+    write_scenario(folder, "ok-gateway", "Recipe planning")
+    broken = write_scenario(folder, "cheapest-penne-gateway", "Product lookup", repeat=0)
+    broken.rename(folder / "cheapest-penne.yaml")
+    no_category = folder / "uncategorized.yaml"
+    no_category.write_text(yaml.safe_dump({"name": "plain-broken", "role": "r"}), "utf-8")
+    (folder / "garbled.yaml").write_text("name: [unclosed\n", "utf-8")
+    entries = load_entries([(f, "s") for f in sorted(folder.iterdir())])
+    by_file = {e.file.name: e for e in entries}
+    assert (by_file["cheapest-penne.yaml"].name, by_file["cheapest-penne.yaml"].category) == (
+        "cheapest-penne-gateway",
+        "Product lookup",
+    )
+    assert by_file["cheapest-penne.yaml"].title == "Cheapest penne gateway"
+    assert (by_file["uncategorized.yaml"].name, by_file["uncategorized.yaml"].category) == (
+        "plain-broken",
+        DEFAULT_CATEGORY,
+    )
+    assert (by_file["garbled.yaml"].name, by_file["garbled.yaml"].category) == ("garbled", "")
+    assert all(e.error for name, e in by_file.items() if name != "ok-gateway.yaml")
+
+    def names(**kwargs: Any) -> list[str]:
+        return sorted(e.name for e in select_entries(entries, **kwargs))
+
+    assert names(names=["*-gateway"]) == ["cheapest-penne-gateway", "ok-gateway"]
+    # The category a broken file states is matched; one that cannot be parsed has an
+    # unknown category and is kept by every category filter.
+    assert names(categories=["Product*"]) == ["cheapest-penne-gateway", "garbled"]
+    assert names(categories=["Recipe*"]) == ["garbled", "ok-gateway"]
+    assert names(categories=[DEFAULT_CATEGORY]) == ["garbled", "plain-broken"]
+    assert names(names=["*-gateway"], categories=["Recipe*"]) == ["ok-gateway"]
 
 
 def test_describe_reports_roles_sources_and_the_scenarios_resolution(skill_copy: Path) -> None:

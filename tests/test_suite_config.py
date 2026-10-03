@@ -134,6 +134,111 @@ def test_config_reports_an_invalid_skill(skill: Path, capsys: pytest.CaptureFixt
     assert err.startswith("mcpsim config: ") and "unknown placeholder 'who'" in err
 
 
+def _set_frontmatter(path: Path, **values: Any) -> None:
+    text = path.read_text(encoding="utf-8")
+    head, body = text.split("\n---\n", 1)
+    lines = head.splitlines()
+    for key, value in values.items():
+        lines = [ln for ln in lines if not ln.startswith(f"{key}:")] + [f"{key}: {value}"]
+    path.write_text("\n".join(lines) + "\n---\n" + body, encoding="utf-8")
+
+
+def test_the_bundled_config_leaves_the_role_files_live(
+    skill: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Editing a role file's model or the judge's votes takes effect with the bundled
+    config.yaml (it sets no model defaults and no judge_votes to shadow them)."""
+    _set_frontmatter(skill / "roles" / "judge.md", model="claude-fable-5-1", votes=1)
+    assert main(["config", "--skill", str(skill), "--json"]) == EXIT_OK
+    info = json.loads(capsys.readouterr().out)
+    judge = info["roles"]["judge"]
+    assert (judge["model"], judge["model_source"]) == ("claude-fable-5-1", "roles/judge.md")
+    assert info["run"]["judge_votes"] == {"value": 1, "source": "roles/judge.md"}
+    assert judge["shadowed"] == [] and info["problems"] == []
+    # The defaults are all on the Anthropic API, from the role files themselves.
+    for role, model in (("planner", "claude-opus-5-5"), ("agent", "claude-sonnet-5-5"),
+                        ("user", "claude-haiku-4-5-20251001"), ("observer", "claude-sonnet-5-5")):
+        assert (info["roles"][role]["model"], info["roles"][role]["model_source"]) == (
+            model,
+            f"roles/{role}.md",
+        )
+
+
+def test_config_notes_every_role_file_value_a_higher_layer_shadows(
+    suite_setup: Path, skill: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # suite_setup's config.yaml sets defaults.judge and run.judge_votes.
+    assert main(["config", "--skill", str(skill)]) == EXIT_OK
+    out = capsys.readouterr().out
+    assert (
+        "      note: its model claude-opus-5-5 is not used: config.yaml defaults sets judge"
+    ) in out
+    assert "      note: its votes 3 is not used: config.yaml run sets judge_votes" in out
+    assert "note: its model claude-sonnet-5-5 is not used" not in out, "agent is live"
+
+
+def test_a_temperature_the_resolved_model_rejects_fails_config_and_list_but_not_dry_run(
+    suite_setup: Path, skill: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """judge.md gets temperature 0.2 while the judge resolves to claude-opus-5-5 (which
+    answers 400 to it): config, config --scenario and suite --list all say so up front."""
+    _set_frontmatter(skill / "roles" / "judge.md", temperature=0.2)
+    assert main(["config", "--skill", str(skill)]) == EXIT_FAILURE
+    captured = capsys.readouterr()
+    assert "problems (a run with this resolution is refused):" in captured.out
+    assert "temperature 0.2 is set, but the judge model" in captured.err
+    assert "claude-opus-5-5, which rejects it" in captured.err
+
+    assert main(["config", "--skill", str(skill), "--scenario", "lookup-a"]) == EXIT_FAILURE
+    err = capsys.readouterr().err
+    assert "judge model for scenario 'lookup-a' is claude-opus-5-5" in err
+    args = ["config", "--skill", str(skill), "--scenario", "lookup-a", "--json"]
+    assert main(args) == EXIT_FAILURE
+    assert json.loads(capsys.readouterr().out)["problems"][0].endswith(
+        "remove temperature or choose another model"
+    )
+
+    assert main(["suite", "--skill", str(skill), "--list", "--name", "lookup-a"]) == EXIT_OK
+    line = capsys.readouterr().out.strip()
+    assert line.startswith("lookup-a") and "[Lookup] error: " in line
+    assert "temperature 0.2" in line
+    # A dry run calls no model: nothing to refuse, so the list resolves and the run runs.
+    dry = ["suite", "--skill", str(skill), "--list", "--name", "lookup-a", "--dry-run"]
+    assert main(dry) == EXIT_OK
+    assert "[Lookup] repeat 1" in capsys.readouterr().out
+    run_dir = runner.run_scenario(
+        suite_setup / "direct" / "lookup-a.yaml", suite_setup / "out", dry_run=True, skill=skill
+    )
+    assert (run_dir / "report.json").is_file()
+
+
+def test_run_sh_config_loads_the_environment_like_suite(tmp_path: Path) -> None:
+    """`run.sh config --scenario recipe-...` needs RECIPE_SHOPPER_SKILL, which load_env
+    sets from pantry-api; config must load it as suite and ui do."""
+    home = tmp_path / "mcp-sim"
+    (home / ".venv" / "bin").mkdir(parents=True)
+    stub = home / ".venv" / "bin" / "mcpsim"
+    stub.write_text(
+        "#!/bin/bash\necho \"args=$*\"\necho \"sop=${RECIPE_SHOPPER_SKILL:-unset}\"\n",
+        encoding="utf-8",
+    )
+    stub.chmod(0o755)
+    sop = tmp_path / "pantry-api" / "skills" / "recipe-shopper" / "SKILL.md"
+    sop.parent.mkdir(parents=True)
+    sop.write_text("---\nname: recipe-shopper\n---\nShop.\n", encoding="utf-8")
+    env = {
+        k: v for k, v in os.environ.items() if k not in ("RECIPE_SHOPPER_SKILL", "CF_JWT_FILE")
+    }
+    env.update(MCPSIM_HOME=str(home), PANTRY_API_HOME=str(sop.parents[2]))
+    script = CHECKOUT_DIR / "scripts" / "run.sh"
+    out = subprocess.run(
+        [str(script), "config", "--scenario", "recipe-link-mala-chicken"],
+        capture_output=True, text=True, env=env, check=True,
+    ).stdout
+    assert f"sop={sop}" in out
+    assert "args=config --skill" in out and "--scenario recipe-link-mala-chicken" in out
+
+
 def test_the_environment_variable_selects_the_skill(
     skill: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -156,8 +261,17 @@ def test_suite_list_selects_by_name_and_category(
     assert "error: " in lines[2] and "NOPE_SKILL is not set" in lines[2]
     assert "[Planning] repeat 1, modes guided, judge_votes 3" in lines[3]
 
+    # broken-d does not load, but its file says it is in Planning: the filter keeps it as an
+    # error row rather than hiding a broken scenario of the selected group.
     assert main(["suite", "--skill", str(skill), "--list", "--category", "Plan*"]) == EXIT_OK
-    assert [line.split()[0] for line in capsys.readouterr().out.splitlines()] == ["plan-c"]
+    planning = capsys.readouterr().out.splitlines()
+    assert [line.split()[0] for line in planning] == ["broken-d", "plan-c"]
+    assert "[Planning] error: " in planning[0] and "NOPE_SKILL is not set" in planning[0]
+    assert main(["suite", "--skill", str(skill), "--list", "--category", "Look*"]) == EXIT_OK
+    assert [line.split()[0] for line in capsys.readouterr().out.splitlines()] == [
+        "lookup-a",
+        "lookup-b",
+    ]
     args = ["suite", "--skill", str(skill), "--list", "--name", "lookup-b", "--name", "plan-*"]
     assert main(args) == EXIT_OK
     assert [line.split()[0] for line in capsys.readouterr().out.splitlines()] == [
@@ -272,7 +386,7 @@ def test_the_configured_suite_runs_into_runs_dir_with_a_pass_k_table(
     ]
     assert rows[1].split()[:6] == ["lookup-a", "Lookup", "1/1", "100%", "pass^1", "yes"]
     assert rows[2].split()[:6] == ["lookup-b", "Lookup", "0/1", "0%", "pass^1", "no"]
-    assert rows[3].split()[:3] == ["broken-d", "-", "-"], "it never loaded: no category"
+    assert rows[3].split()[:3] == ["broken-d", "Planning", "-"], "the category its file states"
     assert "error: " in rows[3] and "NOPE_SKILL is not set" in rows[3]
     [suite_dir] = sorted(runs.glob("suite-*"))
     suite = SuiteReport.load(suite_dir / "suite.json")
@@ -288,6 +402,24 @@ def test_the_configured_suite_runs_into_runs_dir_with_a_pass_k_table(
     assert sorted(p.stem for p in (run_dir / "transcripts").glob("*.jsonl")) == [
         "happy-dry-run-guided-0"
     ], "modes: [guided] in config.yaml drops the free run"
+
+
+def test_a_category_filter_reports_a_broken_scenario_of_that_category_and_fails(
+    suite_setup: Path, skill: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """plan-c passes, but broken-d (category Planning in its file) cannot load: the filtered
+    suite must not go green by leaving it out."""
+    code = runner.run_suite(skill=skill, dry_run=True, categories=["Plan*"])
+    out = capsys.readouterr().out
+    assert code == 1
+    table = out[out.index("scenario  ") :].splitlines()
+    assert [row.split()[0] for row in table[1:3]] == ["broken-d", "plan-c"]
+    assert "NOPE_SKILL is not set" in table[1]
+    assert table[2].split()[:6] == ["plan-c", "Planning", "1/1", "100%", "pass^1", "yes"]
+    [suite_dir] = sorted((suite_setup / "runs" / "sim").glob("suite-*"))
+    suite = SuiteReport.load(suite_dir / "suite.json")
+    assert [e.scenario for e in suite.errors] == ["broken-d"]
+    assert [s.scenario for s in suite.scenarios] == ["plan-c"]
 
 
 def test_a_suite_over_a_directory_still_works_and_the_command_line_wins(
