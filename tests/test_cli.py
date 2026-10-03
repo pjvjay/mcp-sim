@@ -132,7 +132,7 @@ def test_parser_has_every_subcommand() -> None:
     parser = build_parser()
     sub = next(a for a in parser._actions if a.dest == "command")
     assert set(sub.choices) == {  # type: ignore[union-attr]
-        "catalog", "plan", "run", "judge", "report", "suite", "config"
+        "catalog", "plan", "run", "judge", "report", "suite", "config", "ui"
     }
 
 

@@ -446,6 +446,7 @@ mcpsim suite   [scenario_dir] [--skill DIR] [--name GLOB]... [--category GLOB]..
                           [--repeat N] [--modes guided,free] [--list [--json]]
                           [--threshold 1.0] [--dry-run] [--models ...] [--allow-same-judge]
 mcpsim config  [--skill DIR] [--scenario NAME|FILE] [--json]
+mcpsim ui      [--skill DIR] [--host 127.0.0.1] [--port 8765] [--runs DIR]   local test runner
 ```
 
 `suite` runs every scenario of the skill's `config.yaml` (or of `scenario_dir`), one after
@@ -457,6 +458,10 @@ server) is reported in the table and in `suite.json`'s `errors`, the others stil
 suite exits 1. `config` prints every role's model and the layer it came from, its settings and
 prompts, the run settings, the scenario sources and `runs_dir`; `--scenario` resolves for one
 scenario (its overrides included), `--json` prints the same as data.
+
+`mcpsim ui` is a local test runner over the scenario files and run directories: scenarios by
+category with their status, search, run all / one / re-run, run history, the conversation with
+its tool calls, and the judge's per-item verdicts. See [docs/RUNNER_UI.md](docs/RUNNER_UI.md).
 
 `run`, `judge`, `report` and `suite` exit 0 when the overall pass rate reaches `--threshold`
 (a threshold of 0.8 with 4 of 5 runs passing is on the boundary and passes), 1 otherwise, and 1
