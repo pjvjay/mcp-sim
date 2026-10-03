@@ -98,6 +98,44 @@ flowchart LR
   prohibiting instruction (at most three) and kept only when the prohibiting clause names the
   tool and the happy path does not call it. No two paths have identical steps; `plan.json`
   `notes` record every call's tokens and seconds and everything dropped or skipped.
+
+The flowchart below shows how a plan is made under each profile. The hosted planner drafts every
+path in one forced call and is re-asked once when the plan is invalid. Under the local profile
+the model plans the tool execution and answers the policy questions, while the framework reviews
+that answer, builds the happy path and grounds one variant in a live probe. The module docstring
+of `mcpsim/execution_planner.py` and LOCAL_MODELS.md "The execution planner" have the detail,
+and a local plan's `plan.json` `notes` show what one planning run did.
+
+```mermaid
+flowchart TD
+  A{"planner_profile:<br/>an ollama: planner?"}
+  A -->|"no: hosted Claude"| H["One forced emit_execution_plan call<br/>drafts every path, one re-ask"]
+  A -->|"yes: local"| L1["Constrained tool_execution_plan call:<br/>steps + answer_fields lineage"]
+  L1 --> RV["Review arguments and lineage against<br/>the schemas and the scout's result"]
+  RV --> D{"Problems?"}
+  D -->|"after call 1"| RA["Re-ask once, listing the problems"]
+  RA --> RV
+  D -->|"none"| HP["Framework builds the happy path<br/>with derived checkpoints"]
+  D -->|"after the re-ask"| SV["Salvage the last parsed answer:<br/>repair or drop what is still wrong"]
+  SV --> HP
+  SV -->|"none parsed or no tool step left"| E["PlanError"]
+  H -->|"still invalid"| E
+  HP --> CP["Pick the first read-only, free happy step<br/>that stays inside the server"]
+  CP --> PR["Re-send it once on the scout's session<br/>with one argument mutated"]
+  PR -->|"error"| REC["Recovery path: mutated call inserted,<br/>a checkpoint quotes the error"]
+  PR -->|"answer"| BND["Boundary path: mutated call inserted,<br/>checkpoints state what came back"]
+  CP -->|"no probe"| POL["One enum question per prohibiting<br/>instruction, at most 3: which tool?"]
+  PR -->|"call fails or budget spent"| POL
+  REC --> POL
+  BND --> POL
+  POL --> PP["Policy path per tool the clause names<br/>and the happy path does not call"]
+  PP --> DV["Drop paths with identical steps or<br/>failing validation, noting each drop"]
+  POL -->|"no tool kept"| DV
+  DV -->|"happy path invalid"| E
+  DV --> OUT["ExecutionPlan"]
+  H --> OUT
+```
+
 * **Executor** (`mcpsim/agent.py`, `mcpsim/runner.py`). The agent under test is a standard
   Anthropic tool-use loop whose `tools` are the catalog's tool schemas, executing each
   `tool_use` through the MCP `ClientSession` and returning the result as `tool_result`
@@ -155,6 +193,43 @@ flowchart LR
      says which layer failed. Observer `flag` effects that did not fail land in `Verdict.flags`
      and join `failure_reasons` only when the votes fail. The judge's token usage and estimated
      cost are recorded on the verdict (`judge_usage`, `judge_cost_usd`).
+
+The flowchart below shows how one run's verdict is decided (`judge` and `build_verdict` in
+`mcpsim/judge.py`): the layer-1 checks and a run that did not complete are hard gates no vote
+can overturn, and a malformed vote counts as a failed one. §4 details the matcher's operators
+and §2b the observers' `fail` effects.
+
+```mermaid
+flowchart TD
+  T["one transcript + scenario + planned path"]
+  subgraph HG["hard gates, in this order: no vote overturns them"]
+    M["matcher on final_result<br/>vs expected_outcome.json"] --> S["scope violations<br/>(tool not allowed or not disclosed)"]
+    S --> O["observer fail effects"]
+    O --> R["run outcome not completed<br/>(budget_exceeded or error)"]
+  end
+  subgraph LV["judge_votes independent LLM votes, default 3"]
+    V["one forced record_verdict call"] --> P{"well-formed record_verdict input,<br/>item numbers in range, none repeated?"}
+    P -- yes --> G["each expected behaviour by item number<br/>(a number left out fails as omitted),<br/>goal_achieved, honesty, sop_followed if a skill:<br/>pass or fail, turn-numbered quote or no evidence<br/>plus overall passed and score"]
+    P -- no --> MV["malformed vote:<br/>every item failed, passed false, score 0"]
+    G --> VP{"says passed and none<br/>of its items failed?"}
+    MV --> VP
+  end
+  T --> M
+  T --> V
+  M -->|results shown in the prompt| V
+  R --> H{"any hard-gate failure?"}
+  H -- yes --> FL["passed = false"]
+  H -- no --> MAJ{"majority of votes pass?<br/>a tie fails"}
+  VP -->|each vote counted| MAJ
+  MAJ -- no --> FL
+  MAJ -- yes --> PS["passed = true"]
+  G --> IM["per item: majority of votes, first agreeing quote<br/>score: mean of vote scores"]
+  MV --> IM
+  FL --> VER
+  PS --> VER
+  IM --> VER["Verdict: passed, score, matches, checklist,<br/>goal_achieved, sop_followed,<br/>failure_reasons (hard gates first), flags, votes"]
+```
+
 * **Runner** (`mcpsim/runner.py`). `scout → plan → runs → judge → report`, with every artefact on
   disk under `runs/<scenario>/<timestamp>/`: `scout.json` (§2b; when disclosure is not `all`),
   `plan.json`, `transcripts/<path>-<mode>-<i>.jsonl`, `verdicts/<same>.json`, `report.json`,
@@ -175,6 +250,57 @@ flowchart LR
   code), `config` (the skill's resolved roles, models, prompts and run settings), `catalog`
   (print what the server exposes — useful on its own). `plan`, `run`, `judge`, `suite` and
   `config` take `--skill DIR` (§2c).
+
+The sequence below follows one run (one path, one mode, one repeat) and the judging of its
+transcript. Runner is the framework's own code (`mcpsim/runner.py`, the executor loop in
+`mcpsim/agent.py`, the matcher) and relays every message, so no model talks to another directly;
+§2b gives the observers' triggers and effects, and §3 "Who sees what" lists what each role is
+told.
+
+```mermaid
+sequenceDiagram
+  participant R as Runner
+  participant U as Simulated user
+  participant A as Agent under test
+  participant M as MCP server
+  participant O as Observers
+  participant J as Judge
+  Note over R,M: one path, one mode, one repeat, on its own MCP session
+  R->>U: user_instructions, context, language rule, opening cue
+  Note over U: never the agent instructions, SOP, notes,<br/>expected behaviour or expected outcome
+  U-->>R: opening message in the voice of the person
+  loop each agent turn, until final answer, budget or error
+    R->>A: role, goal, instructions, SOP and notes if set<br/>context if agent_visible, steps if guided mode<br/>goals observers enabled, answer contract<br/>the conversation so far and the offered tools
+    Note over A: never user_instructions, expected behaviour<br/>or the expected outcome prose
+    A-->>R: text, tool_use blocks or both
+    opt observers declared on the turn trigger
+      R->>O: the transcript slices each one watches
+      O-->>R: informant reports
+    end
+    Note over R: after every report batch the reports are recorded first,<br/>then effects of changed conditions, tools, goals, flag, fail
+    alt tool_use blocks
+      Note over R: a tool not offered is refused and discover_tools<br/>is answered here, neither reaches the server
+      R->>M: call_tool for each offered server tool
+      M-->>R: result, sent to the agent as tool_result next turn
+      opt observers declared on the tool_result trigger
+        R->>O: the transcript slices each one watches
+        O-->>R: informant reports
+      end
+    else no tool_use, a final_result block
+      opt observers declared on the end trigger
+        R->>O: the transcript slices each one watches
+        O-->>R: informant reports
+      end
+    else text only
+      R->>U: the agent text
+      U-->>R: in-character reply, sent to the agent next turn
+    end
+  end
+  Note over R: run ends completed, budget_exceeded or error<br/>transcript saved as JSONL, then the matcher<br/>checks final_result against expected_outcome.json
+  R->>J: transcript, expected behaviour, expected outcome<br/>SOP and notes, plan checkpoints, informant reports<br/>matcher results, user brief as context only
+  J-->>R: one record_verdict vote per call, judge_votes calls
+  Note over R: verdict passes on a vote majority, but a matcher,<br/>scope or observer failure or a run not completed fails it
+```
 
 ### 2c. The simulate skill: roles, prompts and configuration
 
@@ -237,6 +363,41 @@ skills/simulate/
   that actually ran, with the prompts of the skill it is given. `temperature` is sent only when
   a role file sets one, and refused at resolution when the role's resolved model rejects
   sampling parameters (Claude Opus 4.7+, Opus 5.x, Sonnet 5.x, Fable, Mythos answer 400).
+
+The flowchart below pictures the resolution described above: where the skill directory comes
+from, then both ladders with the lowest layer at the top, each layer replacing the one below
+only for the values it sets. `mcpsim config` prints what resolved and from which layer; the code
+is `skill_dir`, `Skill.resolve_models`, `Skill.resolve_run` and `Skill.apply` in
+`mcpsim/skill.py`.
+
+```mermaid
+flowchart TD
+  A["--skill DIR"] -->|if given| D["skill directory: SKILL.md, config.yaml, roles"]
+  A -->|else| B["MCPSIM_SKILL"]
+  B -->|if set| D
+  B -->|else| C["packaged copy: mcpsim/_skills/simulate,<br/>else the checkout skills/simulate"]
+  C --> D
+  subgraph MOD["Model per role, lowest to highest"]
+    M1["built-in DEFAULT_MODELS"] -->|always set| M2["role file frontmatter provider:model"]
+    M2 -->|if set| M3["config.yaml defaults, empty as shipped"]
+    M3 -->|if set| M4["matching config.yaml overrides: models<br/>in file order, later wins"]
+    M4 -->|if set| M5["models set in the scenario file<br/>Models.explicit"]
+    M5 -->|if set| M6["CLI --models role=provider:model"]
+  end
+  subgraph RUN["Run settings, lowest to highest"]
+    R1["built-in Scenario defaults: repeat 3,<br/>judge_votes 3, concurrency 4, both modes"] -->|if set| R2["roles/judge.md votes, judge_votes only"]
+    R2 -->|if set| R3["config.yaml run: repeat 1,<br/>modes free, concurrency 2"]
+    R3 -->|if set| R4["matching config.yaml overrides: run<br/>in file order, later wins"]
+    R4 -->|if set| R5["repeat, judge_votes, concurrency<br/>set in the scenario file"]
+    R5 -->|if set| R6["CLI --repeat, --mode or --modes"]
+  end
+  D -->|each model role| M1
+  D -->|"repeat, modes, judge_votes, concurrency"| R1
+  M6 --> S["Skill.apply: resolved scenario,<br/>modes kept in Resolved"]
+  R6 --> S
+  S --> J["runner writes scenario.json: models,<br/>repeat, judge_votes, concurrency"]
+```
+
 * **Scenario sources.** `config.yaml` `scenarios` lists directories, globs and files, relative
   to the directory mcpsim runs in; `$NAME`, `${NAME}` and `${NAME:-default}` read the
   environment, and an entry whose variable is unset (with no default) is skipped with a note.
