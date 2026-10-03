@@ -1,0 +1,63 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mcpsim"
+version = "0.1.0"
+description = "LLM-as-a-judge simulations for MCP servers: role, goal, instructions, expected outcome."
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.12"
+dependencies = [
+  "anthropic>=0.122",
+  "mcp>=2.0",
+  "pydantic>=2.9",
+  "pyyaml>=6",
+  "httpx>=0.28",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8",
+  "pytest-asyncio>=0.24",
+  "ruff>=0.7",
+  "mypy>=1.13",
+  "types-PyYAML",
+]
+
+[project.scripts]
+mcpsim = "mcpsim.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["mcpsim*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "UP", "B"]
+
+[tool.mypy]
+python_version = "3.12"
+packages = ["mcpsim"]
+warn_unused_ignores = true
+warn_redundant_casts = true
+check_untyped_defs = true
+disallow_untyped_defs = true
+no_implicit_optional = true
+
+[[tool.mypy.overrides]]
+module = ["mcp.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+markers = [
+  "integration: needs ANTHROPIC_API_KEY and a live pantry server; skipped in CI",
+]
+filterwarnings = [
+  "ignore:Field name \"json\" in \"ExpectedOutcome\" shadows an attribute:UserWarning",
+]

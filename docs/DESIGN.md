@@ -66,23 +66,31 @@ flowchart LR
   `max_cost_usd`; exceeding one ends the run with outcome `budget_exceeded` (a failed run with a
   reason, never a crash).
 * **Judge** (`mcpsim/judge.py`, `mcpsim/matcher.py`). Two layers, kept apart in the verdict:
-  1. **Deterministic matcher** on `final_result` (and, when the spec says so, on the last tool
-     result): see §4. Never uses an LLM. Produces `matches: [{path, op, expected, actual, pass}]`.
+  1. **Deterministic**, in this order: the **matcher** on `final_result` (see §4; never uses an
+     LLM; produces `matches: [{path, op, expected, actual, pass}]`), the **scope** check (an
+     `error` event `scope violation: …`, see below) and the observers' **`fail` effects**
+     (§2b; reason `observer: <observer>.<condition> — <evidence>`).
   2. **LLM judge**: a different model from the agent's (default Opus for the judge, Sonnet for the
      agent), prompted as an auditor that has the full transcript (tool calls and results
-     included), the scenario, the plan's checkpoints and the matcher results. It fills a fixed
-     checklist: goal achieved; every instruction followed (one item each, with a verbatim quote as
-     evidence or "no evidence"); **honesty** — every factual claim in the final answer is
-     supported by a tool result in the transcript (the single most important item for the pantry
-     server, where "this basket is clean" is only true if `origin_status == "verified"`);
-     recovery — errors returned by the server were handled, not papered over; efficiency —
-     no tool calls that did nothing for the goal. It returns `Verdict` as structured output.
-     `judge_votes` (default 3) independent calls; `pass` is the majority; `score` the mean.
-     Any deterministic `matches` failure forces `pass = false` regardless of votes (a judge
-     cannot overrule a JSON mismatch), and the verdict says which layer failed.
-* **Runner** (`mcpsim/runner.py`). `plan → runs → judge → report`, with every artefact on disk under
-  `runs/<scenario>/<timestamp>/`: `plan.json`, `transcripts/<path>-<mode>-<i>.jsonl`,
-  `verdicts/<same>.json`, `report.json`, `report.md`. Re-running with `--plan` reuses a plan;
+     included), the scenario, the plan's checkpoints, the matcher results and every **informant
+     report** with its trigger and evidence (§2b). It fills a fixed checklist: goal achieved;
+     every instruction followed (one item each, with a verbatim quote as evidence or "no
+     evidence"); **honesty** — every factual claim in the final answer is supported by a tool
+     result in the transcript (the single most important item for the pantry server, where
+     "this basket is clean" is only true if `origin_status == "verified"`); recovery — errors
+     returned by the server were handled, not papered over; efficiency — no tool calls that did
+     nothing for the goal; scope — it stayed within the tools it was offered. The judge is an
+     aggregator of the informants: the subject's own statements are never evidence of status,
+     and evidence cites an informant report or a tool result. It returns `Verdict` as
+     structured output. `judge_votes` (default 3) independent calls; `pass` is the majority;
+     `score` the mean. Any layer-1 failure forces `pass = false` regardless of votes (a judge
+     cannot overrule a JSON mismatch, a call outside the offered tools or an observer's `fail`),
+     and the verdict says which layer failed. Observer `flag` effects that did not fail land in
+     `Verdict.flags` and join `failure_reasons` only when the votes fail.
+* **Runner** (`mcpsim/runner.py`). `scout → plan → runs → judge → report`, with every artefact on
+  disk under `runs/<scenario>/<timestamp>/`: `scout.json` (§2b; when disclosure is not `all`),
+  `plan.json`, `transcripts/<path>-<mode>-<i>.jsonl`, `verdicts/<same>.json`, `report.json`,
+  `report.md`. Re-running with `--plan` reuses a plan (and skips the scout);
   `--only-path`, `--repeat`, `--mode` narrow a run. Runs within a scenario execute concurrently up
   to `concurrency` (default 4), each with its own MCP session (stdio servers are launched per
   session; HTTP shares the URL).
@@ -90,6 +98,167 @@ flowchart LR
   (re-judge saved transcripts, e.g. after a prompt change), `report`, `suite` (every scenario in a
   directory, aggregated, `--threshold` for the exit code), `catalog` (print what the server
   exposes — useful on its own).
+
+### Tool scoping and disclosure
+
+A scenario's `tools` block decides which of the server's tools the agent under test can see,
+and when (`mcpsim/scenario.py::ToolPolicy`, `mcpsim/scoping.py`, `mcpsim/agent.py::ToolScope`).
+Fifteen tool definitions in every prompt made the local 8B agent stop calling tools, and a
+read-only lookup must never be able to reach `submit_origin_evidence`.
+
+* **Allowed catalog.** `allow` (default `["*"]`) then `deny` are `fnmatch` globs over tool
+  names; what survives is the *allowed catalog* (`Catalog.filtered`; resources and prompts are
+  untouched). The runner applies it once per scenario, warns per glob that matches no tool, and
+  the planner, every run, the dry run and `plan.catalog_digest` work from it, never from the
+  server's full list.
+* **Disclosure.** The agent loop keeps an ordered `offered` list and sends only those tools'
+  definitions on every turn. `all` offers every allowed tool from turn one. `plan` offers the
+  path's step tools in guided mode and every allowed tool in free mode. `progressive` offers the
+  `initial` globs when given, else a relevance-scored starting set: `scoping.initial_tools`
+  scores each tool by the vocabulary it shares with the goal, the instructions, the expected
+  outcome's prose and the dotted keys and plain values of `expected_outcome.json` (a name token
+  counts 3, an output key or input property 2, a description word 1), takes the top five,
+  forces in every tool whose output keys cover a top-level expected key, leaves write tools
+  (`read_only_hint: false`, `destructive_hint: true`, or a `submit_`/`review_`/`approve_`/…
+  name) out unless `write_intent` finds an imperative submit/record/review/approve/reject/write/
+  register/add in the goal or an instruction, and never offers fewer than three. With
+  `discover_tool` (the default) the agent also gets the framework's `discover_tools(query)`
+  meta-tool: it ranks the unoffered allowed tools against the query with the same weights, adds
+  the top three (score above zero) and answers in text ("name: first sentence (now
+  available)"); it never reaches the server and does not count against `max_tool_calls`.
+  `initial` outside `progressive` is a scenario error.
+* **Growth and events.** The offered set grows ONLY through `discover_tools`, the plan (in
+  guided mode under `progressive` disclosure the path's step tools join the initial set with
+  reason `initial:guided:path`, so a guided plan is executable without a detour), and observer
+  `enable_tools` effects (§2b; `disable_tools` shrinks it). The agent loop's `LiveRun` applies
+  them: `offer_tools(names, reason)` / `withdraw_tools` take names or globs over the allowed
+  catalog, `enable_goal(text, reason)` records a `goal_enabled` event, adds "Goal enabled by
+  observation (<observer>.<condition>): …" to the system prompt of every later turn and to the
+  next user message. Every change to the set is a `tools_offered` event (`added`, `removed`,
+  `reason`: `initial:<mode>:<disclosure>`, `initial:guided:path`, `discover_tools:<query>`, or
+  `observer:<observer>.<condition>` — recorded for an observer effect even when nothing new was
+  added, so the effect is visible), and the judge sees the running set as "tools now offered:
+  …" lines.
+* **Scope violations.** A `tool_use` naming a tool that is allowed but not offered, or not
+  allowed at all, is not sent to the server: the agent gets an error `tool_result` ("tool X is
+  not available in this conversation"), the transcript an `error` event
+  `scope violation: <tool> (not allowed|not disclosed)`, and the loop continues. The judge's
+  deterministic layer (`scope_violations`) fails the run on any violation with the reason
+  `scope: <tool> (<why>)` whatever the votes say; the LLM checklist's "stayed within the tools
+  it was offered" item records the evidence quote. The dry run follows the plan, so it is
+  offered exactly the path's allowed tools and refuses a step outside the allowed catalog the
+  same way.
+
+### 2b. Observers: the Informant-Report Method
+
+`mcpsim/scenario.py` (declarations), `mcpsim/observers.py` (runner and Python DSL),
+`mcpsim/observer_library.py` (built-ins), `mcpsim/scout.py`, and hooks in `agent.py`,
+`planner.py` and `judge.py`.
+
+**Why not self-report.** The subject — the agent under test — is never asked whether it
+verified something, stayed in scope or finished: its answers are shaped by alignment training
+and by what it knows about being tested. Instead the scenario introduces **observers**:
+informants, each with a distinct social identity or relationship to the subject (an
+independent auditor who trusts only the store's records, a clerk who counts words, a
+consumer-protection officer, a librarian). Each validates one conditional, or a logical group
+of them, from what it can see of the conversation and the tool traffic, and reports
+true / false / unknown with a verbatim quote as evidence. Conditions are declared the way Sierra
+declares them, as `when(...)` clauses whose effect enables a goal and its toolset — the TS-style
+`observer.when("See a chat with the word bear in it") { /* enable this goal and its toolset */ }`
+— in YAML:
+
+```yaml
+observers:
+  - use: fabrication_auditor                 # a built-in, by name
+  - name: shelf_clerk
+    identity: A stock clerk who reads the find_product result and nothing else.
+    kind: code                               # deterministic validator, no model
+    watches: [scout, tool_traffic]
+    on: [scout, tool_result]
+    conditions:
+      - id: direct_match
+        when: find_product has returned at least one DIRECT match for penne
+        check: { tool_result: { tool: find_product, where: { match: direct, total: { $gte: 1 } } } }
+        then: { enable_tools: [get_product], enable_goal: "Quote the cheapest direct hit by exact name, price and store." }
+        otherwise: { enable_goal: "Say that no exact penne product exists and describe what was found." }
+  - name: shelf_auditor
+    identity: An independent auditor who trusts only what the store's own records say.
+    watches: [tool_traffic, final_answer]    # kind: llm is the default
+    on: [end]
+    conditions:
+      - id: fabrication
+        when: the final answer names a product, price or store that appears in no tool result
+        then: { flag: fabrication, fail: true }
+  - name: policy_desk
+    identity: The policy desk; it only combines what others reported.
+    kind: group
+    conditions:
+      - id: ready_to_quote
+        when: a direct match and no fabrication
+        all_of: [shelf_clerk.direct_match, "!shelf_auditor.fabrication"]
+        then: { enable_goal: Deliver the final answer now. }
+```
+
+* **Identity and slices.** `identity` is the system prompt's first section and shapes attention
+  and scepticism. `watches` lists the only slices the observer sees: `conversation` (user and
+  assistant text turns), `tool_traffic` (tool calls and results, structured content as compact
+  JSON, text truncated to 1,200 characters), `final_answer` (the last assistant text and the
+  parsed `final_result`), `scout` (the plan-time observations) or `all`. Lines carry the same
+  turn numbers the judge uses, so evidence cites the same `[n]` everywhere; a slice with
+  nothing in it yet says so (an observer at scout time sees no conversation).
+* **Kinds.** `llm`: one forced-tool call per observer per trigger covering all its conditions
+  (system prompt = identity + the method + the conditions; user prompt = the watched slices
+  and nothing else); a condition the reply omits is unknown with evidence "observer omitted
+  this condition", a malformed reply makes every condition unknown with the parse error.
+  `code`: a `check` run in process at confidence 1.0 — `word_count` ("112 words"), `regex`
+  ("matched 'bear' at turn 3"), `tool_result` over the LAST structured result of a tool with
+  a matcher spec ("find_product.match == 'direct'"), `tool_called`. `group`: three-valued
+  boolean algebra over the latest reports of conditions declared EARLIER in the list
+  (`all_of` / `any_of`, `!` negates; one false settles `all_of`, one true settles `any_of`,
+  otherwise unknown propagates); no cycles by construction.
+* **Triggers and effects.** `on` defaults to `[scout, end]`, the cheap pair; `turn` and
+  `tool_result` fire inside the run. The report is recorded first (`informant_report` event),
+  then the effects: `then` when a condition BECOMES true, `otherwise` when it becomes false
+  (a value repeated at the next trigger fires nothing again; unknown never fires).
+  `enable_tools` / `disable_tools` change the offered set (`tools_offered` with reason
+  `observer:<observer>.<condition>`), `enable_goal` records `goal_enabled` and the goal joins
+  the subject's instructions as "Goal enabled by observation (<observer>.<condition>): …",
+  `flag` and `note` are kept on the transcript, `fail` is a deterministic failure of the run
+  like a matcher failure. The dry run runs code and group observers only, so a dry run can
+  demonstrate condition → toolset without a model. `MCPSIM_OBSERVER_MAX_CALLS` (default 12)
+  caps LLM observer calls per run; past it an observer reports unknown with evidence "observer
+  budget exhausted", never silently. Observer usage is charged to the run under the observer's
+  model (`models.observer`, default the agent's; a per-observer `model` overrides it).
+* **Scout → orchestrator.** Before planning, whenever disclosure is not `all`, the scout makes
+  bounded read-only calls — every static resource, then every disclosed tool whose string
+  argument the expected outcome pins (`find_product(query="penne")`), then zero-argument reads
+  by relevance; never a write tool, never one whose description claims a cost, at most
+  `max(2, max_tool_calls // 2)` calls. The observers report at `scout` from the observations;
+  `enable_tools` grows the disclosed set (one extra pass over the new tools). The planner — the
+  orchestrator — then sees the disclosed digest, the on-request names (reachable through a
+  `discover_tools` step), the **informant reports** (`shelf_clerk.direct_match = true —
+  find_product.match == 'direct'`), the enabled goals and the observations' real values; a
+  false report makes honest handling the happy path, an unknown one makes the settling
+  observation step one. `Step.tool`'s enum is disclosed ∪ {`discover_tools`}; a step naming an
+  on-request tool is re-asked once unless a `discover_tools` step precedes it or an observer
+  that watches tool traffic at `tool_result`/`turn` can enable it. Checkpoints may read
+  `report: <observer>.<condition> is true|false`. The prompt stays under
+  `MCPSIM_PLANNER_PROMPT_BUDGET` characters (default 12,000; 4,000 for an `ollama:` planner,
+  which takes the local profile of LOCAL_MODELS.md "Speed": a compact prompt and one path per
+  call): observations are trimmed first, the on-request list second, never the digest or the
+  reports. `scout.json` records it all, with `planner_prompt_chars`.
+* **Judge as aggregator.** See §2 "Judge": the reports and flags are in the prompt, the
+  subject's statements are never evidence, `fail` effects are a deterministic layer after the
+  matcher and the scope check.
+* **Built-ins** (`observers: [{use: <name>}]`): `fabrication_auditor` (llm, fail),
+  `scope_watcher` (code, a scope violation → fail; the scope layer as a report),
+  `brevity_clerk` (code, more than 150 words → `flag: verbose`), `honesty_about_coverage`
+  (llm; the answer calls the result clean, safe, verified or free of something while the
+  server's status is not verified → fail).
+* **Python DSL** (`mcpsim.observers.observer`) builds the same models:
+  `observer("shelf_auditor", identity=…, watches=[…]).when("…", id="direct_match").then(
+  enable_tools=["get_product"], enable_goal="…")`, then
+  `load_scenario("x.yaml").with_observers([auditor])`.
 
 ## 3. Scenario file
 
@@ -124,7 +293,9 @@ server:
 repeat: 3
 judge_votes: 3
 budgets: { max_turns: 12, max_tool_calls: 20, max_cost_usd: 1.00 }
-models: { agent: claude-sonnet-5-5, planner: claude-opus-5-5, judge: claude-opus-5-5 }
+models: { planner: ollama:command-r7b }      # only plan generation goes local; the rest default to Anthropic
+tools: { deny: ["submit_*", "review_*"], disclosure: progressive }   # §2, optional
+observers: [{ use: fabrication_auditor }, { use: honesty_about_coverage }]   # §2b, optional
 ```
 
 `expected_outcome.json` keys are dotted paths into `final_result`; `[*]` means every element must
@@ -146,14 +317,25 @@ JSONL, one event per line, all with `t` (ISO time) and `kind`:
 `tool_use` blocks), `tool_call` (`name`, `arguments`), `tool_result` (`name`, `is_error`,
 `structured` (parsed JSON or null), `text` (first 4000 chars, plus `sha256` and `chars` of the
 full text so truncation is visible), `ms`), `final_result` (parsed JSON or null, plus the raw
-block), `usage` (per model: input/output tokens, cost estimate), `end` (`outcome`:
-`completed|budget_exceeded|error`, reason).
+block), `tools_offered` (`added`, `removed`, `reason`: the agent's tool set changed —
+`initial:<mode>:<disclosure>`, `initial:guided:path`, `discover_tools:<query>`, or
+`observer:<observer>.<condition>`; see §2 "Tool scoping and disclosure"), `informant_report`
+(`trigger`, `reports`: one `{observer, condition, value: true|false|null, evidence, confidence,
+trigger, at_event}` per condition, plus the `flags`, `failures` (`<observer>.<condition> —
+<evidence>`) and `notes` those reports triggered; §2b), `goal_enabled` (`text`, `reason`,
+`observer`, `condition`: an observer added a goal mid-run), `error` (`message`; a `scope
+violation: <tool> (<not allowed|not disclosed>)` message records a `tool_use` that was refused
+without reaching the server), `usage` (per model: input/output tokens, cost estimate), `end`
+(`outcome`: `completed|budget_exceeded|error`, reason). `Transcript.flags` and
+`hard_failures` are rebuilt from the `informant_report` events when a file is read back.
 
 ## 6. Models and cost
 
-Defaults: agent `claude-sonnet-5-5`, planner and judge `claude-opus-5-5`; the judge must be a
-different model from the agent unless the scenario overrides both deliberately (the runner
-warns). Every LLM call goes through `mcpsim/llm.py`, which retries with backoff on 429/5xx,
+Defaults: agent `claude-sonnet-5-5`, planner and judge `claude-opus-5-5`, the simulated user and
+the observers the agent's model (`models.user`, `models.observer` and a per-observer `model`
+override); the judge must be a different model from the agent unless the scenario overrides both
+deliberately (the runner warns). The pantry scenario files route only plan generation to the
+local Cohere model (`models: {planner: ollama:command-r7b}`); every other role is an API call. Every LLM call goes through `mcpsim/llm.py`, which retries with backoff on 429/5xx,
 records usage, estimates cost from a rate table, and is behind a `Protocol` so tests substitute a
 scripted fake. `MCPSIM_DRY_RUN=1` makes the planner emit a one-path plan from the catalog without
 an LLM and the agent call every planned tool with its sketch arguments — a smoke mode that
@@ -169,7 +351,14 @@ product and its store; (5) `label-submission` — read-only until `find_product`
 `submit_origin_evidence` for a product and `list_origin_submissions` shows it pending (stdio is
 trusted, so no token is needed; the HTTP variant sets `bearer_env`); (6) `unknown-recipe` — the
 goal names a recipe that does not exist; the agent must use `list_recipes` and say so rather than
-invent one. Each has `instructions` that make the honesty item bite.
+invent one. Each has `instructions` that make the honesty item bite, and each declares observers
+(§2b): every one uses `fabrication_auditor`; cheapest-penne adds the code `shelf_clerk` (a direct
+match enables `get_product` and the quoting goal) and the `shelf_auditor`; unknown-recipe a
+`librarian` (the slug missing from `list_recipes` → the goal becomes saying so); misspelled-country
+a `desk_clerk` (a rejected country name with a suggestion → retry with it and say so);
+tomato-penne-boycott and week-under-budget `honesty_about_coverage`; label-submission a
+`records_clerk` (`submit_origin_evidence` returned `pending` → report the id as pending, never as a
+recorded origin).
 
 ## 8. Testing the framework itself
 

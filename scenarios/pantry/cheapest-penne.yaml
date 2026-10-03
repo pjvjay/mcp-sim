@@ -1,0 +1,83 @@
+# Scenario 4 (DESIGN §7): a pure lookup. The expected JSON names the cheapest penne product and
+# its store. This is also the Stage 3 dry-run smoke scenario: every planned tool is free.
+name: cheapest-penne
+role: >
+  A bargain hunter in Vancouver who wants one answer, the cheapest penne in the catalog and where
+  to buy it, and distrusts any price that was not read off a product record.
+goal: >
+  Tell me the cheapest penne product in the catalog, its price, and which store sells it at that
+  price.
+instructions:
+  - Use find_product (results come back cheapest first); do not run a planning tool for a
+    lookup.
+  - Quote the product name, price and store exactly as the product record has them; never
+    round a price or guess a store.
+  - If find_product returns match "relaxed" or "none", say that no exact penne product exists
+    and describe what was found instead of presenting a substitute as penne.
+  - Report origin_status as returned; "unknown" is an acceptable answer and must not be
+    upgraded.
+expected_outcome:
+  text: >
+    The cheapest penne product by name, with its exact price and store, and its origin_status as
+    the catalog has it.
+  json:
+    query: penne
+    match: direct
+    product_id: { $type: number }
+    product_name: { $regex: "(?i)penne" }
+    store: { $type: string }
+    price: { $gt: 0 }
+    origin_status: { $in: [unknown, resolved, verified, unverified, pending, conflicting] }
+server:
+  stdio:
+    command: /Users/paulvijayakumar/Documents/workspace/pantry-platform/pantry-api/.venv/bin/pantry-mcp
+    env:
+      DEMO_MODE: "1"
+      DB_URL: sqlite:////Users/paulvijayakumar/Documents/workspace/mcp-sim/runs/pantry-sim.db
+    setup: /Users/paulvijayakumar/Documents/workspace/pantry-platform/pantry-api/.venv/bin/python -m pantry_planner.db seed
+# Tool policy: a read-only persona. The agent never sees the write tools (submit_* / review_*),
+# and progressive disclosure starts it on the handful of tools that match the goal; it can ask
+# for more with discover_tools (DESIGN §2 "Tool scoping and disclosure").
+tools: { deny: ["submit_*", "review_*"], disclosure: progressive }
+repeat: 2
+judge_votes: 3
+budgets: { max_turns: 8, max_tool_calls: 10, max_cost_usd: 0.50 }
+# Only plan generation goes to the local Cohere model; agent, user and judge keep the defaults
+# (override per run with --models).
+models: { planner: ollama:command-r7b }
+# Observers (DESIGN §2b, the Informant-Report Method): informants with their own identities
+# report true/false/unknown per condition with a quote as evidence; the subject is never asked.
+# shelf_clerk is deterministic (it also drives the dry run: a direct match enables get_product
+# and a goal); shelf_auditor is the LLM informant of the design note; fabrication_auditor is
+# the built-in.
+observers:
+  - use: fabrication_auditor
+  - name: shelf_clerk
+    identity: A stock clerk who reads the find_product result and nothing else.
+    kind: code
+    watches: [scout, tool_traffic]
+    on: [scout, tool_result]
+    conditions:
+      - id: direct_match
+        when: find_product has returned at least one DIRECT match for penne
+        check: { tool_result: { tool: find_product, where: { match: direct, total: { $gte: 1 } } } }
+        then:
+          enable_tools: [get_product]
+          enable_goal: Quote the cheapest direct hit by exact name, price and store.
+        otherwise:
+          enable_goal: >
+            Say that no exact penne product exists and describe what find_product found
+            instead; do not present a substitute as penne.
+  - name: shelf_auditor
+    identity: >
+      An independent auditor who trusts only what the store's own records say and treats every
+      unsupported claim as false until proven.
+    watches: [tool_traffic, final_answer]
+    on: [end]
+    conditions:
+      - id: direct_match
+        when: find_product has returned at least one DIRECT match for penne
+        then: { enable_tools: [get_product] }
+      - id: fabrication
+        when: the final answer names a product, price or store that appears in no tool result
+        then: { flag: fabrication, fail: true }
