@@ -1,5 +1,6 @@
 """Background runs for the runner UI: one job runs its scenarios one after another, each as an
-``mcpsim run`` subprocess (contract D).
+``mcpsim run <file> --skill <dir> --out <runs_dir>`` subprocess (contract D), so a run from the
+page resolves its models, prompts and run settings exactly as the same command typed in a shell.
 
 A job lives in a daemon thread, so it behaves the same under uvicorn and under a test client
 whose event loop comes and goes. Output (stdout and stderr merged) goes to a bounded log; the
@@ -147,10 +148,20 @@ def parse_run_options(body: Mapping[str, Any]) -> RunOptions:
 
 
 def build_command(
-    prefix: Sequence[str], scenario_file: FsPath, runs_dir: FsPath, options: RunOptions
+    prefix: Sequence[str],
+    scenario_file: FsPath,
+    runs_dir: FsPath,
+    options: RunOptions,
+    skill_dir: FsPath | None = None,
 ) -> list[str]:
-    """The ``mcpsim run`` argument list for one scenario."""
-    cmd = [*prefix, "run", str(scenario_file), "--out", str(runs_dir)]
+    """The ``mcpsim run`` argument list for one scenario. The settings form maps to the
+    command line's layer: ``--models`` (top of the model precedence), ``--repeat``, ``--mode``
+    (one mode; both modes leave the choice to the skill and the scenario), ``--dry-run`` and
+    ``--allow-same-judge``."""
+    cmd = [*prefix, "run", str(scenario_file)]
+    if skill_dir is not None:
+        cmd += ["--skill", str(skill_dir)]
+    cmd += ["--out", str(runs_dir)]
     if options.models:
         cmd += ["--models", ",".join(f"{k}={v}" for k, v in sorted(options.models.items()))]
     if options.repeat is not None:
@@ -227,6 +238,7 @@ class JobManager:
         self,
         *,
         runs_dir: FsPath,
+        skill_dir: FsPath | None = None,
         command: Sequence[str] | None = None,
         env: Mapping[str, str] | None = None,
         cwd: FsPath | None = None,
@@ -234,6 +246,7 @@ class JobManager:
         output_drain_s: float = OUTPUT_DRAIN_S,
     ) -> None:
         self.runs_dir = runs_dir
+        self.skill_dir = skill_dir
         self.output_drain_s = output_drain_s
         self.command = list(command) if command else default_command()
         self.env_extra = dict(env or {})
@@ -382,7 +395,7 @@ class JobManager:
             job.process = None
 
     def _run_task(self, job: Job, task: ScenarioTask) -> None:
-        cmd = build_command(self.command, task.file, self.runs_dir, job.options)
+        cmd = build_command(self.command, task.file, self.runs_dir, job.options, self.skill_dir)
         env = {**os.environ, "PYTHONUNBUFFERED": "1", **self.env_extra}
         with self._lock:
             task.status = "running"

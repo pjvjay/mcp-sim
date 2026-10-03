@@ -1,53 +1,65 @@
-"""Scenario v2 fields for the runner UI, read with fallbacks (contract A).
+"""What the runner UI shows about a scenario, read through the scenario model (contract A).
 
-This is the one place the UI reads a scenario. It loads the file with
-:func:`mcpsim.scenario.load_scenario` and reads the v2 display fields (``category``, ``title``,
-``user_instructions``, ``context``, ``expected_behavior``, ``agent``) from the validated model
-when the model has them, else from the raw mapping, else from the documented defaults.
-
-The scenario model on this branch predates v2 and forbids unknown keys, so a v2 file fails
-``load_scenario``; :func:`load_scenario_file` then strips the v2 keys and validates the rest.
-Once the model carries the v2 fields the first attempt succeeds and the fallback goes unused,
-so switching to the real model means deleting the fallback, nothing else.
+A scenario file is loaded with :func:`mcpsim.scenario.load_scenario`, exactly as ``mcpsim run``
+loads it, so the UI calls a file valid only when the runner would run it (an ``agent.skill``
+whose ``env:`` variable is unset is an error here too). A run's ``scenario.json`` is validated
+the way the runner reads it back for a re-judge. The view's v2 fields come from the validated
+:class:`~mcpsim.scenario.Scenario`, defaults included (title, user instructions, expected
+behaviour). Only a file or snapshot that does not validate is read as plain YAML, and then just
+for display: its name, title, category and persona next to the error.
 """
 
 from __future__ import annotations
 
 import json
-import re
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
 from pathlib import Path as FsPath
 from typing import Any
 
 import yaml
+from pydantic import ValidationError
 
-from mcpsim import scenario as scenario_module
-from mcpsim.scenario import MODEL_ROLES, Scenario, ScenarioError, load_scenario, parse_scenario
-
-V2_KEYS: tuple[str, ...] = (
-    "category",
-    "title",
-    "user_instructions",
-    "context",
-    "expected_behavior",
-    "agent",
+from mcpsim.scenario import (
+    DEFAULT_CATEGORY,
+    Context,
+    Scenario,
+    ScenarioError,
+    default_title,
+    default_user_instructions,
+    load_scenario,
 )
-DEFAULT_CATEGORY = "Uncategorized"
-CONTEXT_KEYS: tuple[str, ...] = ("device", "location", "language")
 
 
 @dataclass
 class ScenarioContext:
+    """``context`` as text: an absent field is ``""`` and every ``details`` value a string (a
+    non-string value as compact JSON, as :meth:`mcpsim.scenario.Context.items` renders it)."""
+
     device: str = ""
     location: str = ""
     language: str = ""
     details: dict[str, str] = field(default_factory=dict)
     agent_visible: bool = False
 
+    @classmethod
+    def of(cls, context: Context) -> ScenarioContext:
+        pairs = context.items()
+        # items() lists the set fields among device / location / language first, then details.
+        fixed = sum(1 for v in (context.device, context.location, context.language) if v)
+        return cls(
+            device=(context.device or "").strip(),
+            location=(context.location or "").strip(),
+            language=(context.language or "").strip(),
+            details=dict(pairs[fixed:]),
+            agent_visible=context.agent_visible,
+        )
+
 
 @dataclass
 class ScenarioView:
-    """Everything the runner shows about one scenario; ``error`` is set for a file that failed."""
+    """Everything the runner shows about one scenario. ``error`` is set for a file that does
+    not validate; the other fields are then a best-effort reading of the raw file."""
 
     name: str
     file: str
@@ -60,7 +72,7 @@ class ScenarioView:
     expected_behavior_derived: bool = False
     agent_skill: str | None = None
     agent_notes: str | None = None
-    # Filled in a run's scenario.json once the runner has read the SOP (v2 model).
+    # The SOP as resolved when the scenario was validated (skill_text is the procedure itself).
     agent_skill_name: str | None = None
     agent_skill_path: str | None = None
     agent_skill_text: str | None = None
@@ -71,6 +83,8 @@ class ScenarioView:
     expected_outcome_json: dict[str, Any] | None = None
     repeat: int | None = None
     judge_votes: int | None = None
+    # The models the scenario file names itself (the "scenario file" layer of the precedence);
+    # for a run's scenario.json, every model the run used.
     models: dict[str, str] = field(default_factory=dict)
     server: str = ""
     tools: dict[str, Any] = field(default_factory=dict)
@@ -84,65 +98,8 @@ class ScenarioView:
         return " ".join([self.name, self.title, self.category, self.user_instructions]).lower()
 
 
-def derive_title(name: str) -> str:
-    """``cheapest-penne`` -> ``Cheapest penne`` (the scenario module's default when it has one)."""
-    core = getattr(scenario_module, "default_title", None)
-    if callable(core):
-        return str(core(name))
-    words = re.sub(r"[-_.]+", " ", name).strip()
-    return words[:1].upper() + words[1:] if words else name
-
-
-def derive_user_instructions(role: str, goal: str) -> str:
-    """The second-person default built from ``role`` and ``goal`` (contract A); the scenario
-    module's own default when it has one, else the same text."""
-    core = getattr(scenario_module, "default_user_instructions", None)
-    if callable(core):
-        return str(core(role, goal))
-    return (
-        f"You are this person: {role.strip()}\n\nWhat you want from the assistant: {goal.strip()}"
-    )
-
-
 def _text(value: Any) -> str:
-    if value is None:
-        return ""
-    if isinstance(value, str):
-        return value.strip()
-    if isinstance(value, bool | int | float):
-        return str(value)
-    return json.dumps(value, sort_keys=True, default=str)
-
-
-def _plain(value: Any) -> Any:
-    """A pydantic model (the future v2 model) as plain data; anything else unchanged."""
-    dump = getattr(value, "model_dump", None)
-    return dump(mode="json") if callable(dump) else value
-
-
-def _field(model: Scenario | None, raw: dict[str, Any], key: str) -> Any:
-    """The model's attribute when it has one (v2 model), else the raw mapping's key."""
-    if model is not None and hasattr(model, key):
-        value = _plain(getattr(model, key))
-        if value is not None:
-            return value
-    return raw.get(key)
-
-
-def read_context(value: Any) -> ScenarioContext:
-    if not isinstance(value, dict):
-        return ScenarioContext()
-    details_raw = value.get("details")
-    details: dict[str, str] = {}
-    if isinstance(details_raw, dict):
-        details = {str(k): _text(v) for k, v in details_raw.items()}
-    return ScenarioContext(
-        device=_text(value.get("device")),
-        location=_text(value.get("location")),
-        language=_text(value.get("language")),
-        details=details,
-        agent_visible=value.get("agent_visible") is True,
-    )
+    return value.strip() if isinstance(value, str) else ""
 
 
 def read_raw(path: FsPath) -> dict[str, Any] | None:
@@ -155,130 +112,107 @@ def read_raw(path: FsPath) -> dict[str, Any] | None:
     return data if isinstance(data, dict) else None
 
 
-def load_scenario_file(path: FsPath) -> tuple[Scenario | None, dict[str, Any], str | None]:
-    """``(model, raw mapping, error)``; the model is ``None`` exactly when ``error`` is set."""
-    raw = read_raw(path) or {}
-    try:
-        return load_scenario(path), raw, None
-    except ScenarioError as exc:
-        first_error = str(exc)
-    present = [k for k in V2_KEYS if k in raw]
-    if not present:
-        return None, raw, first_error
-    # Pre-v2 model: validate everything except the v2 display fields.
-    stripped = {k: v for k, v in raw.items() if k not in V2_KEYS}
-    try:
-        return parse_scenario(stripped, source=str(path)), raw, None
-    except ScenarioError as exc:
-        return None, raw, str(exc)
-
-
-def build_view(
-    raw: dict[str, Any],
-    *,
-    file: str,
-    model: Scenario | None = None,
-    error: str | None = None,
-    fallback_name: str = "",
+def view_from_scenario(
+    scenario: Scenario, *, file: str, raw: Mapping[str, Any] | None = None
 ) -> ScenarioView:
-    """A :class:`ScenarioView` from a validated model and/or a raw mapping."""
-    name = model.name if model is not None else _text(raw.get("name")) or fallback_name
-    role = model.role if model is not None else _text(raw.get("role"))
-    goal = model.goal if model is not None else _text(raw.get("goal"))
-    raw_instructions = model.instructions if model is not None else raw.get("instructions")
-    instructions = (
-        [_text(i) for i in raw_instructions if _text(i)]
-        if isinstance(raw_instructions, list)
-        else []
+    """The view of a validated scenario.
+
+    ``raw`` is the mapping the file holds: a v2 field the file leaves out is "derived" (the
+    model filled in its default), and ``models`` is what the file names. Without ``raw`` (a
+    run's ``scenario.json``, where the runner wrote every field) a value equal to its default
+    counts as derived, and ``models`` is every model the run used.
+    """
+    behaviors = scenario.behaviors
+    instructions = [item.strip() for item in scenario.instructions]
+    user_instructions = scenario.simulated_user_instructions
+    if raw is not None:
+        derived_ui = "user_instructions" not in raw
+        derived_eb = "expected_behavior" not in raw
+        models = scenario.models.explicit()
+    else:
+        derived_ui = user_instructions == default_user_instructions(scenario.role, scenario.goal)
+        derived_eb = behaviors == instructions
+        dumped = scenario.models.model_dump(mode="json")
+        models = {k: v for k, v in dumped.items() if isinstance(v, str) and v}
+    outcome = scenario.expected_outcome
+    agent = scenario.agent
+    return ScenarioView(
+        name=scenario.name,
+        file=file,
+        title=scenario.display_title,
+        category=scenario.category,
+        user_instructions=user_instructions,
+        user_instructions_derived=derived_ui,
+        context=ScenarioContext.of(scenario.context),
+        expected_behavior=behaviors,
+        expected_behavior_derived=derived_eb,
+        agent_skill=agent.skill,
+        agent_notes=agent.notes,
+        agent_skill_name=agent.skill_name,
+        agent_skill_path=agent.skill_path,
+        agent_skill_text=agent.skill_text,
+        role=scenario.role,
+        goal=scenario.goal,
+        instructions=instructions,
+        expected_outcome_text=outcome.text,
+        expected_outcome_json=dict(outcome.json) if outcome.json is not None else None,
+        repeat=scenario.repeat,
+        judge_votes=scenario.judge_votes,
+        models=models,
+        server=scenario.server.kind,
+        tools=scenario.tools.model_dump(mode="json", exclude_defaults=True),
+        observers=[o.name for o in scenario.observers],
     )
 
-    title = _text(_field(model, raw, "title")) or derive_title(name)
-    category = _text(_field(model, raw, "category")) or DEFAULT_CATEGORY
 
-    # "Derived" means the file does not say it: the v2 model fills these defaults itself, so
-    # whether the raw mapping has the key is what tells a default from a written value.
-    user_instructions = _text(_field(model, raw, "user_instructions"))
-    derived_ui = not _text(raw.get("user_instructions"))
-    if not user_instructions:
-        user_instructions = derive_user_instructions(role, goal)
-
-    behavior_raw = _field(model, raw, "expected_behavior")
-    behavior = (
-        [_text(i) for i in behavior_raw if _text(i)] if isinstance(behavior_raw, list) else []
-    )
-    raw_behavior = raw.get("expected_behavior")
-    derived_eb = not (isinstance(raw_behavior, list) and any(_text(i) for i in raw_behavior))
-    if not behavior:
-        behavior = list(instructions)
-
-    agent = _field(model, raw, "agent")
-    agent = agent if isinstance(agent, dict) else {}
-
-    outcome = raw.get("expected_outcome") if model is None else _plain(model.expected_outcome)
-    outcome = outcome if isinstance(outcome, dict) else {}
-    outcome_json = outcome.get("json")
-
-    models_raw = raw.get("models")
-    models = (
-        {k: _text(v) for k, v in models_raw.items() if k in MODEL_ROLES and _text(v)}
-        if isinstance(models_raw, dict)
-        else {}
-    )
-
-    server = ""
-    server_raw = raw.get("server")
-    if isinstance(server_raw, dict):
-        server = "stdio" if "stdio" in server_raw else "http" if "http" in server_raw else ""
-
-    tools_raw = raw.get("tools")
-    observers_raw = raw.get("observers")
-    observers: list[str] = []
-    if isinstance(observers_raw, list):
-        for entry in observers_raw:
-            if isinstance(entry, dict):
-                observers.append(_text(entry.get("name") or entry.get("use")))
-
-    def _int(key: str) -> int | None:
-        value = getattr(model, key, None) if model is not None else raw.get(key)
-        return value if isinstance(value, int) and not isinstance(value, bool) else None
-
+def view_from_invalid(
+    raw: Mapping[str, Any], *, file: str, error: str, fallback_name: str
+) -> ScenarioView:
+    """A file (or snapshot) that does not validate: its error, plus what the raw mapping says
+    about its name, title, category and persona, so the list can still place it."""
+    name = _text(raw.get("name")) or fallback_name
+    role, goal = _text(raw.get("role")), _text(raw.get("goal"))
+    instructions = raw.get("instructions")
     return ScenarioView(
         name=name,
         file=file,
-        title=title,
-        category=category,
-        user_instructions=user_instructions,
-        user_instructions_derived=derived_ui,
-        context=read_context(_field(model, raw, "context")),
-        expected_behavior=behavior,
-        expected_behavior_derived=derived_eb,
-        agent_skill=_text(agent.get("skill")) or None,
-        agent_notes=_text(agent.get("notes")) or None,
-        agent_skill_name=_text(agent.get("skill_name")) or None,
-        agent_skill_path=_text(agent.get("skill_path")) or None,
-        agent_skill_text=_text(agent.get("skill_text")) or None,
+        title=_text(raw.get("title")) or default_title(name),
+        category=_text(raw.get("category")) or DEFAULT_CATEGORY,
+        user_instructions=_text(raw.get("user_instructions"))
+        or (default_user_instructions(role, goal) if role and goal else ""),
         role=role,
         goal=goal,
-        instructions=instructions,
-        expected_outcome_text=_text(outcome.get("text")) or None,
-        expected_outcome_json=outcome_json if isinstance(outcome_json, dict) else None,
-        repeat=_int("repeat"),
-        judge_votes=_int("judge_votes"),
-        models=models,
-        server=server,
-        tools=tools_raw if isinstance(tools_raw, dict) else {},
-        observers=[o for o in observers if o],
+        instructions=(
+            [_text(i) for i in instructions if _text(i)] if isinstance(instructions, list) else []
+        ),
         error=error,
     )
 
 
-def scenario_view(path: FsPath, *, display_path: str | None = None) -> ScenarioView:
-    """Load one scenario file into a view; a broken file yields a view with ``error`` set."""
-    model, raw, error = load_scenario_file(path)
-    return build_view(
-        raw,
-        file=display_path or str(path),
-        model=model,
-        error=error,
-        fallback_name=path.stem,
-    )
+def load_view(
+    path: FsPath, *, display_path: str | None = None
+) -> tuple[ScenarioView, Scenario | None]:
+    """``(view, scenario)`` for one scenario file, loaded with
+    :func:`~mcpsim.scenario.load_scenario`; ``scenario`` is ``None`` when it does not load, and
+    the view then carries the loader's error."""
+    file = display_path or str(path)
+    raw = read_raw(path)
+    try:
+        scenario = load_scenario(path)
+    except (ScenarioError, ValueError, OSError) as exc:
+        message = str(exc).strip() or type(exc).__name__
+        view = view_from_invalid(raw or {}, file=file, error=message, fallback_name=path.stem)
+        return view, None
+    return view_from_scenario(scenario, file=file, raw=raw if raw is not None else {}), scenario
+
+
+def snapshot_view(data: Mapping[str, Any], *, fallback_name: str) -> ScenarioView:
+    """A run's ``scenario.json`` (the scenario as it ran: models and SOP resolved), validated
+    the way the runner reads it back for ``mcpsim judge``."""
+    try:
+        scenario = Scenario.model_validate(dict(data))
+    except (ValidationError, ValueError) as exc:
+        return view_from_invalid(
+            data, file="scenario.json", error=str(exc), fallback_name=fallback_name
+        )
+    return view_from_scenario(scenario, file="scenario.json")

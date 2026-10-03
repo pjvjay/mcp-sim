@@ -1,9 +1,10 @@
 """``mcpsim ui``: every endpoint, the refusals, the job lifecycle and an HTML smoke test.
 
-The fixture builds a scenario directory (a v1 file, a v2 file, a broken file), a runs directory
-shaped per contract B (judged runs, a plan-only run, a run whose report predates ``pass_k``)
-and a skill directory with ``config.yaml`` and role frontmatter. Jobs run ``tests/fake_mcpsim.py``
-instead of the real CLI.
+The fixture builds a scenario directory (a v1 file, a v2 file whose agent runs on an SOP, a
+broken file), a runs directory shaped per contract B (judged runs, a plan-only run, a run whose
+report predates ``pass_k``) and a copy of the simulate skill with its own ``config.yaml`` and
+role frontmatter, loaded by :func:`mcpsim.skill.load_skill`. Jobs run ``tests/fake_mcpsim.py``
+instead of the real CLI, except one test that runs the real ``mcpsim run --skill`` in dry run.
 """
 
 from __future__ import annotations
@@ -11,6 +12,8 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import re
+import shutil
 import signal
 import sys
 import time
@@ -23,7 +26,9 @@ import pytest
 import yaml
 from starlette.testclient import TestClient
 
-from mcpsim.cli import EXIT_USAGE, main
+from mcpsim.cli import EXIT_FAILURE, EXIT_USAGE, main
+from mcpsim.judge import HONESTY_ITEM
+from mcpsim.skill import CHECKOUT_DIR, SKILL_ENV, SkillError, load_skill
 from mcpsim.ui.app import (
     TOKEN_HEADER,
     UISettings,
@@ -34,8 +39,7 @@ from mcpsim.ui.app import (
     serve,
 )
 from mcpsim.ui.jobs import JobManager, RunOptions, build_command, parse_run_options
-from mcpsim.ui.skill_config import load_skill_config
-from tests.conftest import fake_server_stdio_spec
+from tests.conftest import REPO_ROOT, fake_server_stdio_spec
 
 TOKEN = "test-token-0123456789"
 BASE = "http://127.0.0.1:8765"
@@ -265,19 +269,34 @@ class Env:
     outside: Path
 
     def settings(self, **extra: Any) -> UISettings:
-        return UISettings(
-            runs_dir=self.runs,
-            scenario_sources=[str(self.scenarios)],
-            skill_dir=self.skill,
-            skill=load_skill_config(self.skill),
-            cwd=self.root,
-            bases=[self.root],
-            **extra,
-        )
+        """The scenario sources follow the skill's config.yaml unless ``extra`` names them."""
+        return UISettings(skill=load_skill(self.skill), runs_dir=self.runs, cwd=self.root, **extra)
+
+
+def set_frontmatter(path: Path, **values: Any) -> None:
+    """Set (or add) top-level frontmatter keys of a role file."""
+    text = path.read_text(encoding="utf-8")
+    head, body = text.split("\n---\n", 1)
+    for key, value in values.items():
+        line = f"{key}: {value}"
+        pattern = re.compile(rf"^{key}: .*$", re.MULTILINE)
+        head = pattern.sub(line, head) if pattern.search(head) else f"{head}\n{line}"
+    path.write_text(f"{head}\n---\n{body}", encoding="utf-8")
+
+
+@pytest.fixture(autouse=True)
+def _clean_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    for var in (SKILL_ENV, "MCPSIM_DRY_RUN", "MCPSIM_DEBUG"):
+        monkeypatch.delenv(var, raising=False)
 
 
 @pytest.fixture
-def env(tmp_path: Path) -> Env:
+def env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Env:
+    # The v2 scenario's agent runs on an SOP named through env:RECIPE_SHOPPER_SKILL.
+    sop = tmp_path / "sop" / "SKILL.md"
+    sop.parent.mkdir()
+    sop.write_text("---\nname: shop-sop\n---\n1. Look the product up before quoting it.\n")
+    monkeypatch.setenv("RECIPE_SHOPPER_SKILL", str(sop))
     scenarios = tmp_path / "scenarios"
     (scenarios / "nested").mkdir(parents=True)
     (scenarios / "fake-lookup.yaml").write_text(yaml.safe_dump(_scenario("fake-lookup")))
@@ -364,35 +383,29 @@ def env(tmp_path: Path) -> Env:
         scenario=_scenario("v2-shopper", **V2_EXTRA),
     )
 
+    # A copy of the real simulate skill with its own config.yaml and two frontmatter edits.
     skill = tmp_path / "skill"
-    (skill / "roles").mkdir(parents=True)
+    shutil.copytree(CHECKOUT_DIR, skill)
     (skill / "config.yaml").write_text(
         yaml.safe_dump(
             {
                 "roles_dir": "roles",
                 "defaults": {"planner": "anthropic:claude-sonnet-5-5"},
                 "run": {"repeat": 3, "modes": ["guided", "free"], "judge_votes": 3},
-                "scenarios": ["scenarios"],
+                "scenarios": ["scenarios", "scenarios/nested"],
                 "runs_dir": "runs",
                 "overrides": [
                     {
                         "match": {"category": "Shop*"},
                         "models": {"agent": "claude-haiku-4-5-20251001"},
+                        "run": {"modes": ["guided"]},
                     }
                 ],
             }
         )
     )
-    (skill / "roles" / "agent.md").write_text(
-        "---\nrole: agent\nprovider: anthropic\nmodel: claude-opus-5-5\ntemperature: 0.2\n"
-        "max_tokens: 4096\n---\nYou are {{ role }}.\n"
-    )
-    (skill / "roles" / "judge.md").write_text(
-        "---\nrole: judge\nprovider: anthropic\nmodel: claude-opus-5-5\nvotes: 3\n---\nJudge.\n"
-    )
-    (skill / "roles" / "planner-local.md").write_text(
-        "---\nrole: planner\nprovider: ollama\nmodel: command-r7b\n---\nPlan.\n"
-    )
+    set_frontmatter(skill / "roles" / "agent.md", model="claude-opus-5-5", max_tokens=2048)
+    set_frontmatter(skill / "roles" / "user.md", temperature=0.2)
     outside = tmp_path / "outside"
     outside.mkdir()
     (outside / "secret.jsonl").write_text('{"kind": "user", "text": "SECRET"}\n')
@@ -457,26 +470,86 @@ def test_token_is_random_per_process(env: Env) -> None:
 def test_config_resolves_roles_with_their_sources(client: TestClient, env: Env) -> None:
     data = client.get("/api/config").json()
     roles = {r["role"]: r for r in data["roles"]}
-    assert list(roles) == ["planner", "agent", "user", "observer", "judge"]
-    assert roles["planner"]["spec"] == "anthropic:claude-sonnet-5-5"
-    assert roles["planner"]["source"] == "config defaults"
-    assert (roles["agent"]["model"], roles["agent"]["source"]) == ("claude-opus-5-5", "frontmatter")
-    assert roles["agent"]["temperature"] == 0.2 and roles["agent"]["max_tokens"] == 4096
-    assert roles["judge"]["extra"] == {"votes": 3}
+    assert list(roles) == ["planner", "planner-local", "agent", "user", "observer", "judge"]
+    # config.yaml defaults beat the planner's frontmatter (claude-opus-5-5).
+    assert (roles["planner"]["spec"], roles["planner"]["source"]) == (
+        "anthropic:claude-sonnet-5-5",
+        "config.yaml defaults",
+    )
+    assert roles["planner"]["max_tokens"] == 8192
+    # The frontmatter edits show, with the file that set them.
+    assert (roles["agent"]["model"], roles["agent"]["source"]) == (
+        "claude-opus-5-5",
+        "roles/agent.md",
+    )
+    assert roles["agent"]["max_tokens"] == 2048 and roles["agent"]["temperature"] is None
     assert (roles["user"]["spec"], roles["user"]["source"]) == (
         "anthropic:claude-haiku-4-5-20251001",
-        "built-in",
+        "roles/user.md",
     )
+    assert roles["user"]["temperature"] == 0.2
     assert (roles["observer"]["spec"], roles["observer"]["source"]) == (
         "anthropic:claude-sonnet-5-5",
-        "built-in",
+        "roles/observer.md",
     )
-    assert data["run"] == {"repeat": 3, "modes": ["guided", "free"], "judge_votes": 3}
-    assert data["skill"]["config_file"] == str(env.skill / "config.yaml")
-    assert "planner-local" in data["skill"]["role_files"]
+    assert roles["judge"]["extra"] == {"votes": 3}
+    assert roles["judge"]["file"] == str(env.skill.resolve() / "roles" / "judge.md")
+    assert roles["judge"]["prompts"] == ["system", "user"]
+    # The local planner only serves an ollama: planner; it shows its own frontmatter.
+    local = roles["planner-local"]
+    assert (local["provider"], local["model"]) == ("ollama", "command-r7b")
+    assert "ollama" in local["source"]
+    assert data["run"] == {
+        "repeat": 3,
+        "modes": ["guided", "free"],
+        "judge_votes": 3,
+        "concurrency": 4,
+    }
+    assert data["run_sources"]["repeat"] == "config.yaml run"
+    assert data["run_sources"]["concurrency"] == "built-in default"
+    skill = data["skill"]
+    assert (skill["name"], skill["path"]) == ("simulate", str(env.skill.resolve()))
+    assert skill["config_file"] == str(env.skill.resolve() / "config.yaml")
+    assert skill["error"] is None
+    assert skill["overrides"] == [
+        {
+            "match": {"category": "Shop*"},
+            "models": {"agent": "claude-haiku-4-5-20251001"},
+            "run": {"modes": ["guided"]},
+        }
+    ]
+    assert data["scenario_sources"] == ["scenarios", "scenarios/nested"]
+    assert data["scenario_sources_from"] == "config.yaml"
     assert data["runs_dir"] == str(env.runs)
+    assert data["honesty_item"] == HONESTY_ITEM
     assert "claude-fable-5-1" in data["known_models"]
     assert data["model_roles"] == ["planner", "agent", "judge", "user", "observer"]
+    assert data["warnings"] == []
+
+
+def test_config_follows_skill_edits_and_survives_a_broken_one(
+    client: TestClient, env: Env
+) -> None:
+    config = env.skill / "config.yaml"
+    good = config.read_text()
+    config.write_text(good.replace("claude-sonnet-5-5", "claude-fable-5-1"))
+    roles = {r["role"]: r for r in client.get("/api/config").json()["roles"]}
+    assert roles["planner"]["model"] == "claude-fable-5-1"
+    # A broken edit: the last skill that loaded is shown, with the loader's error.
+    config.write_text(good + "\nnot_a_key: 1\n")
+    data = client.get("/api/config").json()
+    assert data["skill"]["error"] and "not_a_key" in data["skill"]["error"]
+    assert any("no longer loads" in w for w in data["warnings"])
+    assert {r["role"]: r for r in data["roles"]}["planner"]["model"] == "claude-fable-5-1"
+    config.write_text(good)
+    data = client.get("/api/config").json()
+    assert data["skill"]["error"] is None and data["warnings"] == []
+    # A config.yaml source that matches nothing is a warning, and the list follows the edit.
+    config.write_text(good.replace("- scenarios/nested", "- scenarios/nowhere"))
+    data = client.get("/api/config").json()
+    assert any("scenarios/nowhere" in w and "not found" in w for w in data["warnings"])
+    names = {s["name"] for s in client.get("/api/scenarios").json()["scenarios"]}
+    assert names == {"fake-lookup", "broken-one"}
 
 
 # --- scenarios --------------------------------------------------------------------------------
@@ -536,22 +609,71 @@ def test_scenario_detail_reads_v2_fields_and_effective_models(client: TestClient
     assert s["expected_behavior_derived"] is False and s["user_instructions_derived"] is False
     assert s["agent_skill"] == "env:RECIPE_SHOPPER_SKILL"
     assert s["agent_notes"] == "No write tools in this setup."
+    # The model read the SOP through the environment variable and stripped its frontmatter.
+    assert s["agent_skill_name"] == "shop-sop"
+    assert s["agent_skill_text"] == "1. Look the product up before quoting it."
     assert s["file"] == os.path.join("scenarios", "nested", "v2-shopper.yaml")
+    assert s["models"] == {"judge": "claude-fable-5-1"}, "what the file names itself"
     models = data["models"]
     # Category override (Shop*) beats the agent's frontmatter; the scenario's judge beats both.
     assert (models["agent"]["model"], models["agent"]["source"]) == (
         "claude-haiku-4-5-20251001",
-        "config override",
+        "config.yaml overrides[1] (category=Shop*)",
     )
-    assert (models["judge"]["model"], models["judge"]["source"]) == ("claude-fable-5-1", "scenario")
-    assert (models["user"]["model"], models["user"]["source"]) == (
-        "claude-haiku-4-5-20251001",
-        "built-in",
+    assert (models["judge"]["model"], models["judge"]["source"]) == (
+        "claude-fable-5-1",
+        "scenario file",
     )
+    assert (models["user"]["spec"], models["user"]["source"]) == (
+        "anthropic:claude-haiku-4-5-20251001",
+        "roles/user.md",
+    )
+    assert models["user"]["temperature"] == 0.2
+    assert (models["planner"]["model"], models["planner"]["source"]) == (
+        "claude-sonnet-5-5",
+        "config.yaml defaults",
+    )
+    assert models["planner"]["file"].endswith("planner.md")
+    run = data["run_settings"]
+    override = "config.yaml overrides[1] (category=Shop*)"
+    assert run["modes"] == {"value": ["guided"], "source": override}
+    assert run["repeat"] == {"value": 2, "source": "scenario file"}
+    assert run["judge_votes"] == {"value": 3, "source": "config.yaml run"}
+    assert data["warnings"] == []
 
-    v1 = client.get("/api/scenarios/fake-lookup").json()["scenario"]
+    v1_data = client.get("/api/scenarios/fake-lookup").json()
+    v1 = v1_data["scenario"]
     assert v1["expected_behavior"] == v1["instructions"] and v1["expected_behavior_derived"]
     assert v1["context"]["device"] == "" and v1["context"]["agent_visible"] is False
+    assert v1["models"] == {}
+    assert v1_data["models"]["agent"]["source"] == "roles/agent.md"
+    assert v1_data["run_settings"]["modes"]["value"] == ["guided", "free"]
+
+
+def test_a_scenario_the_skill_cannot_run_says_why(client: TestClient, env: Env) -> None:
+    # A temperature on the agent role: fine for Haiku (the Shop* override), refused for the
+    # Opus 5.5 agent every other scenario resolves to, as `mcpsim run` would refuse it.
+    set_frontmatter(env.skill / "roles" / "agent.md", temperature=0.5)
+    lookup = client.get("/api/scenarios/fake-lookup").json()
+    assert lookup["models"]["agent"]["temperature"] == 0.5
+    [warning] = lookup["warnings"]
+    assert "will not run" in warning and "rejects it" in warning
+    assert client.get("/api/scenarios/v2-shopper").json()["warnings"] == []
+
+
+def test_an_unset_sop_variable_makes_the_scenario_invalid(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("RECIPE_SHOPPER_SKILL")
+    listing = {s["name"]: s for s in client.get("/api/scenarios").json()["scenarios"]}
+    shopper = listing["v2-shopper"]
+    assert "RECIPE_SHOPPER_SKILL is not set" in shopper["error"]
+    # The list still places it (title and category from the raw file), and it cannot run.
+    assert (shopper["title"], shopper["category"]) == ("Weekly shop on a phone", "Shopping")
+    detail = client.get("/api/scenarios/v2-shopper").json()
+    assert detail["models"] is None and detail["run_settings"] is None
+    refused = _post(client, "/api/run", {"scenarios": ["v2-shopper"]})
+    assert refused.status_code == 400 and "do not validate" in refused.json()["error"]
 
 
 def test_scenario_edits_show_without_a_restart(client: TestClient, env: Env) -> None:
@@ -604,6 +726,7 @@ def test_run_detail_has_plan_verdicts_transcripts(client: TestClient) -> None:
     assert rows["happy-guided-0"]["cost_usd"] == 0.0123
     assert rows["happy-guided-0"]["duration_s"] == 4.5
     assert data["scenario"]["name"] == "fake-lookup"
+    assert data["scenario"]["error"] is None
     assert data["has_scout"] is False
 
     shopper = client.get("/api/runs/v2-shopper/20250905T120000Z").json()
@@ -612,6 +735,7 @@ def test_run_detail_has_plan_verdicts_transcripts(client: TestClient) -> None:
     # No report.json: cost and duration come from the transcripts themselves.
     assert summary["cost_usd"] == 0.0246 and summary["duration_s"] == 4.5
     assert shopper["scenario"]["context"]["location"] == "Lyon, FR"
+    assert shopper["scenario"]["agent_skill_text"] == "1. Look the product up before quoting it."
     row = next(t for t in shopper["transcripts"] if t["stem"] == "happy-guided-0")
     assert (row["goal_achieved"], row["sop_followed"]) == (True, False)
 
@@ -752,6 +876,7 @@ def job_client(env: Env, request: pytest.FixtureRequest) -> Iterator[tuple[TestC
     plan = getattr(request, "param", {})
     jobs = JobManager(
         runs_dir=env.runs.resolve(),
+        skill_dir=env.skill,
         command=[sys.executable, str(FAKE_MCPSIM)],
         env={"FAKE_MCPSIM_PLAN": json.dumps(plan), "MCPSIM_SKILL": str(env.skill)},
         cwd=env.root,
@@ -802,13 +927,14 @@ def test_job_lifecycle_runs_each_scenario_and_records_status(
     assert all(t["run_id"] and t["finished_at"] for t in tasks.values())
     log = "\n".join(done["log_tail"])
     assert "[v2-shopper] mcpsim: planning v2-shopper" in log
-    assert f"[fake-lookup] mcpsim: skill={env.skill}" in log
+    assert f"[fake-lookup] mcpsim: skill={env.skill} env={env.skill}" in log
     assert "[fake-lookup] exit 0: passed" in log
     assert done["options"]["repeat"] == 2 and done["options"]["dry_run"] is True
 
     run_id = tasks["fake-lookup"]["run_id"]
     argv = json.loads((env.runs / "fake-lookup" / run_id / "argv.json").read_text())
     assert argv[0] == "run" and argv[1].endswith("fake-lookup.yaml")
+    assert argv[2:4] == ["--skill", str(env.skill)]
     assert argv[argv.index("--out") + 1] == str(env.runs.resolve())
     assert argv[argv.index("--models") + 1] == (
         "agent=claude-haiku-4-5-20251001,judge=anthropic:claude-opus-5-5"
@@ -965,6 +1091,16 @@ def test_build_command_maps_options_to_cli_flags(tmp_path: Path) -> None:
         "--out",
         str(out),
     ]
+    skill = tmp_path / "skill"
+    assert build_command(prefix, file, out, RunOptions(), skill) == [
+        *prefix,
+        "run",
+        str(file),
+        "--skill",
+        str(skill),
+        "--out",
+        str(out),
+    ]
     both = parse_run_options({"modes": ["guided", "free"], "models": {"user": ""}})
     assert both.modes == ["guided", "free"] and both.models == {}
     cmd = build_command(prefix, file, out, both)
@@ -1022,21 +1158,74 @@ def test_cli_ui_passes_flags_to_serve(env: Env, monkeypatch: pytest.MonkeyPatch)
     assert (seen["host"], seen["port"]) == ("127.0.0.1", 9999)
     assert settings.scenario_sources == ["scenarios/nested"]
     assert settings.runs_dir == env.root.resolve() / "runs"  # from config.yaml runs_dir
+    assert settings.skill_dir == env.skill.resolve()
     assert settings.allow_remote is False
 
 
-def test_resolve_settings_precedence(env: Env) -> None:
-    from_config = resolve_settings(skill=str(env.skill), cwd=env.root, env={})
-    assert from_config.scenario_sources == ["scenarios"]
+def test_cli_ui_refuses_a_skill_that_does_not_load(
+    env: Env, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(env.root)
+    assert main(["ui", "--skill", str(env.root / "missing")]) == EXIT_FAILURE
+    assert "skill directory not found" in capsys.readouterr().err
+    (env.skill / "roles" / "judge.md").unlink()
+    assert main(["ui", "--skill", str(env.skill)]) == EXIT_FAILURE
+    assert "missing role file(s) judge.md" in capsys.readouterr().err
+
+
+def test_resolve_settings_precedence(env: Env, monkeypatch: pytest.MonkeyPatch) -> None:
+    from_config = resolve_settings(skill=str(env.skill), cwd=env.root)
+    assert from_config.scenario_sources is None, "follows config.yaml's scenarios"
     assert from_config.runs_dir == env.root.resolve() / "runs"
+    assert from_config.skill.config.scenarios == ["scenarios", "scenarios/nested"]
     flags = resolve_settings(
-        skill=str(env.skill), runs="elsewhere", scenarios=["a", "b"], cwd=env.root, env={}
+        skill=str(env.skill), runs="elsewhere", scenarios=["a", "b"], cwd=env.root
     )
     assert flags.scenario_sources == ["a", "b"]
     assert flags.runs_dir == env.root.resolve() / "elsewhere"
-    via_env = resolve_settings(cwd=env.root, env={"MCPSIM_SKILL": str(env.skill)})
-    assert via_env.skill_dir == env.skill
-    bare = resolve_settings(skill=str(env.root / "missing"), cwd=env.root, env={})
-    assert bare.scenario_sources == ["scenarios"]
-    assert bare.runs_dir == env.root.resolve() / "runs"
-    assert any("does not exist" in w for w in bare.skill.warnings)
+    monkeypatch.setenv(SKILL_ENV, str(env.skill))
+    assert resolve_settings(cwd=env.root).skill_dir == env.skill.resolve()
+    monkeypatch.delenv(SKILL_ENV)
+    # Neither --skill nor MCPSIM_SKILL: the packaged skill (the checkout's, in a source tree).
+    packaged = resolve_settings(cwd=env.root)
+    assert packaged.skill.name == "simulate"
+    assert packaged.skill_dir != env.skill.resolve()
+    assert packaged.runs_dir == env.root.resolve() / "runs" / "simulate"
+    with pytest.raises(SkillError, match="skill directory not found"):
+        resolve_settings(skill=str(env.root / "missing"), cwd=env.root)
+
+
+def test_a_job_runs_the_real_cli_with_the_skill(env: Env) -> None:
+    """The page's Run button end to end: the real `mcpsim run --skill` in dry run (no model is
+    called) against the fake stdio server; the run directory records the skill's resolution."""
+    jobs = JobManager(
+        runs_dir=env.runs.resolve(),
+        skill_dir=env.skill.resolve(),
+        env={"PYTHONPATH": str(REPO_ROOT)},
+        cwd=env.root,
+        output_drain_s=0.5,
+    )
+    app = create_app(env.settings(), token=TOKEN, jobs=jobs)
+    try:
+        with TestClient(app, base_url=BASE) as c:
+            res = _post(c, "/api/run", {"scenarios": ["v2-shopper"], "repeat": 1, "dry_run": True})
+            assert res.status_code == 202, res.text
+            done = _wait(c, res.json()["job_id"], timeout=180)
+            task = done["scenarios"][0]
+            log = "\n".join(done["log_tail"])
+            assert task["status"] in ("passed", "failed", "partial"), log
+            assert f"--skill {env.skill.resolve()}" in log
+            run_dir = env.runs / "v2-shopper" / task["run_id"]
+            recorded = json.loads((run_dir / "scenario.json").read_text())
+            assert recorded["models"]["planner"] == "claude-sonnet-5-5", "config.yaml defaults"
+            assert recorded["models"]["agent"] == "claude-haiku-4-5-20251001", "the override"
+            assert recorded["models"]["judge"] == "claude-fable-5-1", "the scenario file"
+            assert (recorded["repeat"], recorded["judge_votes"]) == (1, 3)
+            assert recorded["agent"]["skill_name"] == "shop-sop"
+            stems = sorted(p.stem for p in (run_dir / "transcripts").glob("*.jsonl"))
+            assert stems == ["happy-dry-run-guided-0"], "the override's modes: [guided]"
+            listing = {s["name"]: s for s in c.get("/api/scenarios").json()["scenarios"]}
+            assert listing["v2-shopper"]["last_run"]["run_id"] == task["run_id"]
+            assert listing["v2-shopper"]["pass_k"]["k"] == 1
+    finally:
+        jobs.shutdown()

@@ -85,7 +85,10 @@ skills/simulate/scripts/run.sh report
 4. **Test runner** (`run.sh ui`, which runs `mcpsim ui --skill <this skill>` on
    127.0.0.1:8765). The runner offers search, run all / run one / re-run, run history and
    settings. Its detail view shows the user instructions, the context, each expected-behaviour
-   verdict and the transcript with its tool calls.
+   verdict and the transcript with its tool calls. Settings and the detail view show the models
+   and run settings this skill resolves, each with the layer it came from. The Run buttons
+   start `mcpsim run <file> --skill <this skill>`, so a run from the page is the same as one
+   from the shell.
 5. **Report** (`run.sh report [DIR]`). This prints the newest `suite.md`, or a run directory's
    `report.md`. A run directory holds `scenario.json` (the scenario as it ran: resolved models,
    repeat, votes), `plan.json`, `transcripts/`, `verdicts/` (the expected-behaviour checklist,

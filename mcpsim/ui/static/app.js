@@ -475,6 +475,7 @@
     const s = data.scenario;
     const d = clear($('#detail'));
     const hasRuns = (state.runs || []).length > 0;
+    const rs = data.run_settings || {};
     const runBtn = h('button', {
       class: 'btn btn-primary', type: 'button', disabled: Boolean(s.error) || data.status === 'running',
       onclick: () => startRun([s.name], s.title),
@@ -489,13 +490,14 @@
             h('span', { class: 'mono', text: s.name }),
             h('span', { class: 'mono', text: s.file }),
             s.server ? h('span', { text: `server: ${s.server}` }) : null,
-            typeof s.repeat === 'number' ? h('span', { text: `repeat ${s.repeat}` }) : null)),
+            rs.repeat ? h('span', { text: `repeat ${rs.repeat.value}` }) : null)),
         h('div', { class: 'd-actions' }, statusPill(s.error ? 'error' : data.status, s.error ? 'Invalid file' : null), runBtn)),
     );
     if (s.error) {
       d.append(h('section', { class: 'card error-box', 'aria-labelledby': 'err-title' },
         h('h2', { id: 'err-title', text: 'This scenario file does not validate' }), h('pre', { text: s.error })));
     }
+    for (const w of data.warnings || []) d.append(h('p', { class: 'note', text: w }));
     d.append(
       h('section', { class: 'card', 'aria-labelledby': 'hist-title' },
         h('h2', { id: 'hist-title' }, 'Run history', h('span', { class: 'aside', id: 'hist-count' })),
@@ -657,12 +659,21 @@
         hit && hit.evidence ? h('blockquote', { class: `evidence ${hit.passed ? 'v-pass' : 'v-fail'}`, text: hit.evidence }) : null));
     });
     host.append(list);
-    const extra = checklist.filter((c) => !used.has(c));
+    // The judge grades one standing item after the scenario's own: honesty (judge.HONESTY_ITEM).
+    const honestyText = norm((state.config && state.config.honesty_item) || '');
+    const left = checklist.filter((c) => !used.has(c));
+    const standing = left.filter((c) => honestyText && norm(c.item) === honestyText);
+    const extra = left.filter((c) => !standing.includes(c));
+    const checkRow = (c) => h('li', { class: 'check' },
+      h('span', { class: 'verdict' }, verdictPill(c.passed)), h('span', { class: 'item', text: c.item }),
+      c.evidence ? h('blockquote', { class: `evidence ${c.passed ? 'v-pass' : 'v-fail'}`, text: c.evidence }) : null);
+    if (standing.length) {
+      host.append(h('h3', { class: 'small muted', text: 'Standing check (every scenario)' }));
+      host.append(h('ol', { class: 'checklist' }, standing.map(checkRow)));
+    }
     if (extra.length) {
       host.append(h('h3', { class: 'small muted', text: 'Other items the judge graded' }));
-      host.append(h('ol', { class: 'checklist' }, extra.map((c) => h('li', { class: 'check' },
-        h('span', { class: 'verdict' }, verdictPill(c.passed)), h('span', { class: 'item', text: c.item }),
-        c.evidence ? h('blockquote', { class: `evidence ${c.passed ? 'v-pass' : 'v-fail'}`, text: c.evidence }) : null))));
+      host.append(h('ol', { class: 'checklist' }, extra.map(checkRow)));
     }
     if (v.expected_behavior_derived) host.append(h('p', { class: 'note', text: 'The scenario lists no expected_behavior; its instructions are graded instead.' }));
     if (verdict && !checklist.length) host.append(h('p', { class: 'note', text: `No checklist in this verdict (judge: ${verdict.judge_model || 'unknown'}).` }));
@@ -770,6 +781,23 @@
           const override = (state.opts.models || {})[r];
           return h('tr', null, h('td', { text: r }), h('td', { class: 'mono', text: override || models[r].spec }),
             h('td', { class: 'muted', text: override ? 'run override (settings)' : models[r].source }));
+        })))));
+    }
+    const run = state.scenario && state.scenario.run_settings;
+    if (run) {
+      const o = state.opts || {};
+      const shown = (k) => {
+        if (k === 'repeat' && Number.isInteger(o.repeat)) return [String(o.repeat), 'run override (settings)'];
+        if (k === 'modes' && Array.isArray(o.modes) && o.modes.length === 1) return [o.modes[0], 'run override (settings)'];
+        const v = run[k].value;
+        return [Array.isArray(v) ? v.join(' + ') : String(v), run[k].source];
+      };
+      host.append(h('h3', { class: 'small', text: 'Run settings for the next run' }), h('div', { class: 'table-wrap' }, h('table', { class: 'table' },
+        h('caption', { class: 'sr-only', text: 'Run settings for this scenario' }),
+        h('thead', null, h('tr', null, ['Setting', 'Value', 'Source'].map((c) => h('th', { scope: 'col', text: c })))),
+        h('tbody', null, Object.keys(run).map((k) => {
+          const [value, source] = shown(k);
+          return h('tr', null, h('td', { text: k.replace('_', ' ') }), h('td', { class: 'mono', text: value }), h('td', { class: 'muted', text: source }));
         })))));
     }
   }
@@ -1114,12 +1142,13 @@
     }
     const skill = cfg.skill || {};
     const info = clear($('#skill-info'));
-    const runDefaults = Object.entries(cfg.run || {}).map(([k, v]) => `${k}=${Array.isArray(v) ? v.join('/') : v}`).join(', ');
+    const sources = cfg.run_sources || {};
+    const runDefaults = Object.entries(cfg.run || {}).map(([k, v]) => `${k}=${Array.isArray(v) ? v.join('/') : v}${sources[k] ? ` (${sources[k]})` : ''}`).join(', ');
     append(info, [
-      h('dt', { text: 'Skill' }), h('dd', { class: 'mono', text: skill.skill_dir || 'none (built-in defaults)' }),
+      h('dt', { text: 'Skill' }), h('dd', { class: 'mono', text: skill.path ? `${skill.name} · ${skill.path}` : '–' }),
       h('dt', { text: 'config.yaml' }), h('dd', { class: 'mono', text: skill.config_file || 'not found' }),
       h('dt', { text: 'Run defaults' }), h('dd', { text: runDefaults || '–' }),
-      h('dt', { text: 'Scenarios' }), h('dd', { class: 'mono', text: (cfg.scenario_sources || []).join(', ') }),
+      h('dt', { text: 'Scenarios' }), h('dd', { class: 'mono', text: `${(cfg.scenario_sources || []).join(', ') || '–'}${cfg.scenario_sources_from ? ` (from ${cfg.scenario_sources_from})` : ''}` }),
       h('dt', { text: 'Runs' }), h('dd', { class: 'mono', text: cfg.runs_dir || '' }),
       (skill.overrides || []).length ? [h('dt', { text: 'Overrides' }), h('dd', null, h('ul', { class: 'list-plain' }, skill.overrides.map((o) => h('li', { text: overrideText(o) }))))] : null,
     ]);

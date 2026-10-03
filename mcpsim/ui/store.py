@@ -6,8 +6,11 @@ id must be a directory listed under ``<runs_dir>/<scenario>/``, and a transcript
 inside the runs directory after symlinks are followed. Nothing else on disk is ever read
 through the API.
 
-Artefacts are read as plain JSON, not through the pydantic models: those forbid unknown keys,
-and contract B adds fields (``pass_k``, ``goal_achieved``, ...) that a newer runner writes.
+Scenario files are loaded with the scenario model (:mod:`mcpsim.ui.scenario_view`) from the
+sources the skill's ``config.yaml`` names (or ``mcpsim ui --scenarios``), expanded the way
+``mcpsim suite`` expands them (:func:`mcpsim.skill.expand_source`). Run artefacts (reports,
+verdicts, transcripts) are read as plain JSON, so a run directory written by an older or newer
+runner still shows.
 """
 
 from __future__ import annotations
@@ -16,13 +19,15 @@ import dataclasses
 import json
 import re
 import threading
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path as FsPath
 from typing import Any
 
-from mcpsim.ui.scenario_view import ScenarioView, build_view, scenario_view
-from mcpsim.ui.skill_config import SkillConfig, expand_sources, resolve_roles
+from mcpsim.scenario import Scenario
+from mcpsim.skill import expand_source
+from mcpsim.ui.scenario_view import ScenarioView, load_view, snapshot_view
 
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
@@ -140,6 +145,9 @@ def transcript_facts(events: list[dict[str, Any]]) -> dict[str, Any]:
 class ScenarioIndex:
     views: dict[str, ScenarioView] = field(default_factory=dict)
     paths: dict[str, FsPath] = field(default_factory=dict)
+    # The validated scenario of every view without an error (as freshly loaded from its file,
+    # so Skill.resolve sees which models the file names itself).
+    scenarios: dict[str, Scenario] = field(default_factory=dict)
     warnings: list[str] = field(default_factory=list)
 
 
@@ -149,22 +157,21 @@ class Store:
     def __init__(
         self,
         *,
-        scenario_sources: list[str],
+        scenario_sources: Callable[[], list[str]],
         runs_dir: FsPath,
-        skill: SkillConfig,
-        bases: list[FsPath] | None = None,
+        cwd: FsPath | None = None,
     ) -> None:
-        self.scenario_sources = list(scenario_sources)
+        # Called on every scan, so an edit to config.yaml's scenarios shows without a restart.
+        self.scenario_sources = scenario_sources
         self.runs_dir = runs_dir
-        self.skill = skill
-        self.bases = bases or [FsPath.cwd()]
-        # Parsed views by file, reused while the file's (mtime, size) is unchanged.
-        self._views: dict[FsPath, tuple[tuple[int, int], ScenarioView]] = {}
+        self.cwd = cwd or FsPath.cwd()
+        # Loaded files, reused while the file's (mtime, size) is unchanged.
+        self._views: dict[FsPath, tuple[tuple[int, int], ScenarioView, Scenario | None]] = {}
         self._views_lock = threading.Lock()
 
     # --- scenarios --------------------------------------------------------------------------
 
-    def _view(self, path: FsPath, fresh: bool) -> ScenarioView:
+    def _view(self, path: FsPath, fresh: bool) -> tuple[ScenarioView, Scenario | None]:
         try:
             st = path.stat()
             key = (st.st_mtime_ns, st.st_size)
@@ -173,21 +180,40 @@ class Store:
         with self._views_lock:
             cached = self._views.get(path)
         if not fresh and cached is not None and cached[0] == key:
-            return dataclasses.replace(cached[1])
-        view = scenario_view(path, display_path=self._display(path))
+            return dataclasses.replace(cached[1]), cached[2]
+        view, scenario = load_view(path, display_path=self._display(path))
         with self._views_lock:
-            self._views[path] = (key, view)
-        return dataclasses.replace(view)
+            self._views[path] = (key, view, scenario)
+        return dataclasses.replace(view), scenario
+
+    def files(self) -> tuple[list[FsPath], list[str]]:
+        """The scenario files the sources name, expanded as ``mcpsim suite`` expands them
+        (relative to the working directory; ``$NAME`` / ``${NAME:-default}`` read the
+        environment), deduplicated; plus a note per source that matched nothing."""
+        files: list[FsPath] = []
+        seen: set[FsPath] = set()
+        notes: list[str] = []
+        for entry in self.scenario_sources():
+            source = expand_source(entry, base=self.cwd)
+            if source.note:
+                where = f" ({source.path})" if source.path else ""
+                notes.append(f"scenarios entry {entry!r}{where}: {source.note}")
+            for file in source.files:
+                resolved = file.resolve()
+                if resolved not in seen:
+                    seen.add(resolved)
+                    files.append(resolved)
+        return files, notes
 
     def scan(self, fresh: bool = False) -> ScenarioIndex:
         """Every scenario file the sources name. A file whose modification time and size are
-        unchanged is not parsed again unless ``fresh`` (the scenario list always is: an
+        unchanged is not loaded again unless ``fresh`` (the scenario list always is: an
         ``agent.skill`` the file points at may have changed)."""
         index = ScenarioIndex()
-        files, warnings = expand_sources(self.scenario_sources, self.bases)
+        files, warnings = self.files()
         index.warnings.extend(warnings)
         for path in files:
-            view = self._view(path, fresh)
+            view, scenario = self._view(path, fresh)
             if not NAME_RE.match(view.name):
                 safe = re.sub(r"[^A-Za-z0-9._-]", "-", path.stem).lstrip("-._") or "scenario"
                 view.error = (view.error + "\n" if view.error else "") + (
@@ -202,25 +228,15 @@ class Store:
                 continue
             index.views[view.name] = view
             index.paths[view.name] = path
+            if view.error is None and scenario is not None:
+                index.scenarios[view.name] = scenario
         return index
 
     def _display(self, path: FsPath) -> str:
-        for base in self.bases:
-            try:
-                return str(path.relative_to(base.resolve()))
-            except ValueError:
-                continue
-        return str(path)
-
-    def effective_models(self, view: ScenarioView, run_models: dict[str, str] | None = None) -> Any:
-        roles = resolve_roles(
-            self.skill,
-            scenario_name=view.name,
-            category=view.category,
-            scenario_models=view.models,
-            run_models=run_models,
-        )
-        return {role: r.to_json() for role, r in roles.items()}
+        try:
+            return str(path.relative_to(self.cwd.resolve()))
+        except ValueError:
+            return str(path)
 
     # --- runs -------------------------------------------------------------------------------
 
@@ -434,14 +450,14 @@ class Store:
         report = self._small_json(run_dir, "report.json")
         plan = self._small_json(run_dir, "plan.json")
         snapshot = self._small_json(run_dir, "scenario.json")
-        snapshot_view = None
+        as_run = None
         if isinstance(snapshot, dict):
-            snapshot_view = build_view(snapshot, file="scenario.json", fallback_name=name).to_json()
+            as_run = snapshot_view(snapshot, fallback_name=name).to_json()
         return {
             "summary": self.run_summary(name, run_id, run_dir, verdicts=verdicts, facts=facts),
             "report": report if isinstance(report, dict) else None,
             "plan": plan if isinstance(plan, dict) else None,
-            "scenario": snapshot_view,
+            "scenario": as_run,
             "verdicts": verdicts,
             "transcripts": transcripts,
             "has_scout": (run_dir / "scout.json").is_file(),

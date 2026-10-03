@@ -12,6 +12,10 @@ Security model (contract D):
 * Path parameters are looked up in listings (known scenarios, run directories, transcript
   files) and every resolved path must stay inside the runs directory; nothing else on disk is
   served. The page renders all text with ``textContent`` and ships a strict CSP.
+
+What the page shows comes from the same code the CLI runs: the simulate skill through
+:func:`mcpsim.skill.load_skill` (``--skill``, else ``MCPSIM_SKILL``, else the packaged copy), the
+scenario files through the scenario model, and runs through ``mcpsim run --skill``.
 """
 
 from __future__ import annotations
@@ -20,9 +24,8 @@ import contextlib
 import html
 import ipaddress
 import json
-import os
 import secrets
-from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, MutableMapping
+from collections.abc import AsyncIterator, Awaitable, Callable, MutableMapping
 from dataclasses import dataclass, field
 from pathlib import Path as FsPath
 from typing import Any
@@ -35,18 +38,14 @@ from starlette.responses import HTMLResponse, JSONResponse, Response
 from starlette.routing import Route
 
 from mcpsim import __version__
+from mcpsim.judge import HONESTY_ITEM
+from mcpsim.llm import KNOWN_MODELS
 from mcpsim.plan import MODES
 from mcpsim.scenario import MODEL_ROLES
+from mcpsim.skill import SKILL_ENV, Skill, SkillError, load_skill, skill_dir
 from mcpsim.ui.jobs import JobConflictError, JobManager, parse_run_options
 from mcpsim.ui.scenario_view import ScenarioView
-from mcpsim.ui.skill_config import (
-    KNOWN_MODELS,
-    SKILL_ENV,
-    SkillConfig,
-    default_skill_dir,
-    load_skill_config,
-    resolve_roles,
-)
+from mcpsim.ui.skill_view import SkillSource, overrides_json, role_rows, scenario_settings
 from mcpsim.ui.store import Store, now_iso
 
 TOKEN_HEADER = "X-MCPSim-Token"
@@ -94,14 +93,19 @@ def host_name(header: str) -> str:
 
 @dataclass
 class UISettings:
+    """``skill`` is the simulate skill as loaded at start; ``scenario_sources`` is ``None`` to
+    follow its ``config.yaml`` (re-read on every scan) or the ``--scenarios`` entries."""
+
+    skill: Skill
     runs_dir: FsPath
-    scenario_sources: list[str]
-    skill_dir: FsPath | None = None
-    skill: SkillConfig = field(default_factory=SkillConfig)
+    scenario_sources: list[str] | None = None
     allow_remote: bool = False
     command: list[str] | None = None
-    cwd: FsPath | None = None
-    bases: list[FsPath] = field(default_factory=list)
+    cwd: FsPath = field(default_factory=FsPath.cwd)
+
+    @property
+    def skill_dir(self) -> FsPath:
+        return self.skill.path
 
 
 def resolve_settings(
@@ -110,28 +114,25 @@ def resolve_settings(
     runs: str | None = None,
     scenarios: list[str] | None = None,
     allow_remote: bool = False,
-    env: Mapping[str, str] | None = None,
     cwd: FsPath | None = None,
 ) -> UISettings:
-    """CLI flags over ``config.yaml`` over built-in defaults (``scenarios/``, ``runs/``)."""
-    source = os.environ if env is None else env
+    """The skill (``--skill``, else ``$MCPSIM_SKILL``, else the packaged copy), loaded and
+    validated as every mcpsim command loads it; the runs directory (``--runs``, else the
+    config's ``runs_dir``) and the scenario sources (``--scenarios``, else the config's), both
+    relative to the working directory. Raises :class:`~mcpsim.skill.SkillError`."""
     base = (cwd or FsPath.cwd()).resolve()
-    skill_dir = default_skill_dir(skill, source)
-    config = load_skill_config(skill_dir)
-    bases = [base] + ([skill_dir.resolve()] if skill_dir is not None else [])
-    sources = list(scenarios) if scenarios else list(config.scenarios) or ["scenarios"]
-    runs_value = runs or (os.path.expandvars(config.runs_dir) if config.runs_dir else "runs")
-    runs_path = FsPath(runs_value).expanduser()
-    if not runs_path.is_absolute():
-        runs_path = base / runs_path
+    loaded = load_skill(skill_dir(skill))
+    if runs:
+        runs_path = FsPath(runs).expanduser()
+        runs_path = runs_path if runs_path.is_absolute() else base / runs_path
+    else:
+        runs_path = loaded.runs_dir(base)
     return UISettings(
+        skill=loaded,
         runs_dir=runs_path,
-        scenario_sources=sources,
-        skill_dir=skill_dir,
-        skill=config,
+        scenario_sources=list(scenarios) if scenarios else None,
         allow_remote=allow_remote,
         cwd=base,
-        bases=bases,
     )
 
 
@@ -199,19 +200,19 @@ class RunnerUI:
     ) -> None:
         self.settings = settings
         self.token = token or secrets.token_urlsafe(32)
+        self.skill_source = SkillSource(settings.skill)
         self.store = Store(
-            scenario_sources=settings.scenario_sources,
+            scenario_sources=self._scenario_sources,
             runs_dir=settings.runs_dir,
-            skill=settings.skill,
-            bases=settings.bases or None,
+            cwd=settings.cwd,
         )
-        env: dict[str, str] = {}
-        if settings.skill_dir is not None and settings.skill_dir.exists():
-            env[SKILL_ENV] = str(settings.skill_dir.resolve())
+        skill_path = settings.skill_dir.resolve()
         self.jobs = jobs or JobManager(
             runs_dir=settings.runs_dir.resolve(),
+            skill_dir=skill_path,
             command=settings.command,
-            env=env,
+            # --skill names the skill; MCPSIM_SKILL makes library defaults agree with it.
+            env={SKILL_ENV: str(skill_path)},
             cwd=settings.cwd,
             status_lookup=self._run_status,
         )
@@ -226,6 +227,12 @@ class RunnerUI:
         self._page = page.replace(TOKEN_PLACEHOLDER, html.escape(self.token, quote=True))
 
     # --- helpers ----------------------------------------------------------------------------
+
+    def _scenario_sources(self) -> list[str]:
+        if self.settings.scenario_sources is not None:
+            return list(self.settings.scenario_sources)
+        skill, _ = self.skill_source.load()
+        return list(skill.config.scenarios)
 
     def _run_status(self, name: str, run_id: str) -> str | None:
         run_dir = self.store.run_dir(name, run_id)
@@ -275,21 +282,44 @@ class RunnerUI:
     # --- read API ---------------------------------------------------------------------------
 
     def config(self, request: Request) -> Response:
-        skill = self.settings.skill
-        roles = resolve_roles(skill)
+        """The skill as ``mcpsim config`` resolves it (:meth:`Skill.describe`): every role
+        file's model and the layer it came from, its settings and prompts, the run defaults,
+        the overrides, the scenario sources and the runs directory."""
+        skill, error = self.skill_source.load()
+        warnings: list[str] = []
+        if error is not None:
+            warnings.append(f"the skill no longer loads (showing the last one that did): {error}")
+        try:
+            described = skill.describe(base=self.settings.cwd)
+        except SkillError as exc:  # runs_dir names an unset environment variable
+            return _error(500, str(exc))
+        _, notes = self.store.files()
+        warnings += notes
         return JSONResponse(
             {
                 "version": __version__,
-                "skill": skill.to_json(),
-                "roles": [r.to_json() for r in roles.values()],
-                "run": skill.run,
-                "scenario_sources": self.settings.scenario_sources,
+                "skill": {
+                    "name": skill.name,
+                    "description": skill.description,
+                    "path": str(skill.path),
+                    "config_file": described["config"],
+                    "overrides": overrides_json(skill),
+                    "error": error,
+                },
+                "roles": role_rows(skill, described),
+                "run": {k: v["value"] for k, v in described["run"].items()},
+                "run_sources": {k: v["source"] for k, v in described["run"].items()},
+                "scenario_sources": self._scenario_sources(),
+                "scenario_sources_from": (
+                    "--scenarios" if self.settings.scenario_sources is not None else "config.yaml"
+                ),
                 "runs_dir": str(self.settings.runs_dir),
                 "known_models": list(KNOWN_MODELS),
                 "model_roles": list(MODEL_ROLES),
                 "modes": list(MODES),
+                "honesty_item": HONESTY_ITEM,
                 "allow_remote": self.settings.allow_remote,
-                "warnings": list(skill.warnings),
+                "warnings": warnings,
             }
         )
 
@@ -339,20 +369,35 @@ class RunnerUI:
 
     def scenario(self, request: Request) -> Response:
         name = request.path_params["name"]
-        known = self._known(name)
-        if known is None:
+        index = self.store.scan()
+        view = index.views.get(name)
+        if view is None:
             return _error(404, "unknown scenario")
-        view, _ = known
         last, count = self.store.last_judged(
             name, self._in_progress(name, self.jobs.running_since())
         )
+        models: dict[str, Any] | None = None
+        run: dict[str, Any] | None = None
+        warnings: list[str] = []
+        scenario = index.scenarios.get(name)
+        if scenario is not None:
+            skill, error = self.skill_source.load()
+            if error is not None:
+                warnings.append(f"the skill no longer loads: {error}")
+            try:
+                models, run = scenario_settings(skill, scenario)
+                skill.apply(scenario)  # what `mcpsim run` checks before it starts
+            except (SkillError, ValueError) as exc:
+                warnings.append(f"this scenario will not run with this skill: {exc}")
         return JSONResponse(
             {
                 "scenario": view.to_json(),
                 "status": self._scenario_status(name, last, self.jobs.active_scenarios()),
                 "last_run": last,
                 "run_count": count,
-                "models": self.store.effective_models(view),
+                "models": models,
+                "run_settings": run,
+                "warnings": warnings,
             }
         )
 
@@ -487,20 +532,25 @@ def create_app(
     return app
 
 
-def serve(settings: UISettings, *, host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> None:
-    """Run the app with uvicorn until interrupted. Refuses a non-loopback host unless allowed."""
-    if not settings.allow_remote and not is_loopback(host):
+def check_bind(host: str, *, allow_remote: bool) -> None:
+    """Raise ``ValueError`` for a non-loopback ``host`` unless ``allow_remote``."""
+    if not allow_remote and not is_loopback(host):
         raise ValueError(
             f"refusing to bind {host!r}: not a loopback address (pass --allow-remote to expose "
             "the runner, its transcripts and its run button to the network)"
         )
+
+
+def serve(settings: UISettings, *, host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> None:
+    """Run the app with uvicorn until interrupted. Refuses a non-loopback host unless allowed."""
+    check_bind(host, allow_remote=settings.allow_remote)
     import uvicorn
 
     app = create_app(settings)
     shown = f"[{host}]" if ":" in host else host
     print(f"mcpsim ui: http://{shown}:{port}/", flush=True)
-    print(f"  scenarios: {', '.join(settings.scenario_sources)}", flush=True)
+    sources = settings.scenario_sources or settings.skill.config.scenarios
+    print(f"  scenarios: {', '.join(sources) or '(none configured)'}", flush=True)
     print(f"  runs:      {settings.runs_dir}", flush=True)
-    if settings.skill_dir is not None:
-        print(f"  skill:     {settings.skill_dir}", flush=True)
+    print(f"  skill:     {settings.skill_dir}", flush=True)
     uvicorn.run(app, host=host, port=port, log_level="warning", server_header=False)

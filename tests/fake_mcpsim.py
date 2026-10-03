@@ -1,8 +1,8 @@
 """A stand-in for ``python -m mcpsim.cli`` in the runner-UI job tests.
 
-``fake_mcpsim.py run <scenario> --out <dir> [--models ..] [--repeat N] [--mode M] [--dry-run]
-[--allow-same-judge]`` behaves like ``mcpsim run`` as far as the UI can tell: it prints a few
-progress lines, writes ``<out>/<name>/<stamp>/`` (scenario.json, transcripts, verdicts,
+``fake_mcpsim.py run <scenario> [--skill DIR] --out <dir> [--models ..] [--repeat N] [--mode M]
+[--dry-run] [--allow-same-judge]`` behaves like ``mcpsim run`` as far as the UI can tell: it
+prints a few progress lines, writes ``<out>/<name>/<stamp>/`` (scenario.json, transcripts, verdicts,
 report.json, plus ``argv.json`` so a test can see the arguments), prints ``run dir: <path>``
 and exits 0 when every run passed, else 1.
 
@@ -46,6 +46,7 @@ def main(argv: list[str]) -> int:
     sub = parser.add_subparsers(dest="command", required=True)
     p = sub.add_parser("run")
     p.add_argument("scenario")
+    p.add_argument("--skill")
     p.add_argument("--out", required=True)
     p.add_argument("--models")
     p.add_argument("--repeat", type=int)
@@ -59,7 +60,7 @@ def main(argv: list[str]) -> int:
     plan = json.loads(os.environ.get("FAKE_MCPSIM_PLAN", "{}"))
     behaviour = plan.get(name, "pass")
     print(f"mcpsim: planning {name}", flush=True)
-    print(f"mcpsim: skill={os.environ.get('MCPSIM_SKILL', '')}", flush=True)
+    print(f"mcpsim: skill={args.skill} env={os.environ.get('MCPSIM_SKILL', '')}", flush=True)
 
     if behaviour == "error":
         print(f"mcpsim run: {args.scenario}: cannot connect to server", file=sys.stderr, flush=True)
