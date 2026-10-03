@@ -164,14 +164,25 @@ numbers:
 | local profile, call 4 (the re-ask, accepted) | 2,377 | 171 | 218 s |
 
 The local-profile rows ran with the CPU held at 22–33 % of its clock (see below): prompt 5.6–6.6
-tok/s, output 0.9–2.4. The plan validated with three paths (`examples/cheapest-penne/local-plan`)
-and no call came near the deadline. At the unthrottled rates the same calls take about 2.4
-minutes (call 1, whose answer the model pretty-prints; later calls copy the compact JSON in the
-conversation and write a third fewer tokens) and one minute (each later call).
+tok/s, output 0.9–2.4. No call came near the deadline. At the unthrottled rates the same calls
+take about 2.4 minutes (call 1, whose answer the model pretty-prints; later calls copy the
+compact JSON in the conversation and write a third fewer tokens) and one minute (each later
+call). A second run, after the recovery rule below, took 134 s, 163 s, 140 s and 129 s.
 
-The same run showed a "recovery" path whose failing step sent good input and had no corrected
-call; the validator now requires the failure, then a later tool step that expects success, and
-rejects a failing step that sends the same tool the same arguments as the fix.
+**Speed is fixed; plan quality is not.** Both runs produced plans that validate and test almost
+nothing. In the first, the "recovery" path sent good input marked `expect_error` and had no
+corrected call (the validator now requires the failure, a later tool step that expects success,
+and different input between the two). In the second, told so, the model changed the kind
+instead of the path: all three paths call `find_product(query="penne")` and expect,
+respectively, a direct match, a relaxed match and zero results; only the first is what the
+server returns. The happy path's single checkpoint (`match equals direct`) never mentions the
+price, store or origin status the goal asks for. The grammar guarantees the shape, not the
+reasoning, and designing distinct test cases is reasoning a 7–8B model on a compact prompt does
+poorly. Neither plan is committed as an example; `examples/cheapest-penne/local-plan` is still
+the earlier two-path plan. The likely remedy is a smaller job for the local model: checkpoints
+derived from `expected_outcome.json`, the happy path from the scout's proven calls, a fixed shape
+per path kind, and short constrained questions to the model ("a bad value for `product_id`",
+"the instruction most tempting to break") instead of whole paths.
 
 **What the machine does to it.** Two things outside the framework dominated:
 
