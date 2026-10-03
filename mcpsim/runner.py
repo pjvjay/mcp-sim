@@ -61,7 +61,7 @@ from mcpsim.llm import (
     parse_model_spec,
     unpriced_models,
 )
-from mcpsim.mcpclient import Catalog, Session, connect
+from mcpsim.mcpclient import Catalog, Session, connect, describe_exception, sole_leaf
 from mcpsim.observers import ObserverRunner
 from mcpsim.plan import MODES, ExecutionPlan, Mode, Path
 from mcpsim.planner import plan as plan_paths
@@ -461,8 +461,7 @@ def _connection_failure(
     scenario: Scenario, path: Path, mode: Mode, index: int, exc: BaseException
 ) -> Transcript:
     """A transcript standing in for a run whose MCP session could not be opened."""
-    text = str(exc).strip()
-    reason = f"could not open MCP session: {type(exc).__name__}" + (f": {text}" if text else "")
+    reason = f"could not open MCP session: {describe_exception(exc)}"
     transcript = Transcript(scenario=scenario.name, path_id=path.id, mode=mode, index=index)
     transcript.add(
         SystemEvent(scenario=scenario.name, path_id=path.id, index=index, mode=mode)
@@ -1004,9 +1003,17 @@ def run_suite(
                 # so the other scenarios still run; MCPSIM_DEBUG=1 re-raises for the traceback.
                 if os.environ.get("MCPSIM_DEBUG"):
                     raise
-                message = exc.args[0] if isinstance(exc, KeyError) and exc.args else str(exc)
-                prefix = "" if isinstance(exc, USER_ERRORS) else f"{type(exc).__name__}: "
-                row.error = f"{prefix}{message}" if str(message) else type(exc).__name__
+                # The SDK's task groups wrap a failure inside an MCP session in exception
+                # groups; the row names the failure itself.
+                leaf = sole_leaf(exc)
+                if isinstance(leaf, BaseExceptionGroup):
+                    row.error = describe_exception(leaf)
+                else:
+                    message = (
+                        leaf.args[0] if isinstance(leaf, KeyError) and leaf.args else str(leaf)
+                    )
+                    prefix = "" if isinstance(leaf, USER_ERRORS) else f"{type(leaf).__name__}: "
+                    row.error = f"{prefix}{message}" if str(message) else type(leaf).__name__
         if row.report is not None:
             print(f"{entry.name}: {summary_line(row.report)}  ({row.run_dir})", flush=True)
         else:

@@ -23,6 +23,7 @@ from mcpsim.cli import (
     dry_run_requested,
     main,
 )
+from mcpsim.mcpclient import MCPClientError
 from mcpsim.report import Report, aggregate, render_markdown
 from mcpsim.scenario import ScenarioError
 from mcpsim.verdict import Verdict
@@ -272,6 +273,18 @@ def test_user_errors_become_one_line_and_exit_1(
     assert main(["run", "s.yaml", "--only-path", "nope"]) == EXIT_FAILURE
     assert capsys.readouterr().err.strip() == "mcpsim run: no path with id 'nope'"
 
+    # A server's refusal inside an MCP session arrives wrapped in the SDK's task groups.
+    refusal = MCPClientError("HTTP 429 Too Many Requests from http://gw/mcp: locked")
+    fake_runner.raise_on_run = ExceptionGroup("tg", [ExceptionGroup("tg", [refusal])])
+    assert main(["run", "s.yaml"]) == EXIT_FAILURE
+    assert capsys.readouterr().err.strip() == (
+        "mcpsim run: HTTP 429 Too Many Requests from http://gw/mcp: locked"
+    )
+    fake_runner.raise_on_run = ExceptionGroup("tg", [ZeroDivisionError("bug")])
+    with pytest.raises(ExceptionGroup):
+        main(["run", "s.yaml"])  # a bug inside a group still shows its traceback
+
+    fake_runner.raise_on_run = KeyError("no path with id 'nope'")
     monkeypatch.setenv("MCPSIM_DEBUG", "1")
     with pytest.raises(KeyError):
         main(["run", "s.yaml", "--only-path", "nope"])

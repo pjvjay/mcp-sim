@@ -182,6 +182,15 @@ review the diff of what the models will now be told.
 - **Gateway scenarios fail with 401**: `CONTEXTFORGE_JWT` is missing. Set `CF_JWT_FILE`;
   run.sh reads the file into it.
 - **`credit balance is too low`** (HTTP 400 from Anthropic): the account is out of credit. Use
-  `--dry-run` to test the wiring without LLM calls.
+  `--dry-run` to test the wiring without LLM calls. In live mode the pantry server's own plan
+  tools call Claude with the same account, so they fail too.
+- **Gateway scenarios fail with `HTTP 429 Too Many Requests ... Account locked`**: ContextForge's
+  rate limiter refused the client. By default it allows 100 requests a minute on `/servers/…`
+  per client address (every local client shares 127.0.0.1), and after 5 refused requests it
+  locks that address out of every endpoint, `/health` included, for 15 minutes. A dry run of
+  the whole gateway suite calls the tools back to back and trips it; dry-run one scenario at a
+  time (`--name`). The lockout is kept in ContextForge's memory (no Redis locally), so it ends
+  after 15 minutes or when ContextForge restarts; `RATE_LIMIT_MEDIUM_RPM` in its `.env` raises
+  the limit.
 - **A scenario stops with a setup or connection error**: the suite records it, goes on with the
   other scenarios, and exits 1.

@@ -61,7 +61,7 @@ from typing import Any
 
 from mcpsim.llm import DEFAULT_MAX_TOKENS, LLM, Usage, sampling, total_cost_usd
 from mcpsim.matcher import MISSING, resolve
-from mcpsim.mcpclient import Catalog, Session, ToolResult
+from mcpsim.mcpclient import Catalog, Session, ToolResult, describe_exception
 from mcpsim.observers import ObserverRunner
 from mcpsim.plan import Mode, Path, Step, StepReference, parse_reference
 from mcpsim.prompt_template import Value
@@ -659,8 +659,7 @@ class _Run:
 
 
 def _describe(exc: BaseException) -> str:
-    text = str(exc).strip()
-    return f"{type(exc).__name__}: {text}" if text else type(exc).__name__
+    return describe_exception(exc)
 
 
 class StepReferenceError(LookupError):

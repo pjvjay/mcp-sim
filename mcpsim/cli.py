@@ -118,7 +118,7 @@ from pathlib import Path as FsPath
 from typing import Any
 
 from mcpsim import __version__
-from mcpsim.mcpclient import Catalog, MCPClientError, connect
+from mcpsim.mcpclient import Catalog, MCPClientError, connect, sole_leaf
 from mcpsim.report import Report, exit_code, render_markdown, summary_line
 from mcpsim.scenario import MODEL_ROLES, Scenario, ScenarioError, load_scenario
 from mcpsim.skill import SKILL_ENV, Resolved, Skill, SkillError, load_skill, one_line
@@ -270,9 +270,19 @@ def _guarded(command: str, body: Callable[[], int]) -> int:
     except _USER_ERRORS as exc:
         if os.environ.get(DEBUG_ENV):
             raise
-        message = exc.args[0] if isinstance(exc, KeyError) and exc.args else str(exc)
-        print(f"mcpsim {command}: {message}", file=sys.stderr)
-        return EXIT_FAILURE
+        return _user_error(command, exc)
+    except ExceptionGroup as group:
+        # A failure inside an MCP session reaches here wrapped in the SDK's task groups.
+        leaf = sole_leaf(group)
+        if os.environ.get(DEBUG_ENV) or not isinstance(leaf, _USER_ERRORS):
+            raise
+        return _user_error(command, leaf)
+
+
+def _user_error(command: str, exc: BaseException) -> int:
+    message = exc.args[0] if isinstance(exc, KeyError) and exc.args else str(exc)
+    print(f"mcpsim {command}: {message}", file=sys.stderr)
+    return EXIT_FAILURE
 
 
 def _exit_from_report(run_dir: FsPath, threshold: float) -> int:
