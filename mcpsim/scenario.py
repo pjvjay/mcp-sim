@@ -3,11 +3,20 @@
 A scenario is one test case: who the agent acts for (``role``), what they want (``goal``),
 the policies the agent must follow (``instructions``), what success looks like
 (``expected_outcome``), which server to drive (``server``) and the run budgets.
+
+Scenario v2 (DESIGN §3 "Scenario v2") adds, all optional so v1 files keep loading: a runner
+``category`` and display ``title``; ``user_instructions``, the second-person brief the simulated
+user plays (default built from ``role`` + ``goal``); ``context`` (device, location, language,
+details), which the simulated user always gets and the agent only when ``agent_visible``;
+``expected_behavior``, the observable behaviours the judge grades one by one (default: the
+``instructions``); and ``agent``, the agent under test's standard operating procedure (a
+SKILL.md, frontmatter stripped) and extra system ``notes``.
 """
 
 from __future__ import annotations
 
 import json
+import os
 import re
 import warnings
 from collections.abc import Sequence
@@ -15,12 +24,38 @@ from pathlib import Path as FsPath
 from typing import Any, Literal, Protocol
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    ValidationInfo,
+    field_validator,
+    model_validator,
+)
 
 DEFAULT_AGENT_MODEL = "claude-sonnet-5-5"
 DEFAULT_PLANNER_MODEL = "claude-opus-5-5"
 DEFAULT_JUDGE_MODEL = "claude-opus-5-5"
+DEFAULT_USER_MODEL = "claude-haiku-4-5-20251001"
+DEFAULT_OBSERVER_MODEL = "claude-sonnet-5-5"
 MODEL_ROLES: tuple[str, ...] = ("planner", "agent", "judge", "user", "observer")
+# Every role's built-in default; all of them are Anthropic API models. The local (Ollama)
+# planner profile is reached only by naming an ``ollama:`` planner explicitly.
+DEFAULT_MODELS: dict[str, str] = {
+    "planner": DEFAULT_PLANNER_MODEL,
+    "agent": DEFAULT_AGENT_MODEL,
+    "user": DEFAULT_USER_MODEL,
+    "observer": DEFAULT_OBSERVER_MODEL,
+    "judge": DEFAULT_JUDGE_MODEL,
+}
+
+DEFAULT_CATEGORY = "Uncategorized"
+SKILL_FILE = "SKILL.md"
+SKILL_ENV_PREFIX = "env:"
+# The validation-context key :func:`load_scenario` sets so a relative ``agent.skill`` resolves
+# against the scenario file's directory.
+BASE_DIR_CONTEXT = "base_dir"
 
 
 class ScenarioError(ValueError):
@@ -93,30 +128,49 @@ class Budgets(_Strict):
 class Models(_Strict):
     """Which model serves each role, as ``provider:model`` (a bare name means ``anthropic``).
 
-    ``user`` is the simulated user's model and defaults to the agent's. ``allow_same_judge``
-    lets the judge and the agent share a model (DESIGN §6 warns against it; docs/LOCAL_MODELS.md
-    explains when a local-only setup needs it).
+    Every role defaults to an Anthropic model (:data:`DEFAULT_MODELS`): planner and judge
+    ``claude-opus-5-5``, agent and observers ``claude-sonnet-5-5``, the simulated user
+    ``claude-haiku-4-5-20251001``. A ``null`` ``user`` / ``observer`` (as v1 ``scenario.json``
+    files hold) means that default. ``allow_same_judge`` lets the judge and the agent share a
+    model (DESIGN §6 warns against it; docs/LOCAL_MODELS.md explains when a local-only setup
+    needs it). :meth:`explicit` says which roles the scenario file itself named.
     """
 
     agent: str = Field(default=DEFAULT_AGENT_MODEL, min_length=1)
     planner: str = Field(default=DEFAULT_PLANNER_MODEL, min_length=1)
     judge: str = Field(default=DEFAULT_JUDGE_MODEL, min_length=1)
-    user: str | None = Field(default=None, min_length=1)
-    observer: str | None = Field(default=None, min_length=1)
+    user: str = Field(default=DEFAULT_USER_MODEL, min_length=1)
+    observer: str = Field(default=DEFAULT_OBSERVER_MODEL, min_length=1)
     allow_same_judge: bool = False
+
+    @field_validator("user", "observer", mode="before")
+    @classmethod
+    def _null_is_default(cls, value: Any, info: ValidationInfo) -> Any:
+        if value is None:
+            return DEFAULT_MODELS[str(info.field_name)]
+        return value
+
+    def explicit(self) -> dict[str, str]:
+        """``{role: spec}`` for the roles set explicitly when this object was validated (a
+        scenario file's own ``models``), so configuration layers can sit underneath it. A copy
+        made through ``model_validate(model_dump())`` marks every role explicit, so call this
+        on the freshly loaded scenario."""
+        return {
+            role: str(getattr(self, role)) for role in MODEL_ROLES if role in self.model_fields_set
+        }
 
     @property
     def user_model(self) -> str:
-        """The simulated user's model: ``user`` when set, else the agent's."""
-        return self.user if self.user is not None else self.agent
+        """The simulated user's model (``user``)."""
+        return self.user
 
     @property
     def observer_model(self) -> str:
-        """The default model for LLM observers: ``observer`` when set, else the agent's.
+        """The default model for LLM observers (``observer``).
 
         An observer with its own ``model`` field overrides this (:meth:`model_for_observer`).
         """
-        return self.observer if self.observer is not None else self.agent
+        return self.observer
 
     def model_for_observer(self, observer: Observer) -> str:
         return observer.model if observer.model is not None else self.observer_model
@@ -501,8 +555,198 @@ class ObserverLike(Protocol):
     def build(self) -> Observer: ...
 
 
+# --- scenario v2: context, the agent's SOP skill, defaults ------------------------------------
+
+
+class Context(_Strict):
+    """The situation the simulated user is in (DESIGN §3 "Scenario v2").
+
+    The simulated user always gets it; the agent under test only when ``agent_visible`` is
+    true (a deployed agent may know the channel and location, or may not). ``details`` holds
+    anything else worth saying (``{account: "guest", time: "Friday 6 pm"}``).
+    """
+
+    device: str | None = None
+    location: str | None = None
+    language: str | None = None
+    details: dict[str, Any] = Field(default_factory=dict)
+    agent_visible: bool = False
+
+    @model_validator(mode="after")
+    def _non_blank(self) -> Context:
+        for field_name in ("device", "location", "language"):
+            value = getattr(self, field_name)
+            if value is not None and not value.strip():
+                raise ValueError(f"context.{field_name} must not be blank")
+        for key in self.details:
+            if not str(key).strip():
+                raise ValueError("context.details has a blank key")
+        return self
+
+    def is_empty(self) -> bool:
+        return not (self.device or self.location or self.language or self.details)
+
+    def items(self) -> list[tuple[str, str]]:
+        """``(label, value)`` pairs in display order: device, location, language, then
+        ``details`` in file order (a non-string value as compact JSON)."""
+        pairs: list[tuple[str, str]] = []
+        for field_name in ("device", "location", "language"):
+            value = getattr(self, field_name)
+            if value is not None:
+                pairs.append((field_name, value.strip()))
+        for key, value in self.details.items():
+            shown = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+            pairs.append((str(key).strip(), str(shown).strip()))
+        return pairs
+
+
+def split_frontmatter(text: str) -> tuple[dict[str, Any], str]:
+    """``(frontmatter, body)`` of a Markdown file whose first line may open a ``---`` YAML block.
+
+    A file without frontmatter is all body. Raises ``ValueError`` when the block is not closed
+    or is not a YAML mapping.
+    """
+    stripped = text.lstrip("﻿")
+    lines = stripped.splitlines()
+    if not lines or lines[0].strip() != "---":
+        return {}, stripped.strip()
+    end = next((i for i, line in enumerate(lines[1:], start=1) if line.strip() == "---"), None)
+    if end is None:
+        raise ValueError("the YAML frontmatter opened by '---' on line 1 is never closed")
+    raw = "\n".join(lines[1:end])
+    try:
+        meta = yaml.safe_load(raw) if raw.strip() else {}
+    except yaml.YAMLError as exc:
+        raise ValueError(f"the YAML frontmatter is not valid YAML: {exc}") from None
+    if not isinstance(meta, dict):
+        raise ValueError(f"the YAML frontmatter must be a mapping, got {type(meta).__name__}")
+    return meta, "\n".join(lines[end + 1 :]).strip()
+
+
+def resolve_skill_path(spec: str, base_dir: str | os.PathLike[str] | None = None) -> FsPath:
+    """The SKILL.md an ``agent.skill`` value names (DESIGN §3 "Scenario v2").
+
+    * ``env:VAR`` — the path held in environment variable ``VAR`` (a relative value resolves
+      against the current working directory, where the variable was set);
+    * an absolute path (``~`` expands);
+    * a relative path, resolved against ``base_dir`` (the scenario file's directory) or, without
+      one, the current working directory.
+
+    A directory means its ``SKILL.md``. Raises ``ValueError`` with the spec and the path tried
+    when the variable is unset or the file does not exist.
+    """
+    text = spec.strip()
+    if text.startswith(SKILL_ENV_PREFIX):
+        var = text[len(SKILL_ENV_PREFIX) :].strip()
+        if not var:
+            raise ValueError(f"skill {spec!r}: name the environment variable after 'env:'")
+        value = os.environ.get(var, "").strip()
+        if not value:
+            raise ValueError(
+                f"skill {spec!r}: environment variable {var} is not set (it must hold the path "
+                f"to a {SKILL_FILE})"
+            )
+        path = FsPath(value).expanduser()
+        if not path.is_absolute():
+            path = FsPath.cwd() / path
+    else:
+        path = FsPath(text).expanduser()
+        if not path.is_absolute():
+            path = (FsPath(base_dir) if base_dir is not None else FsPath.cwd()) / path
+    if path.is_dir():
+        path = path / SKILL_FILE
+    if not path.is_file():
+        raise ValueError(f"skill {spec!r}: no {SKILL_FILE} at {path}")
+    return path.resolve()
+
+
+def read_skill(path: str | os.PathLike[str]) -> tuple[str, str]:
+    """``(name, body)`` of a SKILL.md: the frontmatter ``name`` (else the folder's name) and the
+    Markdown body with the frontmatter stripped. Raises ``ValueError`` for an unreadable file,
+    a broken frontmatter block or an empty body."""
+    fs_path = FsPath(path)
+    try:
+        text = fs_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise ValueError(f"cannot read skill {fs_path}: {exc}") from None
+    try:
+        meta, body = split_frontmatter(text)
+    except ValueError as exc:
+        raise ValueError(f"skill {fs_path}: {exc}") from None
+    if not body:
+        raise ValueError(f"skill {fs_path}: no procedure after the frontmatter")
+    name = meta.get("name")
+    if not isinstance(name, str) or not name.strip():
+        name = fs_path.parent.name or fs_path.stem
+    return name.strip(), body
+
+
+class AgentSpec(_Strict):
+    """The agent under test's standard operating procedure and extra system text.
+
+    ``skill`` names a SKILL.md (see :func:`resolve_skill_path`); when the scenario is validated
+    it is read and ``skill_path`` / ``skill_name`` / ``skill_text`` are filled, so the
+    ``scenario.json`` of a run records the exact procedure the agent ran on (and a re-judge
+    never re-reads the file). ``skill_text`` may also be given inline instead of ``skill``.
+    ``notes`` is extra system text for the agent, such as the limits of this environment.
+    """
+
+    skill: str | None = None
+    notes: str | None = None
+    skill_path: str | None = None
+    skill_name: str | None = None
+    skill_text: str | None = None
+
+    @model_validator(mode="after")
+    def _resolve_skill(self, info: ValidationInfo) -> AgentSpec:
+        if self.skill is not None and not self.skill.strip():
+            raise ValueError("agent.skill must not be blank")
+        if self.notes is not None and not self.notes.strip():
+            raise ValueError("agent.notes must not be blank")
+        if self.skill_text is not None and not self.skill_text.strip():
+            raise ValueError("agent.skill_text must not be blank")
+        if self.skill is not None and self.skill_text is None:
+            context = info.context if isinstance(info.context, dict) else {}
+            path = resolve_skill_path(self.skill, context.get(BASE_DIR_CONTEXT))
+            name, body = read_skill(path)
+            self.skill_path = str(path)
+            self.skill_name = self.skill_name or name
+            self.skill_text = body
+        if self.skill_text is not None and not self.skill_name:
+            self.skill_name = "inline"
+        return self
+
+    @property
+    def has_sop(self) -> bool:
+        """True when the agent runs on a standard operating procedure."""
+        return self.skill_text is not None
+
+
+def default_title(name: str) -> str:
+    """``cheapest-penne`` -> ``Cheapest penne``."""
+    words = re.sub(r"[-_.]+", " ", name).strip()
+    return words[:1].upper() + words[1:] if words else name
+
+
+def default_user_instructions(role: str, goal: str) -> str:
+    """The v1 fallback for ``user_instructions``: the persona and the goal, in the second
+    person."""
+    return (
+        f"You are this person: {role.strip()}\n\n"
+        f"What you want from the assistant: {goal.strip()}"
+    )
+
+
 class Scenario(_Strict):
     name: str = Field(min_length=1, pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+    # v2 (all optional; filled with their defaults after validation, see _v2_defaults)
+    category: str = DEFAULT_CATEGORY
+    title: str | None = None
+    user_instructions: str | None = None
+    context: Context = Field(default_factory=Context)
+    expected_behavior: list[str] | None = None
+    agent: AgentSpec = Field(default_factory=AgentSpec)
+    # v1
     role: str = Field(min_length=1)
     goal: str = Field(min_length=1)
     instructions: list[str] = Field(default_factory=list)
@@ -515,6 +759,48 @@ class Scenario(_Strict):
     concurrency: int = Field(default=4, ge=1)
     tools: ToolPolicy = Field(default_factory=ToolPolicy)
     observers: list[Observer] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _v2_defaults(self) -> Scenario:
+        """``title`` from ``name``, ``user_instructions`` from ``role`` + ``goal``,
+        ``expected_behavior`` from ``instructions``; blanks are errors, not defaults."""
+        if not self.category.strip():
+            raise ValueError("category must not be blank")
+        self.category = self.category.strip()
+        if self.title is not None and not self.title.strip():
+            raise ValueError("title must not be blank")
+        if self.title is None:
+            self.title = default_title(self.name)
+        if self.user_instructions is not None and not self.user_instructions.strip():
+            raise ValueError("user_instructions must not be blank")
+        if self.user_instructions is None:
+            self.user_instructions = default_user_instructions(self.role, self.goal)
+        if self.expected_behavior is None:
+            # A blank instruction is reported by _instructions_non_blank below.
+            self.expected_behavior = [item.strip() for item in self.instructions]
+            return self
+        for i, item in enumerate(self.expected_behavior):
+            if not item.strip():
+                raise ValueError(f"expected_behavior[{i}] is blank")
+        self.expected_behavior = [item.strip() for item in self.expected_behavior]
+        return self
+
+    @property
+    def display_title(self) -> str:
+        return self.title or default_title(self.name)
+
+    @property
+    def simulated_user_instructions(self) -> str:
+        """What the simulated user is told (always set after validation)."""
+        return self.user_instructions or default_user_instructions(self.role, self.goal)
+
+    @property
+    def behaviors(self) -> list[str]:
+        """The expected-behaviour items the judge grades, in order (always set after
+        validation; the ``instructions`` when the file gives none)."""
+        if self.expected_behavior is None:
+            return [item.strip() for item in self.instructions]
+        return [item.strip() for item in self.expected_behavior]
 
     @model_validator(mode="before")
     @classmethod
@@ -573,18 +859,29 @@ def _format_validation_error(path: FsPath, exc: ValidationError) -> str:
     return "\n".join(lines)
 
 
-def parse_scenario(data: Any, *, source: str = "<data>") -> Scenario:
-    """Validate an already-parsed mapping into a :class:`Scenario`."""
+def parse_scenario(
+    data: Any,
+    *,
+    source: str = "<data>",
+    base_dir: str | os.PathLike[str] | None = None,
+) -> Scenario:
+    """Validate an already-parsed mapping into a :class:`Scenario`.
+
+    ``base_dir`` is where a relative ``agent.skill`` resolves (the scenario file's directory;
+    the current working directory when not given).
+    """
     if not isinstance(data, dict):
         raise ScenarioError(f"{source}: top level must be a mapping, got {type(data).__name__}")
+    context = {BASE_DIR_CONTEXT: str(base_dir)} if base_dir is not None else None
     try:
-        return Scenario.model_validate(data)
+        return Scenario.model_validate(data, context=context)
     except ValidationError as exc:
         raise ScenarioError(_format_validation_error(FsPath(source), exc)) from exc
 
 
 def load_scenario(path: str | FsPath) -> Scenario:
-    """Load a YAML or JSON scenario file."""
+    """Load a YAML or JSON scenario file (a relative ``agent.skill`` resolves against the
+    file's directory)."""
     fs_path = FsPath(path)
     try:
         raw = fs_path.read_text(encoding="utf-8")
@@ -597,4 +894,4 @@ def load_scenario(path: str | FsPath) -> Scenario:
             data = yaml.safe_load(raw)
     except (yaml.YAMLError, json.JSONDecodeError) as exc:
         raise ScenarioError(f"{fs_path}: cannot parse scenario: {exc}") from exc
-    return parse_scenario(data, source=str(fs_path))
+    return parse_scenario(data, source=str(fs_path), base_dir=fs_path.resolve().parent)

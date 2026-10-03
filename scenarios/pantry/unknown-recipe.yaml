@@ -1,8 +1,29 @@
 # Scenario 6 (DESIGN §7): the goal names a recipe that does not exist. The agent must consult
 # list_recipes and say so rather than invent a recipe or plan something else unasked.
 name: unknown-recipe
+# Scenario v2 (DESIGN §3): the runner groups it under its category; the simulated user plays
+# user_instructions in its context; the judge grades expected_behavior item by item.
+category: Recipe planning
+title: Recipe that is not in the library
+user_instructions: >
+  You are Alex, hosting a dinner party in Vancouver tonight. You are sure you saw
+  "lobster_thermidor" in the recipe library last week and want it planned with a shopping list.
+  If the assistant tells you it is not there, you are disappointed but accept it; you may ask
+  once which recipes do exist, but do not ask for a substitute to be planned. You do not want to
+  be quietly given a different dinner. You do not know any other recipe names, ingredients or
+  prices.
+context:
+  device: desktop web
+  location: "Vancouver, BC (49.2827, -123.1207)"
+  language: en
+expected_behavior:
+  - Checks list_recipes before planning and never calls plan_recipe with lobster_thermidor.
+  - Tells the person plainly that lobster_thermidor is not in the recipe library and names
+    the recipe slugs that do exist.
+  - Lists recipe slugs only from the list_recipes result.
+  - Plans no substitute recipe and invents no ingredient list or price for lobster thermidor.
 role: >
-  A dinner-party host in Calgary who is sure they saw "lobster_thermidor" in the recipe library
+  A dinner-party host in Vancouver who is sure they saw "lobster_thermidor" in the recipe library
   last week and wants it planned tonight. Will accept being told it is not there, but not being
   quietly given a different dinner.
 goal: >
@@ -38,9 +59,6 @@ tools: { deny: ["submit_*", "review_*"], disclosure: progressive }
 repeat: 3
 judge_votes: 3
 budgets: { max_turns: 10, max_tool_calls: 10, max_cost_usd: 0.75 }
-# Only plan generation goes to the local Cohere model; agent, user and judge keep the defaults
-# (override per run with --models).
-models: { planner: ollama:command-r7b }
 # Observers (DESIGN §2b): the librarian reads list_recipes at scout time and at every tool
 # result; when the slug the user named is not there, the agent's goal becomes saying so.
 observers:

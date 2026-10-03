@@ -10,11 +10,11 @@ asked to report on itself).
 ```mermaid
 flowchart TD
     subgraph S["1 · Scenario (YAML)"]
-        S1["role · goal · instructions"]
+        S1["role · goal · instructions<br/>category · title · user_instructions · context · expected_behavior · agent.skill (SOP)"]
         S2["expected_outcome<br/>prose for the judge + JSON spec for the matcher"]
         S3["tools: allow / deny · disclosure = all | plan | progressive"]
         S4["observers: identity · when(condition) → then{enable_tools, enable_goal, flag, fail}"]
-        S5["models: planner = ollama:command-r7b (local) · agent, user, observers, judge = API"]
+        S5["models: every role on the Anthropic API by default<br/>(an explicit ollama: planner takes the local profile)"]
     end
 
     subgraph C["2 · Catalog"]
@@ -31,15 +31,15 @@ flowchart TD
         DISC["disclosed toolset + enabled goals<br/>(the rest reachable via discover_tools)"]
     end
 
-    subgraph P["4 · Orchestrating planner (local Cohere)"]
+    subgraph P["4 · Orchestrating planner (claude-opus-5-5)"]
         PL["plan from the disclosed tools and the reports"]
         PLAN[("plan.json<br/>paths: happy · recovery · alternative · boundary · policy<br/>steps with tool + arguments · checkpoints")]
         VAL["validate: tool ∈ catalog enum · argument keys and types ·<br/>recovery path contains a failing step · checkpoint shape"]
     end
 
     subgraph R["5 · Runs (path × mode × repeat)"]
-        US["Simulated user LLM<br/>plays the role"]
-        AG["Subject agent LLM<br/>tool-use loop over the offered tools"]
+        US["Simulated user LLM<br/>plays user_instructions in its context"]
+        AG["Subject agent LLM<br/>tool-use loop over the offered tools, on its SOP"]
         SESS["MCP ClientSession<br/>tools/call JSON-RPC"]
         OBR{{"Observers at turn / tool_result / end"}}
         EFF2["effects mid-run:<br/>reveal tools · add goals · flag · fail"]
@@ -51,11 +51,11 @@ flowchart TD
         SV["deterministic: scope violations<br/>(tool not allowed / not disclosed)"]
         OF["deterministic: observer fail effects"]
         JV["judge LLM × N votes<br/>reads the transcript and the informant reports,<br/>never the subject's own claims as proof"]
-        VER[/"verdict.json<br/>passed · score · matches · checklist with evidence · reasons"/]
+        VER[/"verdict.json<br/>passed · score · matches · expected-behaviour checklist with evidence ·<br/>goal_achieved · sop_followed · reasons"/]
     end
 
     subgraph RP["7 · Report"]
-        AGG["aggregate: pass rate by path × mode · worst failures · cost"]
+        AGG["aggregate: pass rate by path × mode · pass^k · behaviour tallies ·<br/>worst failures · cost · run time"]
         MD[/"report.md · report.json · exit code against a threshold"/]
     end
 
@@ -67,7 +67,7 @@ flowchart TD
     DISC --> PL --> PLAN --> VAL
     VAL -->|"re-ask once on a violation"| PL
     PLAN -->|"guided: steps as guidance · free: goal only"| AG
-    US <-->|"goal in the role's voice · clarifying answers"| AG
+    US <-->|"what the persona wants, in its voice · clarifying answers"| AG
     AG <-->|"tool_use ↔ tool_result"| SESS
     SESS <-->|"JSON-RPC"| MCP
     AG --> OBR --> EFF2 --> AG
@@ -99,7 +99,7 @@ sequenceDiagram
     autonumber
     participant SC as Scout (no LLM)
     participant OBS as Observers<br/>(identities, API)
-    participant PL as Planner<br/>(ollama:command-r7b)
+    participant PL as Planner<br/>(claude-opus-5-5)
     participant U as Simulated user<br/>(API)
     participant A as Subject agent<br/>(API)
     participant M as MCP server<br/>(pantry)

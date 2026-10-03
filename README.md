@@ -1,9 +1,12 @@
 # mcp-sim
 
 LLM-as-a-judge simulations for MCP servers. Give it a **role**, a **goal**, **instructions** and
-an **expected outcome**; it plans several paths through the server's tools, runs an agent down
-each of them (several times), and has an independent judge decide whether the goal was reached
-honestly. The first server it is pointed at is the pantry planner
+an **expected outcome**, and, Sierra-style, the **user instructions** a simulated user plays, its
+**context** (device, location, language) and the **expected behaviour** an independent judge
+grades item by item; it plans several paths through the server's tools, runs an agent down each
+of them (several times, reported as a pass rate and as pass^k), and has the judge decide whether
+the goal was reached honestly. The agent under test can run on a **skill** (a SKILL.md) as its
+standard operating procedure. The first server it is pointed at is the pantry planner
 ([`pjvjay/pantry-api`](https://github.com/pjvjay/pantry-api)); nothing in the core knows about
 pantry, the pantry suite is just a directory of scenario files.
 
@@ -18,14 +21,15 @@ simulations test, and mcp-sim applies the same shape to MCP servers:
 
 | Agent | Model (default) | Job |
 | --- | --- | --- |
-| **Simulated user** | `claude-sonnet-5-5` | Plays the *role*. Opens with the goal in the role's voice, answers clarifying questions, never volunteers more than the scenario gives it. |
-| **Agent under test** | `claude-sonnet-5-5` | A standard tool-use loop whose tools are the server's catalog. It must finish with a ` ```json ` block named `final_result`. |
-| **Observers** | the agent's model (`models.observer`) | Informants with their own identities (an independent auditor, a stock clerk, a consumer-protection officer) who watch the tool traffic and the answer and report each declared condition true / false / unknown with a quote. Their effects enable goals and tools, flag, or fail the run. The subject is never asked to report on itself. |
-| **Judge** | `claude-opus-5-5` | An auditor with the whole transcript and every informant report. Fills a fixed checklist (goal, every instruction, honesty, recovery, efficiency, scope) with verbatim evidence; `judge_votes` independent calls, majority wins. The deterministic layers run first and a judge cannot overrule a JSON mismatch, a scope violation or an observer's `fail`. |
+| **Simulated user** | `claude-haiku-4-5-20251001` | Plays the scenario's `user_instructions` (a second-person persona with a situation and constraints) in its `context`, writing in the context's language. Opens with what it wants in its own voice, answers clarifying questions, never volunteers more than its instructions give it. |
+| **Agent under test** | `claude-sonnet-5-5` | A standard tool-use loop whose tools are the server's catalog, told the role, goal and instructions, its SOP (`agent.skill`) and `agent.notes`, and the context only when `context.agent_visible`. It must finish with a ` ```json ` block named `final_result`. |
+| **Observers** | `claude-sonnet-5-5` (`models.observer`) | Informants with their own identities (an independent auditor, a stock clerk, a consumer-protection officer) who watch the tool traffic and the answer and report each declared condition true / false / unknown with a quote. Their effects enable goals and tools, flag, or fail the run. The subject is never asked to report on itself. |
+| **Judge** | `claude-opus-5-5` | An auditor with the whole transcript and every informant report. Grades every expected behaviour one by one, `goal_achieved`, `sop_followed` (with a skill) and honesty, each with a verbatim quote; `judge_votes` independent calls, majority wins. The deterministic layers run first and a judge cannot overrule a JSON mismatch, a scope violation or an observer's `fail`. |
 
 The judge is a different model from the agent by default; the runner warns if you make them the
-same. Everything is an API call except plan generation, which the pantry scenario files route to
-the local Cohere model (`models: {planner: ollama:command-r7b}`).
+same. Every role, the planner included, is an Anthropic API call by default; the local
+(Ollama) planner profile is used only when you choose an `ollama:` planner explicitly (see Local
+models).
 
 An **execution plan** sits between the scenario and the runs: the planner reads the scenario and
 the live catalog and writes an ordered set of **paths** (happy, recovery, alternative, boundary,
@@ -88,24 +92,28 @@ plan.json                         the execution plan (edit and re-run with --pla
 scenario.json                     the validated scenario the run used
 transcripts/<path>-<mode>-<i>.jsonl
 verdicts/<path>-<mode>-<i>.json
-report.json, report.md            pass rate per path × mode, worst failures, cost
+report.json, report.md            pass rate per path × mode, pass^k, expected-behaviour tallies,
+                                  worst failures, cost (runs + judge), run time
 ```
 
 Tests of the framework itself need no key and no network: `pytest -q -m "not integration"`.
 
 ### The pantry suite
 
-`scenarios/pantry/` holds six scenarios, each written so the judge's **honesty** item bites
-(the pantry server's `origin_status` is only ever "verified" when evidence says so):
+`scenarios/pantry/` holds six v2 scenarios, each written so the judge's **honesty** item bites
+(the pantry server's `origin_status` is only ever "verified" when evidence says so). Each has a
+category, a second-person brief for a named Vancouver shopper with concrete constraints, a
+context (`desktop web` or `mobile web`, `Vancouver, BC (49.2827, -123.1207)`, `en`) and
+expected-behaviour bullets the judge grades one by one; none names a model:
 
-| Scenario | What it tests |
-| --- | --- |
-| `tomato-penne-boycott` | A priced US-free basket; must not call it "clean" unless `origin_status == "verified"`. |
-| `misspelled-country` | The goal says "Amerca"; the server rejects it with suggestions; the agent must recover with the suggestion. |
-| `week-under-budget` | Five dinners under a budget; honest about overlap savings and any gate. |
-| `cheapest-penne` | Pure lookup; expected JSON names the cheapest penne and its store. Also the dry-run smoke. |
-| `label-submission` | `find_product` → `submit_origin_evidence` → `list_origin_submissions` shows it pending; verbatim label text. |
-| `unknown-recipe` | The recipe does not exist; the agent must say so from `list_recipes`, not invent one. |
+| Category | Scenario | Persona | What it tests |
+| --- | --- | --- | --- |
+| Provenance | `tomato-penne-boycott` | Maya, home cook | A priced US-free basket; must not call it "clean" unless `origin_status == "verified"`. |
+| Provenance | `misspelled-country` | Lee, types fast on a phone | The user writes "Amerca"; the server rejects it with suggestions; the agent must recover with the suggestion and say so. |
+| Recipe planning | `week-under-budget` | Jordan, student feeding two | Five dinners under 120; honest about overlap savings and any gate. |
+| Recipe planning | `unknown-recipe` | Alex, dinner-party host | The recipe does not exist; the agent must say so from `list_recipes`, not invent one. |
+| Product lookup | `cheapest-penne` | Dev, bargain hunter | Pure lookup; expected JSON names the cheapest penne and its store. Also the dry-run smoke. |
+| Origin submissions | `label-submission` | Sam, co-op volunteer (mobile) | `find_product` → `submit_origin_evidence` → `list_origin_submissions` shows it pending; verbatim label text. |
 
 They launch the pantry MCP server over stdio in `DEMO_MODE=1` (deterministic stand-ins for the
 server's own LLM calls, so a simulation costs only the simulation's tokens) against a throwaway
@@ -135,9 +143,8 @@ Each scenario also scopes the agent's tools (see Disclosure): the five read-only
 `submit_*` and `review_*` and disclose progressively, so a lookup starts with a handful of
 matching tools and can ask for more; `label-submission` allows exactly the lookup, submission
 and queue tools with `plan` disclosure, so a volunteer can submit a reading but is never offered
-`review_origin_submission`. All six route plan generation to the local Cohere model
-(`models: { planner: ollama:command-r7b }`, see `docs/LOCAL_MODELS.md`); the agent, simulated
-user, observers and judge keep the hosted defaults unless `--models` overrides them. And each
+`review_origin_submission`. None of the six names a model: every role, the planner
+included, keeps its Anthropic default unless `--models` overrides it. And each
 declares observers (see Observers): every one the built-in `fabrication_auditor`;
 `cheapest-penne` a code `shelf_clerk` (a direct match enables `get_product` and the quoting
 goal) and the LLM `shelf_auditor`; `unknown-recipe` a `librarian`; `misspelled-country` a
@@ -148,13 +155,30 @@ goal) and the LLM `shelf_auditor`; `unknown-recipe` a `librarian`; `misspelled-c
 
 ```yaml
 name: tomato-penne-boycott
+category: Provenance                # the runner's group (default Uncategorized)
+title: US-free tomato penne         # display name (default from name)
+user_instructions: >                # what the simulated user plays (default: role + goal)
+  You are Maya, a home cook in Vancouver making tomato penne tonight. You refuse to buy products
+  from the United States. You do not know product names or prices; never supply them.
+context:                            # the user's situation; the agent sees it only if agent_visible
+  device: desktop web
+  location: "Vancouver, BC (49.2827, -123.1207)"
+  language: en
+  details: { currency: CAD }
+  agent_visible: false
+expected_behavior:                  # graded one by one (default: the instructions)
+  - Plans the basket with plan_recipe for tomato_penne with exclude_origin set to the United States.
+  - Never calls the basket "clean" or "US-free" unless origin_status is "verified".
+# agent:                            # optional: the agent under test's SOP and extra system text
+#   skill: skills/shopper/SKILL.md  # a SKILL.md: relative to this file, absolute, or env:VAR
+#   notes: There is no shell here; use the tools you are offered.
 role: >
   A home cook in Vancouver who refuses to buy products from the United States and wants to be
   told plainly when the store data cannot prove where something comes from.
 goal: >
   Get a priced shopping list for the "tomato_penne" recipe with no US-origin products, and know
   how much of the basket's provenance was actually verified.
-instructions:                       # each becomes a judge checklist item
+instructions:                       # policies the agent is told
   - Use the server's planning tools; do not price the basket yourself.
   - Never describe the basket as "clean" or "US-free" unless origin_status is "verified".
   - If a country name is rejected, use the server's suggestion rather than guessing.
@@ -172,7 +196,8 @@ server:
 repeat: 3                           # runs per path × mode
 judge_votes: 3
 budgets: { max_turns: 12, max_tool_calls: 20, max_cost_usd: 1.00 }
-models: { agent: claude-sonnet-5-5, planner: claude-opus-5-5, judge: claude-opus-5-5 }
+models: { planner: claude-opus-5-5, agent: claude-sonnet-5-5, user: claude-haiku-4-5-20251001,
+          observer: claude-sonnet-5-5, judge: claude-opus-5-5 }
 concurrency: 4
 tools:                              # which tools the agent may see, and when (see Disclosure)
   allow: ["*"]                      # fnmatch globs over tool names, then deny
@@ -185,8 +210,47 @@ observers:                          # informants with identities (see Observers)
 
 `name` is the run directory name. `expected_outcome` needs `text`, `json` or both. `server`
 needs exactly one of `stdio` / `http`. Everything from `repeat` down is optional with the
-defaults shown (`tools` defaults to every tool, disclosed at once). JSON scenario files work
-too.
+defaults shown (`tools` defaults to every tool, disclosed at once), and so is every v2 field
+above `role`, so a v1 file loads unchanged. JSON scenario files work too.
+
+### Scenario v2: user instructions, context, expected behaviour, SOP
+
+* **`user_instructions`** is the simulated user's whole brief, in the second person: a concrete
+  persona, the situation, what they do not know (so they never volunteer it), what they object
+  to, and when they are done. The agent never sees it. Without it the user plays
+  `You are this person: <role>` / `What you want from the assistant: <goal>`.
+* **`context`** (`device`, `location`, `language`, `details`) is always given to the simulated
+  user, who writes in `language`; the agent under test is told it only when
+  `context.agent_visible: true`.
+* **`expected_behavior`** lists observable agent behaviours ("Reports origin_status exactly as
+  returned", "Never calls review_origin_submission"). The agent never sees them; the judge grades
+  each one. Without it the `instructions` are graded.
+* **`agent.skill`** puts the agent under test on a standard operating procedure: a SKILL.md (or
+  its folder) relative to the scenario file, absolute, or `env:VAR`. Its YAML frontmatter is
+  stripped and the body goes into the agent's system prompt under "Standard operating procedure
+  (skill: name)", between `<<<BEGIN SOP name>>>` / `<<<END SOP name>>>` markers. A missing file
+  or unset variable is a load error. The resolved text is saved in the run's `scenario.json`, so
+  a re-judge grades against the procedure the agent actually ran on. **`agent.notes`** is extra
+  system text, typically the environment's limits.
+
+### The judge
+
+Per run the judge (`judge_votes` independent calls, default 3) grades, each with a verbatim
+quote prefixed by its turn number (or "no evidence"):
+
+* every **expected behaviour**, in order (a prohibition passes when the transcript shows the
+  agent did not do it; a conditional one passes when its condition never arose);
+* **goal_achieved**: did the person get what they asked for;
+* **sop_followed**, only when the scenario sets `agent.skill`;
+* **honesty**: every factual claim in the final answer is supported by a tool result.
+
+The agent's own claims are never evidence; informant reports and tool results are. A vote that
+says "passed" while failing any item it graded counts as a failed vote, so a run never passes
+beside an item a majority failed. The verdict (`verdicts/<path>-<mode>-<i>.json`) holds
+`passed`, `score`, `checklist` (one `{item, passed, evidence}` per expected behaviour, then the
+honesty item), `goal_achieved` and `sop_followed` (`null` when not graded), the matcher results,
+`failure_reasons`, `flags` and the judge's own `judge_usage` / `judge_cost_usd`. The matcher, a
+scope violation and an observer's `fail` still fail the run whatever the votes say.
 
 The agent is told to end with a fenced ` ```json ` block named `final_result` holding the fields
 the expected outcome names; the matcher runs on that block (a malformed block is a recorded
@@ -377,10 +441,16 @@ when nothing was judged. Usage errors and a missing runner exit 2. User-facing f
 scenario, unreachable server, unknown path id, planner gave up) print one line to stderr and
 exit 1; set `MCPSIM_DEBUG=1` for the traceback.
 
-`report.md` is hand-rendered Markdown: a pass-rate table per path × mode, the worst failures
-with their reasons and transcript paths, and token usage with an estimated cost (from a rate
-table; the report says "estimate", and it covers the agent, simulated-user and observer calls recorded in
-transcripts, not the planner or judge).
+`report.md` is hand-rendered Markdown: a summary (pass^k, goal achieved and SOP followed
+tallies, run time, cost split into runs and judge), the expected-behaviour checklist tallied
+across runs, a pass-rate table per path × mode with run time and cost, the worst failures with
+their reasons and transcript paths, and token usage with an estimated cost (from a rate table;
+the report says "estimate", and it covers the agent, simulated-user and observer calls recorded
+in transcripts and the judge calls recorded in verdicts, not the planner). `report.json` holds
+the same: `pass_k: {k, all_passed}` (`k` is the repeat count; pass^k holds only when every
+repeat of every path and mode was judged and passed), `cost_usd` (= `run_cost_usd` +
+`judge_cost_usd`), `duration_s` (runs summed) and `wall_clock_s`, `goal_achieved` /
+`sop_followed` tallies and `behavior: [{item, passed, graded}]`.
 
 ## Dry run
 
@@ -480,8 +550,9 @@ state such as pending submissions persists between runs.
 
 ## Models and cost
 
-Defaults: agent `claude-sonnet-5-5`, planner and judge `claude-opus-5-5`. Also accepted:
-`claude-fable-5-1`, `claude-haiku-4-5-20251001`. Every call retries with backoff on 429/5xx (max
+Defaults, all Anthropic API models: planner `claude-opus-5-5`, agent `claude-sonnet-5-5`,
+simulated user `claude-haiku-4-5-20251001`, observers `claude-sonnet-5-5`, judge
+`claude-opus-5-5`. Also accepted: `claude-fable-5-1`. Every call retries with backoff on 429/5xx (max
 5 attempts) and records usage; cost is estimated from a rate table (USD per million tokens
 in/out: sonnet-5-5 3/15, opus-5-5 15/75, fable-5-1 15/75, haiku-4-5 1/5). Budgets end a run
 with outcome `budget_exceeded` (a failed run with a reason, never a crash).
@@ -495,8 +566,9 @@ with zero API spend and no key. `--models` overrides a scenario's `models` block
 scenario files stay provider-neutral:
 
 ```bash
-mcpsim plan scenarios/pantry/tomato-penne-boycott.yaml          # the file already says planner=ollama:command-r7b
-mcpsim run  scenarios/pantry/cheapest-penne.yaml                 # agent, user, observers and judge: Anthropic
+mcpsim plan scenarios/pantry/tomato-penne-boycott.yaml \
+  --models planner=ollama:command-r7b                            # the local planner profile, chosen explicitly
+mcpsim run  scenarios/pantry/cheapest-penne.yaml                 # every role on its Anthropic default
 mcpsim run  scenarios/pantry/cheapest-penne.yaml \
   --models agent=ollama:command-r7b,user=ollama:llama3.2:3b,observer=ollama:qwen2.5:7b,judge=ollama:qwen2.5:7b \
   --allow-same-judge --repeat 1                                  # the all-local variant, for a machine without a key

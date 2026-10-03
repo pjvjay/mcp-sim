@@ -18,8 +18,8 @@ import pytest
 import yaml
 
 from mcpsim import runner
-from mcpsim.judge import DRY_RUN_JUDGE_MODEL, VERDICT_TOOL
-from mcpsim.llm import AnthropicLLM
+from mcpsim.judge import DRY_RUN_JUDGE_MODEL, HONESTY_ITEM, VERDICT_TOOL
+from mcpsim.llm import AnthropicLLM, Usage
 from mcpsim.mcpclient import MCPClientError, Session
 from mcpsim.plan import ExecutionPlan, Path, Step
 from mcpsim.planner import DRY_RUN_PATH_ID
@@ -125,8 +125,21 @@ def test_dry_run_writes_every_artefact(quick_path: FsPath, out_dir: FsPath) -> N
         (DRY_RUN_PATH_ID, "free"),
         (DRY_RUN_PATH_ID, "guided"),
     ]
+    # pass^1 holds: the one repeat of each path and mode passed. Nothing graded the goal.
+    assert report.pass_k.model_dump() == {"k": 1, "all_passed": True}
+    assert report.duration_s > 0 and report.wall_clock_s > 0
+    assert report.duration_s == pytest.approx(
+        sum(
+            Transcript.read_jsonl(run_dir / "transcripts" / f"{stem}.jsonl").duration_s
+            for stem in stems
+        ),
+        abs=0.01,
+    )
+    assert (report.judge_cost_usd, report.goal_achieved.graded, report.behavior) == (0.0, 0, [])
+    assert verdict.goal_achieved is None and verdict.sop_followed is None
     md = (run_dir / "report.md").read_text(encoding="utf-8")
     assert md.startswith("# mcp-sim report: fake-lookup\n")
+    assert "pass^1 yes" in md and "- pass^1: **yes**" in md
     assert f"| {DRY_RUN_PATH_ID} | guided | 1 | 1 |" in md
     assert "deterministic:" not in md
 
@@ -209,19 +222,16 @@ def test_judge_and_report_refuse_a_directory_that_is_not_a_run(tmp_path: FsPath)
         runner.report_run_dir(tmp_path)
 
 
-def _vote(passed: bool, score: float, instruction_count: int) -> Any:
+def _vote(passed: bool, score: float, behavior_count: int) -> Any:
     ok = {"passed": True, "evidence": '[5] "price": 2.49'}
     bad = {"passed": False, "evidence": "no evidence"}
     item = ok if passed else bad
     return structured_response(
         VERDICT_TOOL,
         {
-            "goal": item,
-            "instructions": [item] * instruction_count,
+            "expected_behavior": [item] * behavior_count,
+            "goal_achieved": item,
             "honesty": item,
-            "recovery": ok,
-            "efficiency": ok,
-            "scope": ok,
             "passed": passed,
             "score": score,
             "failure_reasons": [] if passed else ["goal missed"],
@@ -283,7 +293,8 @@ def test_judge_run_dir_uses_the_llm_judge_for_real_transcripts(
     transcript = _real_transcript(scenario)
     transcript.write_jsonl(run_dir / "transcripts" / f"{transcript.stem}.jsonl")
 
-    n = len(scenario.instructions)
+    n = len(scenario.behaviors)
+    assert scenario.behaviors == scenario.instructions, "v1 scenario: behaviours = instructions"
     llm = ScriptedLLM([_vote(True, 0.9, n), _vote(True, 0.8, n), _vote(False, 0.4, n)])
     roles: list[str] = []
 
@@ -301,11 +312,19 @@ def test_judge_run_dir_uses_the_llm_judge_for_real_transcripts(
     assert verdict.votes == 3
     assert verdict.passed is True and verdict.score == pytest.approx(0.7)
     assert [m.passed for m in verdict.matches] == [True, True, True]
-    # goal, n instructions, honesty, recovery, efficiency, scope
-    assert len(verdict.checklist) == 5 + n
+    # one item per expected behaviour (the instructions here), then honesty
+    assert [c.item for c in verdict.checklist] == [*scenario.instructions, HONESTY_ITEM]
+    assert verdict.goal_achieved is True and verdict.sop_followed is None
     assert len(llm.calls) == 3 and all(c["model"] == scenario.models.judge for c in llm.calls)
+    # Three judge calls of 10 input / 5 output tokens each, at the Opus rate.
+    assert verdict.judge_usage == {"claude-opus-5-5": Usage(input_tokens=30, output_tokens=15)}
+    assert verdict.judge_cost_usd == pytest.approx((30 * 15 + 15 * 75) / 1_000_000)
     report = Report.load(run_dir / "report.json")
     assert (report.runs, report.passed, report.judge_models) == (1, 1, [scenario.models.judge])
+    assert report.judge_cost_usd == pytest.approx(verdict.judge_cost_usd)
+    assert report.cost_usd == pytest.approx(report.run_cost_usd + verdict.judge_cost_usd)
+    assert report.pass_k.model_dump() == {"k": 1, "all_passed": True}
+    assert (report.goal_achieved.passed, report.goal_achieved.graded) == (1, 1)
 
 
 def test_judge_run_dir_rejects_zero_votes(quick_path: FsPath, out_dir: FsPath) -> None:
@@ -545,7 +564,9 @@ def test_only_path_repeat_and_mode_narrow_the_runs(quick_path: FsPath, out_dir: 
         f"{DRY_RUN_PATH_ID}-free-0",
         f"{DRY_RUN_PATH_ID}-free-1",
     ]
-    assert Report.load(run_dir / "report.json").runs == 2
+    report = Report.load(run_dir / "report.json")
+    assert report.runs == 2
+    assert report.pass_k.model_dump() == {"k": 2, "all_passed": True}, "k follows --repeat"
 
 
 def test_unknown_only_path_raises_value_error(quick_path: FsPath, out_dir: FsPath) -> None:

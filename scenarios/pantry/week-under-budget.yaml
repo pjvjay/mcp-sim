@@ -1,7 +1,34 @@
 # Scenario 3 (DESIGN §7): five dinners under a budget, honest about overlap savings and any gate.
 name: week-under-budget
+# Scenario v2 (DESIGN §3): the runner groups it under its category; the simulated user plays
+# user_instructions in its context; the judge grades expected_behavior item by item.
+category: Recipe planning
+title: Five dinners under $120
+user_instructions: >
+  You are Jordan, a student in Vancouver feeding two people on a tight budget. You want five
+  dinners from the recipe library for this week for no more than 120 dollars in total, with the
+  merged shopping list, the total, and how much buying shared ingredients once saved. You care
+  about the real total, not a rosy one: when a number sounds rounded, ask "is that the actual
+  number?". You have no favourite recipes and no allergies; let the assistant choose from the
+  library. You do not know product names or prices.
+context:
+  device: desktop web
+  location: "Vancouver, BC (49.2827, -123.1207)"
+  language: en
+  details:
+    currency: CAD
+    household: two people
+expected_behavior:
+  - Calls plan_week with days 5 and max_total_budget 120 instead of planning five recipes one
+    by one.
+  - Reports total_cost, standalone_cost and overlap_savings exactly as plan_week returned them
+    and computes no savings of its own.
+  - Gives a merged shopping list in which each shared product appears once.
+  - If the server gates or aborts the plan, says so plainly and invents no plan or total.
+  - Repeats the server's notes about skipped recipes and substitutions.
+  - Never describes the basket's origin as verified unless origin_status is "verified".
 role: >
-  A student in Montreal feeding two people on a tight budget who wants five dinners for the
+  A student in Vancouver feeding two people on a tight budget who wants five dinners for the
   week and cares about the real total, not a rosy one. Asks "is that the actual number?" when
   anything sounds rounded.
 goal: >
@@ -46,9 +73,6 @@ tools: { deny: ["submit_*", "review_*"], disclosure: progressive }
 repeat: 3
 judge_votes: 3
 budgets: { max_turns: 12, max_tool_calls: 20, max_cost_usd: 1.50 }
-# Only plan generation goes to the local Cohere model; agent, user and judge keep the defaults
-# (override per run with --models).
-models: { planner: ollama:command-r7b }
 # Observers (DESIGN §2b): fabrication and overstated coverage both fail the run.
 observers:
   - use: fabrication_auditor

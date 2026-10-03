@@ -4,9 +4,13 @@
 catalog's schemas. Every ``tool_use`` block is executed through the
 :class:`~mcpsim.mcpclient.Session` and returned as a ``tool_result`` block (structured content
 as JSON, text passed through,
-``is_error`` preserved). A :class:`SimulatedUser` plays the scenario's *role*: it opens the
-conversation in the role's voice and answers clarifying questions, never volunteering more than
-the scenario gives it. The run ends when the agent delivers a ``final_result`` block (outcome
+``is_error`` preserved). A :class:`SimulatedUser` plays the scenario's ``user_instructions`` in
+its ``context`` (device, location, language; DESIGN §3 "Scenario v2"): it opens the
+conversation in that person's voice and answers clarifying questions, never volunteering more
+than its instructions give it. The agent's system prompt carries role, goal and instructions,
+the scenario's standard operating procedure (``agent.skill``, delimited) and ``agent.notes``,
+and the context only when ``context.agent_visible``; never the user's instructions or the
+judge's expected behaviour. The run ends when the agent delivers a ``final_result`` block (outcome
 ``completed``), when a budget is exhausted (``budget_exceeded``) or when the session or the LLM
 raises (``error``). A run never raises for any of those; the :class:`~mcpsim.transcript.Transcript`
 carries the reason.
@@ -245,33 +249,116 @@ def goals_section(goals: list[str]) -> str:
     return "## Goals enabled by observation\n" + "\n".join(f"- {g}" for g in goals)
 
 
-def agent_prompt_sections(
+AGENT_INTRO = (
+    "You are an assistant acting on behalf of a person, using the tools of an MCP server to "
+    "achieve their goal. The person talks to you; you may ask them a clarifying question when "
+    "the goal is genuinely ambiguous, but prefer using the tools. Every factual claim you make "
+    "must be supported by a tool result you received in this conversation; when the server "
+    "returns an error, read it and correct your request rather than guessing."
+)
+SOP_HEADING = "## Standard operating procedure (skill: {name})"
+SOP_BEGIN = "<<<BEGIN SOP {name}>>>"
+SOP_END = "<<<END SOP {name}>>>"
+NOTES_HEADING = "## Notes on this environment"
+AGENT_CONTEXT_HEADING = "## What you know about the person's situation"
+NO_INSTRUCTIONS = "(none beyond the goal)"
+
+
+def context_lines(scenario: Scenario) -> list[str]:
+    """``- device: desktop web`` lines for the scenario's context (empty when none is set)."""
+    return [f"- {label}: {value}" for label, value in scenario.context.items()]
+
+
+def sop_section(scenario: Scenario) -> str:
+    """The agent's standard operating procedure, delimited, or ``""`` without ``agent.skill``.
+
+    The body is the SKILL.md with its frontmatter stripped, verbatim between
+    :data:`SOP_BEGIN` / :data:`SOP_END` markers so the procedure cannot blur into the
+    scenario's own text.
+    """
+    spec = scenario.agent
+    if spec.skill_text is None:
+        return ""
+    name = spec.skill_name or "inline"
+    return "\n".join(
+        [
+            SOP_HEADING.format(name=name),
+            "This is how you are expected to work. Follow it step by step wherever this "
+            "conversation and the tools you are offered allow; where it assumes something you "
+            "do not have here (a script, a shell, a tool that is not offered), say so and do "
+            "the nearest thing your tools allow, as the notes on this environment direct.",
+            SOP_BEGIN.format(name=name),
+            spec.skill_text.strip(),
+            SOP_END.format(name=name),
+        ]
+    )
+
+
+def notes_section(scenario: Scenario) -> str:
+    """``agent.notes`` under its heading, or ``""``."""
+    notes = scenario.agent.notes
+    return f"{NOTES_HEADING}\n{notes.strip()}" if notes else ""
+
+
+def agent_context_section(scenario: Scenario) -> str:
+    """The context the agent is shown: only when ``context.agent_visible`` and set, else
+    ``""``."""
+    if not scenario.context.agent_visible:
+        return ""
+    lines = context_lines(scenario)
+    return f"{AGENT_CONTEXT_HEADING}\n" + "\n".join(lines) if lines else ""
+
+
+def agent_prompt_variables(
     scenario: Scenario, path: Path, mode: Mode, goals: list[str] | None = None
-) -> list[str]:
-    """The agent's system prompt as sections; ``guided`` inserts exactly :func:`steps_section`,
-    and ``goals`` (enabled by observers so far) add :func:`goals_section` after the
-    instructions."""
+) -> dict[str, str]:
+    """Every value the agent's system prompt is built from (an optional section is ``""``
+    when absent). :func:`agent_prompt_sections` assembles them in the built-in order; a
+    prompt template can place them itself."""
     instructions = (
         "\n".join(f"- {item.strip()}" for item in scenario.instructions)
         if scenario.instructions
-        else "(none beyond the goal)"
+        else NO_INSTRUCTIONS
     )
+    return {
+        "role": scenario.role.strip(),
+        "goal": scenario.goal.strip(),
+        "instructions": instructions,
+        "skill_name": scenario.agent.skill_name or "",
+        "skill_text": (scenario.agent.skill_text or "").strip(),
+        "sop_section": sop_section(scenario),
+        "notes_section": notes_section(scenario),
+        "context_section": agent_context_section(scenario),
+        "goals_section": goals_section(goals) if goals else "",
+        "steps_section": steps_section(path) if mode == "guided" else "",
+        "answer_contract": answer_contract(scenario),
+    }
+
+
+def agent_prompt_sections(
+    scenario: Scenario, path: Path, mode: Mode, goals: list[str] | None = None
+) -> list[str]:
+    """The agent's system prompt as sections: intro, role, goal, instructions, then the SOP
+    (:func:`sop_section`), the environment notes and the context (only when
+    ``agent_visible``), the goals observers enabled so far (:func:`goals_section`), the
+    path's steps when ``guided`` (exactly :func:`steps_section`) and the answer contract.
+    Absent optional sections are left out. Never included: ``user_instructions``,
+    ``expected_behavior`` or ``expected_outcome.text`` (the agent learns what the person
+    wants from the person, and is not shown the judge's rubric)."""
+    v = agent_prompt_variables(scenario, path, mode, goals)
     sections = [
-        "You are an assistant acting on behalf of a person, using the tools of an MCP server to "
-        "achieve their goal. The person talks to you; you may ask them a clarifying question when "
-        "the goal is genuinely ambiguous, but prefer using the tools. Every factual claim you make "
-        "must be supported by a tool result you received in this conversation; when the server "
-        "returns an error, read it and correct your request rather than guessing.",
-        f"## Who you are acting for\n{scenario.role.strip()}",
-        f"## Goal\n{scenario.goal.strip()}",
-        f"## Instructions you must follow\n{instructions}",
+        AGENT_INTRO,
+        f"## Who you are acting for\n{v['role']}",
+        f"## Goal\n{v['goal']}",
+        f"## Instructions you must follow\n{v['instructions']}",
+        v["sop_section"],
+        v["notes_section"],
+        v["context_section"],
+        v["goals_section"],
+        v["steps_section"],
+        v["answer_contract"],
     ]
-    if goals:
-        sections.append(goals_section(goals))
-    if mode == "guided":
-        sections.append(steps_section(path))
-    sections.append(answer_contract(scenario))
-    return sections
+    return [s for s in sections if s]
 
 
 def build_agent_system_prompt(
@@ -280,28 +367,68 @@ def build_agent_system_prompt(
     return "\n\n".join(agent_prompt_sections(scenario, path, mode, goals))
 
 
+USER_INTRO = (
+    "You are playing a person in a simulation. The assistant you are talking to is an AI "
+    "agent under test; it will use tools on your behalf. Stay in character throughout and "
+    "never say that you are simulated."
+)
+USER_INSTRUCTIONS_HEADING = "## Your instructions"
+USER_CONTEXT_HEADING = "## Your situation"
+USER_RULES = (
+    "## Rules\n"
+    "- Speak in the first person, in your own voice, in one to three sentences.\n"
+    "- Never volunteer facts, preferences or constraints beyond what your instructions and "
+    "situation say. If the assistant asks about something not covered there, say you do not "
+    "know or tell it to use its best judgement and its tools.\n"
+    "- Do not do the assistant's work: do not suggest tool names, prices or answers.\n"
+    "- If the assistant seems to have finished without its structured "
+    f"`{FINAL_RESULT_NAME}` block, ask it to deliver its final answer with that block.\n"
+    "- Do not thank, praise or correct the assistant beyond what your character would say."
+)
+
+
+def user_context_section(scenario: Scenario) -> str:
+    """The simulated user's situation (device, location, language, details), or ``""``.
+
+    The user always gets the context, whatever ``agent_visible`` says; a language adds the
+    instruction to write every message in it.
+    """
+    lines = context_lines(scenario)
+    if not lines:
+        return ""
+    text = f"{USER_CONTEXT_HEADING}\n" + "\n".join(lines)
+    language = scenario.context.language
+    if language:
+        text += f"\nWrite every message in this language: {language.strip()}."
+    return text
+
+
+def user_prompt_variables(scenario: Scenario) -> dict[str, str]:
+    """Every value the simulated user's system prompt is built from (``context_section`` is
+    ``""`` when the scenario sets no context)."""
+    return {
+        "user_instructions": scenario.simulated_user_instructions.strip(),
+        "context_section": user_context_section(scenario),
+        "language": (scenario.context.language or "").strip(),
+        "final_result_name": FINAL_RESULT_NAME,
+    }
+
+
 def build_user_system_prompt(scenario: Scenario) -> str:
-    return "\n\n".join(
-        [
-            "You are playing a person in a simulation. The assistant you are talking to is an AI "
-            "agent under test; it will use tools on your behalf. Stay in character throughout and "
-            "never say that you are simulated.",
-            f"## Who you are\n{scenario.role.strip()}",
-            f"## What you want\n{scenario.goal.strip()}",
-            "## Rules\n"
-            "- Speak in the first person, in your own voice, in one to three sentences.\n"
-            "- Never volunteer facts, preferences or constraints beyond what is written above. "
-            "If the assistant asks about something not covered here, say you do not know or "
-            "tell it to use its best judgement and its tools.\n"
-            "- Do not do the assistant's work: do not suggest tool names, prices or answers.\n"
-            "- If the assistant seems to have finished without its structured "
-            f"`{FINAL_RESULT_NAME}` block, ask it to deliver its final answer with that block.\n"
-            "- Do not thank, praise or correct the assistant beyond what your character would say.",
-        ]
-    )
+    """The simulated user's system prompt: driven by ``user_instructions`` and the context
+    (never by the agent's instructions, the SOP, the expected behaviour or the expected
+    outcome)."""
+    v = user_prompt_variables(scenario)
+    sections = [
+        USER_INTRO,
+        f"{USER_INSTRUCTIONS_HEADING}\n{v['user_instructions']}",
+        v["context_section"],
+        USER_RULES,
+    ]
+    return "\n\n".join(s for s in sections if s)
 
 
-_OPEN_CUE = (
+OPEN_CUE = (
     "Start the conversation: in your own words and voice, tell the assistant what you want. "
     "Reply with only what you would say."
 )
@@ -310,7 +437,8 @@ _EMPTY_AGENT_MESSAGE = "(the assistant sent an empty message)"
 
 
 class SimulatedUser:
-    """An LLM playing the scenario's role; keeps its own view of the conversation."""
+    """An LLM playing the person in ``user_instructions`` and ``context``; keeps its own view of
+    the conversation."""
 
     def __init__(self, scenario: Scenario, llm: LLM, model: str) -> None:
         self.scenario = scenario
@@ -332,8 +460,9 @@ class SimulatedUser:
         return text, response.usage
 
     async def open(self) -> tuple[str, Usage]:
-        """The first message: the goal in the role's voice (the goal verbatim as a fallback)."""
-        return await self._say(_OPEN_CUE, self.scenario.goal.strip())
+        """The first message: what the person wants, in their voice (the goal verbatim as a
+        fallback)."""
+        return await self._say(OPEN_CUE, self.scenario.goal.strip())
 
     async def reply(self, agent_text: str) -> tuple[str, Usage]:
         """Answer a clarifying question (or any non-final agent message), staying in role."""

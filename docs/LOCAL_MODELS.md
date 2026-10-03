@@ -3,8 +3,9 @@
 The framework has one LLM boundary (`mcpsim/llm.py`, the `LLM` protocol). Anthropic models are
 the default; an Ollama backend lets the planner, the agent under test, the simulated user and
 (with caveats) the judge run on a local model such as Cohere's `command-r7b`, with zero API
-spend. This is how the first plan executions are meant to run on a laptop before a key is
-involved.
+spend. It is opt-in: every role defaults to the Anthropic API and no scenario in the repository
+names a local model, so a local run is always chosen explicitly (`--models
+planner=ollama:command-r7b`, or a scenario's own `models` block).
 
 ## Addressing a model
 
@@ -311,7 +312,8 @@ round a price or guess a store` names no tool, whatever the model answered). No 
 identical steps.
 
 **Live results** (2026-10-03, `command-r7b` on Ollama 0.34.4, the pantry server over stdio in
-`DEMO_MODE` from the pantry-api working tree, `mcpsim plan scenarios/pantry/<name>.yaml`):
+`DEMO_MODE` from the pantry-api working tree, `mcpsim plan scenarios/pantry/<name>.yaml`; the
+files named the planner then, today add `--models planner=ollama:command-r7b`):
 
 | call | cheapest-penne | tomato-penne-boycott |
 | --- | --- | --- |
@@ -353,8 +355,8 @@ as a weak path.
 
 ## Observers on local models
 
-Observers (DESIGN §2b) are API calls by default: an LLM observer runs on `models.observer`,
-which falls back to the agent's model, and a per-observer `model` can send one informant to a
+Observers (DESIGN §2b) are API calls by default: an LLM observer runs on `models.observer`
+(default `claude-sonnet-5-5`, whatever the agent runs on), and a per-observer `model` can send one informant to a
 local model (`model: ollama:qwen2.5:7b`) while the rest stay hosted. Cost control is built into
 the design rather than the provider: `on` defaults to `[scout, end]` — one report at plan time
 and one after the final answer — so a scenario with two LLM observers costs two observer calls

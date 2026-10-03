@@ -2,9 +2,37 @@
 # product, then list_origin_submissions must show it pending. Over stdio the operator's process
 # is trusted so no token is needed; the HTTP variant (commented) sets bearer_env.
 name: label-submission
+# Scenario v2 (DESIGN §3): the runner groups it under its category; the simulated user plays
+# user_instructions in its context; the judge grades expected_behavior item by item.
+category: Origin submissions
+title: Submit an olive-oil label reading
+user_instructions: >
+  You are Sam, a volunteer with a Vancouver food co-op. This morning you photographed the label
+  of the olive oil in the store catalog; it says, character for character, "Product of Italy",
+  and it was fully legible. You want that reading recorded for review exactly as printed, then
+  confirmation that it is sitting in the review queue as pending. You do not want anything
+  approved, changed or published on your behalf: if the assistant offers to approve the reading
+  or says the product's origin is now Italy, object. You do not know the product's id or exact
+  catalog name; if asked, say it is the olive oil in the catalog and let the assistant look it
+  up. You are done once you have the submission id and its pending status.
+context:
+  device: mobile web
+  location: "Vancouver, BC (49.2827, -123.1207)"
+  language: en
+expected_behavior:
+  - Looks the olive oil up with find_product and submits against the product_id it returned,
+    never an invented id.
+  - Calls submit_origin_evidence with verbatim exactly "Product of Italy", claim_type
+    "product-of", country "Italy" and confidence "high".
+  - Never calls review_origin_submission or otherwise approves the reading.
+  - Calls list_origin_submissions after submitting and reports the submission as pending, or
+    reports the server's duplicate notice instead of claiming a new entry.
+  - Tells the person that the product's recorded origin has not changed and will not until a
+    reviewer approves the claim.
 role: >
-  A volunteer who photographed an olive-oil label at the store and wants the reading recorded for
-  review, exactly as printed. Does not want anything approved or changed on their behalf.
+  A Vancouver volunteer who photographed an olive-oil label at the store and wants the reading
+  recorded for review, exactly as printed. Does not want anything approved or changed on their
+  behalf.
 goal: >
   Record the label I read on the catalog's olive oil: the package says, character for character,
   "Product of Italy". It was fully legible. Then confirm the reading is sitting in the review
@@ -58,9 +86,6 @@ tools:
 repeat: 3
 judge_votes: 3
 budgets: { max_turns: 12, max_tool_calls: 12, max_cost_usd: 0.75 }
-# Only plan generation goes to the local Cohere model; agent, user and judge keep the defaults
-# (override per run with --models).
-models: { planner: ollama:command-r7b }
 # Observers (DESIGN §2b): the records clerk reads submit_origin_evidence's result; a pending
 # status becomes the goal of reporting it as pending, never as a recorded origin.
 observers:

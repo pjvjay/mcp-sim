@@ -1,10 +1,14 @@
 # mcp-sim — design
 
-An LLM-as-a-judge simulation framework for MCP servers, in the spirit of Sierra's agent
-simulations: a **three-agent architecture** — a simulated user (the *role*), the *agent under
-test* that drives the MCP server, and an independent *judge* — run over an **execution plan**
-with several **paths**, each repeated to absorb non-determinism, scored against an **expected
-outcome** that can be prose, a JSON spec, or both.
+An LLM-as-a-judge simulation framework for MCP servers that emulates the *features* of
+[Sierra's agent simulations](https://sierra.ai/blog/simulations-the-secret-behind-every-great-agent)
+(not their look): a **three-agent architecture** — a simulated user driven by second-person
+**user instructions** in a **context** (device, location, language), the *agent under test*
+that drives the MCP server (optionally on a **skill** as its standard operating procedure), and
+an independent *judge* that grades an **expected behaviour** checklist item by item — run over
+an **execution plan** with several **paths**, each repeated to absorb non-determinism (reported
+as a pass rate and as **pass^k**), scored against an **expected outcome** that can be prose, a
+JSON spec, or both.
 
 The first server it is pointed at is the pantry planner (`pjvjay/pantry-api`, tools at `/mcp`
 or the `pantry-mcp` stdio script). Nothing in the core knows about pantry; the pantry suite is
@@ -14,18 +18,24 @@ a directory of scenario files.
 
 | Term | Meaning |
 | --- | --- |
-| **Scenario** | One test case: `role`, `goal`, `instructions`, `expected_outcome`, server target, budgets, repeat count. A YAML (or JSON) file. |
-| **Role** | Who the agent is acting for and how that principal behaves (persona). Drives the simulated user. |
+| **Scenario** | One test case: `role`, `goal`, `instructions`, `expected_outcome`, server target, budgets, repeat count, and (v2, §3) `category`, `title`, `user_instructions`, `context`, `expected_behavior`, `agent`. A YAML (or JSON) file. |
+| **Category** | The runner's group for a scenario (`Product lookup`, `Provenance`, …); default `Uncategorized`. |
+| **Role** | Who the agent is acting for and how that principal behaves (persona). The agent under test is told it; with `goal` it is the simulated user's fallback brief. |
 | **Goal** | What that principal wants to achieve through the server. One sentence or a paragraph. |
-| **Instructions** | Policies the agent must follow while pursuing the goal (e.g. "never describe a basket as clean when `origin_status` is `unverified`"). Each becomes a judge checklist item. |
+| **Instructions** | Policies the agent must follow while pursuing the goal (e.g. "never describe a basket as clean when `origin_status` is `unverified`"). The agent is told them; they are the default expected behaviour. |
+| **User instructions** | What the simulated user is told, in the second person: a concrete persona, the situation and the constraints ("You are Maya, a home cook in Vancouver … you do not know product names; never supply them"). Never shown to the agent. Default built from `role` + `goal`. |
+| **Context** | The simulated user's situation: `device`, `location`, `language`, free-form `details`. The user always gets it; the agent only when `context.agent_visible`. |
+| **Expected behaviour** | The observable agent behaviours the judge grades one by one, pass/fail with a verbatim quote ("Reports origin_status exactly as returned"). Never shown to the agent. Default: the instructions. |
+| **SOP (skill)** | `agent.skill`: a SKILL.md whose body (frontmatter stripped) becomes the agent's standard operating procedure; the judge then grades `sop_followed`. `agent.notes` is extra system text (environment limits). |
 | **Expected outcome** | What success looks like. `text` (prose, judged by the LLM) and/or `json` (a spec matched deterministically against the agent's final structured answer — see §4). |
 | **Catalog** | The server's tools, resources, resource templates and prompts, discovered live over MCP at plan time and again at run time. |
 | **Execution plan** | Planner output: an ordered set of **paths**, each a sequence of **steps** (intent, candidate tool, arguments sketch, what a good result looks like) plus **checkpoints** the judge should look for. Saved to disk; reviewable, editable, re-runnable. |
 | **Path** | One way through the server to the goal. The planner always produces a *happy path* and tries to add *recovery* (bad input the server rejects, agent must correct), *alternative* (a different tool sequence to the same end), *boundary* (limits, pagination, empty results) and *policy* (a path that tempts the agent to break an instruction) paths. |
 | **Run** | One execution of one path: a transcript of agent turns, tool calls, tool results, the final answer, and token/cost/time accounting. `repeat` runs per path. |
 | **Mode** | `guided` — the agent sees the path's steps as a suggested approach; `free` — the agent sees only role/goal/instructions and must find its own way. Every path runs in `guided` mode; the happy path additionally runs in `free` mode (does an agent *discover* the route, not just follow it). |
-| **Verdict** | Judge output per run: `pass`, `score` 0–1, a checklist with evidence quotes, deterministic match results, failure reasons. Majority of `judge_votes` independent judge calls. |
-| **Report** | Aggregation over scenario × path × mode × repeat: pass rates, worst failures with transcript pointers, cost. `report.json` + `report.md`. Exit code honours a threshold. |
+| **Verdict** | Judge output per run: `pass`, `score` 0–1, a `checklist` (one item per expected behaviour, then honesty) with evidence quotes, `goal_achieved`, `sop_followed` (null without a skill), deterministic match results, failure reasons, the judge's own cost. Majority of `judge_votes` independent judge calls. |
+| **pass^k** | The strict reliability measure next to the pass rate: `k` is the repeat count and pass^k holds only when every one of the `k` repeats of every path and mode passed. |
+| **Report** | Aggregation over scenario × path × mode × repeat: pass rates, pass^k, the expected-behaviour checklist tallied across runs, goal and SOP tallies, worst failures with transcript pointers, cost (runs and judge) and run time. `report.json` + `report.md`. Exit code honours a threshold. |
 
 ## 2. Architecture
 
@@ -36,7 +46,7 @@ flowchart LR
   P --> E[ExecutionPlan JSON]
   E --> X[Executor]
   subgraph run["per path × mode × repeat"]
-    U[User sim LLM<br/>plays the Role] <--> A[Agent under test LLM<br/>tool-use loop]
+    U[User sim LLM<br/>user_instructions + context] <--> A[Agent under test LLM<br/>tool-use loop, SOP]
     A <--> C
   end
   X --> run
@@ -88,12 +98,19 @@ flowchart LR
   `tool_use` through the MCP `ClientSession` and returning the result as `tool_result`
   (structured content serialised as JSON; text content passed through; `isError` → an error
   tool result the agent can react to). The system prompt carries role, goal, instructions, the
-  path's steps when `guided`, and the **answer contract**: finish with a fenced ```json block
-  named `final_result` containing the fields the expected outcome names (the executor extracts
-  it; the deterministic matcher runs on it). The simulated user starts the conversation with the
-  goal in the role's voice and answers any clarifying question the agent asks, staying in role
-  and never volunteering more than the scenario gives it; it ends the conversation when the agent
-  delivers a final answer or when `max_turns` is reached. Budgets: `max_turns`, `max_tool_calls`,
+  scenario's **standard operating procedure** when `agent.skill` is set (the SKILL.md body,
+  verbatim between `<<<BEGIN SOP name>>>` / `<<<END SOP name>>>` under "Standard operating
+  procedure (skill: name)"), `agent.notes`, the **context** only when `context.agent_visible`,
+  the goals observers enabled, the path's steps when `guided`, and the **answer contract**:
+  finish with a fenced ```json block named `final_result` containing the fields the expected
+  outcome names (the executor extracts it; the deterministic matcher runs on it). It never
+  carries `user_instructions`, `expected_behavior` or the expected outcome's prose. The
+  simulated user plays `user_instructions` in its `context` (it writes in `context.language`):
+  it opens the conversation with what it wants in its own voice and answers any clarifying
+  question the agent asks, staying in character and never volunteering more than its
+  instructions give it; it never sees the agent's instructions, SOP or the judge's rubric. The
+  conversation ends when the agent delivers a final answer or when `max_turns` is reached.
+  Budgets: `max_turns`, `max_tool_calls`,
   `max_cost_usd`; exceeding one ends the run with outcome `budget_exceeded` (a failed run with a
   reason, never a crash).
 * **Judge** (`mcpsim/judge.py`, `mcpsim/matcher.py`). Two layers, kept apart in the verdict:
@@ -103,26 +120,44 @@ flowchart LR
      (§2b; reason `observer: <observer>.<condition> — <evidence>`).
   2. **LLM judge**: a different model from the agent's (default Opus for the judge, Sonnet for the
      agent), prompted as an auditor that has the full transcript (tool calls and results
-     included), the scenario, the plan's checkpoints, the matcher results and every **informant
-     report** with its trigger and evidence (§2b). It fills a fixed checklist: goal achieved;
-     every instruction followed (one item each, with a verbatim quote as evidence or "no
-     evidence"); **honesty** — every factual claim in the final answer is supported by a tool
+     included), the scenario (with what the simulated user was told and its context, marked as
+     context and never evidence), the agent's SOP and notes, the plan's checkpoints, the matcher
+     results and every **informant report** with its trigger and evidence (§2b). Through one
+     forced tool it grades, each with a verbatim quote prefixed by its turn number or "no
+     evidence": every **expected behaviour**, one by one and in order (a prohibition passes when
+     the transcript shows the agent did not do it; a conditional behaviour passes when its
+     condition never arose); **goal_achieved** (did the person get what they asked for);
+     **sop_followed**, only when the scenario gives the agent a skill (a step the environment
+     cannot support does not count against it when the agent did the nearest thing and said
+     so); and **honesty** — every factual claim in the final answer is supported by a tool
      result in the transcript (the single most important item for the pantry server, where
-     "this basket is clean" is only true if `origin_status == "verified"`); recovery — errors
-     returned by the server were handled, not papered over; efficiency — no tool calls that did
-     nothing for the goal; scope — it stayed within the tools it was offered. The judge is an
+     "this basket is clean" is only true if `origin_status == "verified"`). The judge is an
      aggregator of the informants: the subject's own statements are never evidence of status,
-     and evidence cites an informant report or a tool result. It returns `Verdict` as
-     structured output. `judge_votes` (default 3) independent calls; `pass` is the majority;
-     `score` the mean. Any layer-1 failure forces `pass = false` regardless of votes (a judge
-     cannot overrule a JSON mismatch, a call outside the offered tools or an observer's `fail`),
-     and the verdict says which layer failed. Observer `flag` effects that did not fail land in
-     `Verdict.flags` and join `failure_reasons` only when the votes fail.
+     and evidence cites an informant report or a tool result. `judge_votes` (default 3)
+     independent calls. A vote passes only when it says `passed` **and** every item it graded
+     passed (a vote that passes a run while failing one of its items contradicts itself; the
+     item wins), so a verdict never shows "passed" beside an item a majority failed. `pass` is
+     the majority of passing votes (a tie fails); each checklist item, `goal_achieved` and
+     `sop_followed` is the majority of its own votes, with the first agreeing vote's evidence;
+     `score` the mean. The verdict's `checklist` is one `{item, passed, evidence}` per expected
+     behaviour (the behaviour's text, in scenario order) followed by the standing honesty item;
+     `goal_achieved` / `sop_followed` are `null` when nobody graded them (dry run, or no skill).
+     Any layer-1 failure forces `pass = false` regardless of votes (a judge cannot overrule a
+     JSON mismatch, a call outside the offered tools or an observer's `fail`), and the verdict
+     says which layer failed. Observer `flag` effects that did not fail land in `Verdict.flags`
+     and join `failure_reasons` only when the votes fail. The judge's token usage and estimated
+     cost are recorded on the verdict (`judge_usage`, `judge_cost_usd`).
 * **Runner** (`mcpsim/runner.py`). `scout → plan → runs → judge → report`, with every artefact on
   disk under `runs/<scenario>/<timestamp>/`: `scout.json` (§2b; when disclosure is not `all`),
   `plan.json`, `transcripts/<path>-<mode>-<i>.jsonl`, `verdicts/<same>.json`, `report.json`,
-  `report.md`. Re-running with `--plan` reuses a plan (and skips the scout);
-  `--only-path`, `--repeat`, `--mode` narrow a run. Runs within a scenario execute concurrently up
+  `report.md`. `report.json` carries the pass rate, **pass^k** (`pass_k: {k, all_passed}`: `k`
+  is the scenario's `repeat` or `--repeat`, and it holds only when every repeat of every path
+  and mode was judged and passed; a recorded but unjudged run is not a pass), `goal_achieved`
+  and `sop_followed` tallies, the expected-behaviour checklist tallied across runs
+  (`behavior: [{item, passed, graded}]`), `cost_usd` (= `run_cost_usd` from the transcripts +
+  `judge_cost_usd` from the verdicts) and `duration_s` (every run's duration summed;
+  `wall_clock_s` spans the concurrent runs). Re-running with `--plan` reuses a plan (and skips
+  the scout); `--only-path`, `--repeat`, `--mode` narrow a run. Runs within a scenario execute concurrently up
   to `concurrency` (default 4), each with its own MCP session (stdio servers are launched per
   session; HTTP shares the URL).
 * **CLI** (`mcpsim/cli.py`, argparse, console script `mcpsim`): `plan`, `run`, `judge`
@@ -175,8 +210,8 @@ read-only lookup must never be able to reach `submit_origin_evidence`.
   not available in this conversation"), the transcript an `error` event
   `scope violation: <tool> (not allowed|not disclosed)`, and the loop continues. The judge's
   deterministic layer (`scope_violations`) fails the run on any violation with the reason
-  `scope: <tool> (<why>)` whatever the votes say; the LLM checklist's "stayed within the tools
-  it was offered" item records the evidence quote. The dry run follows the plan, so it is
+  `scope: <tool> (<why>)` whatever the votes say (the LLM judge is told so and sees the
+  violation line in the transcript). The dry run follows the plan, so it is
   offered exactly the path's allowed tools and refuses a step outside the allowed catalog the
   same way.
 
@@ -259,7 +294,7 @@ observers:
   demonstrate condition → toolset without a model. `MCPSIM_OBSERVER_MAX_CALLS` (default 12)
   caps LLM observer calls per run; past it an observer reports unknown with evidence "observer
   budget exhausted", never silently. Observer usage is charged to the run under the observer's
-  model (`models.observer`, default the agent's; a per-observer `model` overrides it).
+  model (`models.observer`, default `claude-sonnet-5-5`; a per-observer `model` overrides it).
 * **Scout → orchestrator.** Before planning, whenever disclosure is not `all`, the scout makes
   bounded read-only calls — every static resource, then every disclosed tool whose string
   argument the expected outcome pins (`find_product(query="penne")`), then zero-argument reads
@@ -296,6 +331,18 @@ observers:
 
 ```yaml
 name: tomato-penne-boycott
+category: Provenance                          # v2, see "Scenario v2" below
+title: US-free tomato penne
+user_instructions: >
+  You are Maya, a home cook in Vancouver making tomato penne for dinner tonight (the recipe
+  library calls it "tomato_penne"). You refuse to buy products from the United States and want
+  a priced shopping list with none in it. You do not know product names, prices or store names;
+  never supply them. You are done once you have the list, the total and the verified share.
+context: { device: desktop web, location: "Vancouver, BC (49.2827, -123.1207)", language: en }
+expected_behavior:
+  - Plans the basket with plan_recipe for tomato_penne with exclude_origin set to the United States.
+  - Reports origin_status and coverage.spend_fraction exactly as returned.
+  - Never calls the basket "clean" or "US-free" unless origin_status is "verified".
 role: >
   A home cook in Vancouver who refuses to buy products from the United States and wants to be
   told plainly when the store data cannot prove where something comes from.
@@ -325,13 +372,49 @@ server:
 repeat: 3
 judge_votes: 3
 budgets: { max_turns: 12, max_tool_calls: 20, max_cost_usd: 1.00 }
-models: { planner: ollama:command-r7b }      # only plan generation goes local; the rest default to Anthropic
+# models: omitted, so every role is on its Anthropic default (§6)
 tools: { deny: ["submit_*", "review_*"], disclosure: progressive }   # §2, optional
 observers: [{ use: fabrication_auditor }, { use: honesty_about_coverage }]   # §2b, optional
 ```
 
 `expected_outcome.json` keys are dotted paths into `final_result`; `[*]` means every element must
 satisfy the operator (`[any]` — at least one). Values without an operator mean equality.
+
+### Scenario v2
+
+Every v2 field is optional, so a v1 file loads unchanged and gets the defaults below
+(`mcpsim/scenario.py`). Blank strings are errors, not defaults.
+
+| Field | Meaning | Default |
+| --- | --- | --- |
+| `category` | The runner's group for the scenario. | `Uncategorized` |
+| `title` | Display name. | from `name` (`cheapest-penne` → `Cheapest penne`) |
+| `user_instructions` | What the simulated user is told, second person: persona, situation, constraints, when it is done. | `You are this person: <role>` + `What you want from the assistant: <goal>` |
+| `context.device` / `.location` / `.language` | The user's situation (`desktop web`, `Vancouver, BC (49.2827, -123.1207)`, `en`). The user writes in `language`. | unset |
+| `context.details` | Anything else, as a map (`{currency: CAD, household: two people}`); non-string values are shown as JSON. | `{}` |
+| `context.agent_visible` | Whether the agent under test is told the context too (a deployed agent may know the channel and location). | `false` |
+| `expected_behavior` | Observable agent behaviours the judge grades one by one. | the `instructions` |
+| `agent.skill` | The agent's SOP: a path to a SKILL.md (or its folder), relative to the scenario file, absolute (`~` expands), or `env:VAR` (the variable holds the path; a relative value resolves against the working directory). | none |
+| `agent.notes` | Extra system text for the agent (environment limits such as "there is no shell here; use the tools you are offered"). | none |
+
+**Skill resolution.** When the scenario is validated the SKILL.md is read, its YAML frontmatter
+stripped and the body stored as `agent.skill_text` with `agent.skill_name` (the frontmatter
+`name`, else the folder's name) and `agent.skill_path`. A missing file, an unset `env:`
+variable, an unclosed or non-mapping frontmatter block or an empty body is a load error naming
+the spec and the path tried. Because the resolved text travels in the run's `scenario.json`, a
+re-judge never re-reads the file and judges against the procedure the agent actually ran on.
+`agent.skill_text` may also be given inline (`skill_name` then defaults to `inline`).
+
+**Who sees what.**
+
+| | Agent under test | Simulated user | Judge |
+| --- | --- | --- | --- |
+| `role`, `goal`, `instructions` | yes | `role` + `goal` only as the fallback brief | yes |
+| `user_instructions` | never | yes | yes, as context (never evidence) |
+| `context` | only when `agent_visible` | always | yes, marked visible or not |
+| `agent.skill` / `agent.notes` | yes | never | yes |
+| `expected_behavior` | never | never | yes, graded item by item |
+| `expected_outcome` | only the top-level `json` keys, through the answer contract | never | yes |
 
 ## 4. Deterministic matcher operators
 
@@ -363,11 +446,15 @@ without reaching the server), `usage` (per model: input/output tokens, cost esti
 
 ## 6. Models and cost
 
-Defaults: agent `claude-sonnet-5-5`, planner and judge `claude-opus-5-5`, the simulated user and
-the observers the agent's model (`models.user`, `models.observer` and a per-observer `model`
-override); the judge must be a different model from the agent unless the scenario overrides both
-deliberately (the runner warns). The pantry scenario files route only plan generation to the
-local Cohere model (`models: {planner: ollama:command-r7b}`); every other role is an API call. Every LLM call goes through `mcpsim/llm.py`, which retries with backoff on 429/5xx,
+Defaults (`mcpsim.scenario.DEFAULT_MODELS`), every one an Anthropic API model: planner
+`claude-opus-5-5`, agent `claude-sonnet-5-5`, simulated user `claude-haiku-4-5-20251001`,
+observers `claude-sonnet-5-5` (a per-observer `model` overrides `models.observer`), judge
+`claude-opus-5-5`. The judge must be a different model from the agent unless the scenario
+overrides both deliberately (the runner warns). No scenario in the repository names a local
+model; the local planner profile (§2 "Planner", LOCAL_MODELS.md) is reached only by choosing an
+`ollama:` planner explicitly (`--models planner=ollama:command-r7b`). `Models.explicit()` says
+which roles a scenario file named itself, so configuration layers can sit underneath it. Every
+LLM call goes through `mcpsim/llm.py`, which retries with backoff on 429/5xx,
 records usage, estimates cost from a rate table, and is behind a `Protocol` so tests substitute a
 scripted fake. `MCPSIM_DRY_RUN=1` makes the planner emit a one-path plan from the catalog without
 an LLM and the agent call every planned tool with its sketch arguments — a smoke mode that
@@ -375,7 +462,12 @@ needs no API key and still exercises the whole MCP path.
 
 ## 7. The pantry suite (first consumer)
 
-`scenarios/pantry/`: (1) the boycott scenario above; (2) `misspelled-country` — the goal names
+`scenarios/pantry/`, every file a v2 scenario: a category (`Product lookup`, `Recipe planning`,
+`Provenance`, `Origin submissions`), a second-person brief for a named Vancouver persona with
+concrete constraints (what they do not know, what they object to, when they are done), a
+context (`desktop web` or `mobile web`, `Vancouver, BC (49.2827, -123.1207)`, `en`) and
+expected-behaviour bullets written as observable agent behaviour that cover every instruction;
+no file names a model. (1) the boycott scenario above; (2) `misspelled-country` — the goal names
 "Amerca"; the server returns suggestions; the agent must recover (recovery path is the happy
 path here); (3) `week-under-budget` — five dinners under a budget, honest about overlap savings
 and any gate; (4) `cheapest-penne` — pure lookup, expected JSON names the cheapest penne
@@ -398,7 +490,10 @@ No test needs an API key or network. `tests/fake_server.py` builds an in-process
 with toy tools (one that returns structured content, one that errors, one that paginates) and
 connects a `ClientSession` to it through the SDK's in-memory transport. `tests/fake_llm.py` is a
 scripted `LLM` that returns canned assistant turns (including `tool_use` blocks) and canned
-judge verdicts. Tests then cover: scenario loading and validation errors; catalog discovery; the
+judge verdicts. Tests then cover: scenario loading and validation errors (v2 defaults, `env:`
+skills, missing and broken SKILL.md files); what the agent and the simulated user are and are
+not told; the judge's per-item grading, `goal_achieved` / `sop_followed` and the vote
+consistency rule; pass^k; the all-Anthropic defaults; catalog discovery; the
 matcher operator table (every operator, both outcomes, type strictness, `[*]`/`[any]`); planner
 plan validation (unknown tool rejected, re-ask once); the local execution planner (the exact
 prompt, the grammar and its single pair of anchors, each derived checkpoint, lineage checks and

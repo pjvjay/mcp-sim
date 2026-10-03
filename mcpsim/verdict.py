@@ -1,7 +1,10 @@
 """Judge output models (DESIGN §1 "Verdict", §2 "Judge").
 
 Two layers are kept apart: deterministic :class:`Match` results from the matcher and the
-LLM judge's :class:`ChecklistItem` list. Any failed match forces ``passed = False``.
+LLM judge's :class:`ChecklistItem` list (one item per expected behaviour, then honesty). Any
+failed match forces ``passed = False``. ``goal_achieved`` and ``sop_followed`` are the judge's
+majority on the goal and on the agent's standard operating procedure; ``None`` when nobody
+graded them (dry run) or, for ``sop_followed``, when the scenario gives the agent no SOP.
 """
 
 from __future__ import annotations
@@ -11,6 +14,8 @@ from pathlib import Path as FsPath
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
+
+from mcpsim.llm import Usage
 
 
 class Match(BaseModel):
@@ -52,6 +57,11 @@ class Verdict(BaseModel):
     flags: list[str] = Field(default_factory=list)
     votes: int = Field(ge=0)
     judge_model: str
+    goal_achieved: bool | None = None
+    sop_followed: bool | None = None
+    # What the judge's votes cost (estimate from the rate table; empty in a dry run).
+    judge_usage: dict[str, Usage] = Field(default_factory=dict)
+    judge_cost_usd: float = Field(default=0.0, ge=0.0)
 
     @property
     def matcher_passed(self) -> bool:

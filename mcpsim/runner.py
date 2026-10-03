@@ -485,8 +485,19 @@ def _write_report(
     scenario: Scenario,
     verdicts: Iterable[Verdict],
     transcripts: Iterable[Transcript],
+    *,
+    repeat: int | None = None,
 ) -> tuple[FsPath, FsPath]:
-    report = aggregate(list(verdicts), list(transcripts), scenario=scenario.name, run_dir=run_dir)
+    """``report.json`` and ``report.md``; ``repeat`` is pass^k's ``k`` when the caller knows how
+    many runs per path × mode were asked for (a re-judge or re-report infers it from the
+    transcripts)."""
+    report = aggregate(
+        list(verdicts),
+        list(transcripts),
+        scenario=scenario.name,
+        run_dir=run_dir,
+        repeat=repeat,
+    )
     if uses_local_models(scenario):
         report.cost_note = f"{LOCAL_COST_NOTE}; hosted calls, if any, are an {report.cost_note}"
     json_path = report.save(run_dir / REPORT_JSON)
@@ -533,9 +544,8 @@ async def _run_scenario_async(
             scout_result.save(run_dir / SCOUT_FILE)
     plan.save(run_dir / PLAN_FILE)
 
-    cells = run_matrix(
-        plan, only_path=only_path, repeat=scenario.repeat if repeat is None else repeat, mode=mode
-    )
+    repeats = scenario.repeat if repeat is None else repeat
+    cells = run_matrix(plan, only_path=only_path, repeat=repeats, mode=mode)
     agent_llm = None if dry_run else make_llm_for(scenario, "agent")
     judge_llm = None if dry_run else make_llm_for(scenario, "judge")
     observer_llm = (
@@ -569,7 +579,7 @@ async def _run_scenario_async(
     results = await asyncio.gather(*(cell(p, m, i) for p, m, i in cells))
     transcripts = [t for t, _ in results]
     verdicts = [v for _, v in results]
-    _write_report(run_dir, scenario, verdicts, transcripts)
+    _write_report(run_dir, scenario, verdicts, transcripts, repeat=repeats)
     return run_dir
 
 
