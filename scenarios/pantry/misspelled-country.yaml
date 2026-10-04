@@ -67,20 +67,8 @@ server:
 # for more with discover_tools (DESIGN §2 "Tool scoping and disclosure").
 tools: { deny: ["submit_*", "review_*"], disclosure: progressive }
 budgets: { max_turns: 12, max_tool_calls: 20, max_cost_usd: 1.00 }
-# Observers (DESIGN §2b): the desk clerk watches for the server's rejection of the country name
-# and turns the suggestion into the agent's next goal.
+# Observers (DESIGN §2b): the built-in fabrication auditor only. Recovering from the rejected
+# spelling is what this scenario tests, so no observer turns the server's suggestion into the
+# agent's next goal; the judge grades the retry against expected_behavior.
 observers:
   - use: fabrication_auditor
-  - name: desk_clerk
-    identity: >
-      A front-desk clerk who reads every server error aloud and insists the suggested spelling
-      is used, not a guess.
-    watches: [tool_traffic]
-    on: [tool_result]
-    conditions:
-      - id: rejected_with_suggestion
-        when: the server rejected a country name and offered a suggestion
-        then:
-          enable_goal: >
-            Retry with the suggested spelling and say which spelling you used in place of the
-            one the shopper typed.
