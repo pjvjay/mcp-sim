@@ -51,7 +51,38 @@ flowchart LR
   asks for distinct paths with the five kinds above, forbids inventing tools not in the catalog
   (validated: every `tool` in a step must exist in the catalog or the plan is rejected and
   re-asked once with the error), and asks for `checkpoints` phrased as observable facts
-  ("`origin_status` in the final answer equals the value the plan tool returned").
+  ("`origin_status` in the final answer equals the value the plan tool returned"). That is the
+  **hosted** profile. An `ollama:` planner takes the **local** profile
+  (`mcpsim/execution_planner.py`, LOCAL_MODELS.md "The execution planner"), because a 7–8B model
+  asked for whole test paths wrote plans that validate and test almost nothing. The model's job
+  shrinks to *planning the tool execution for the user's request*, in the user's own framing
+  ("You are an expert JSON config generator…"): `steps` (`tool` from the disclosed set,
+  `arguments`, `why`, `expect`) and `answer_fields`, the lineage of every `expected_outcome.json`
+  key (`"price": "step 1: items[0].price"`, a single-anchored grammar pattern). Arguments are
+  schema-checked like any step; lineage must name a tool step and a path the tool's output
+  schema declares and, when the scout made the same call, a path the observed result has whose
+  value satisfies the field's own expected-outcome spec (the matcher run on the final result
+  the lineage implies, so `[*]`, `[any]` and projections are judged as the answer will be); a
+  `[*]` field read from one element (`lines[*].price ← summary.lines[0].price`) is sent back
+  with the `[*]` rewrite; a lineage
+  that reads another key while one with the field's own name is there (`store` from
+  `items[0].brand` beside `items[0].store`, `query` from `items[0].name` under a top-level
+  `query`) is sent back with that key; one re-ask. The framework then builds the tests: the **happy path** from the
+  steps plus an answer step, with checkpoints derived from the lineage (`final_result: price
+  equals tool_result[find_product] items[0].price`) and from the expected outcome
+  (`final_result: price is greater than 0`); one **recovery or boundary path** grounded in a
+  live probe on the scout's read-only session (the first read-only, free happy step re-sent
+  with one argument mutated, a string losing an interior character or an integer becoming
+  999999: an error becomes a recovery path that quotes it, an answer a boundary path whose
+  checkpoints state what came back, from structured content only and never a value that
+  changes on every call; never a write or costly tool, never one that reaches outside the
+  server (`openWorldHint`, an internet description), never a call that sends a URL, host name
+  or e-mail address; a probe the server answers badly costs the variant; counted against the scout
+  budget, which keeps one call back for it, and recorded in `scout.json`); and a **policy
+  path** per tool that an instruction forbids, found by one tiny enum-constrained question per
+  prohibiting instruction (at most three) and kept only when the prohibiting clause names the
+  tool and the happy path does not call it. No two paths have identical steps; `plan.json`
+  `notes` record every call's tokens and seconds and everything dropped or skipped.
 * **Executor** (`mcpsim/agent.py`, `mcpsim/runner.py`). The agent under test is a standard
   Anthropic tool-use loop whose `tools` are the catalog's tool schemas, executing each
   `tool_use` through the MCP `ClientSession` and returning the result as `tool_result`
@@ -244,9 +275,10 @@ observers:
   that watches tool traffic at `tool_result`/`turn` can enable it. Checkpoints may read
   `report: <observer>.<condition> is true|false`. The prompt stays under
   `MCPSIM_PLANNER_PROMPT_BUDGET` characters (default 12,000; 4,000 for an `ollama:` planner,
-  which takes the local profile of LOCAL_MODELS.md "Speed": a compact prompt and one path per
-  call): observations are trimmed first, the on-request list second, never the digest or the
-  reports. `scout.json` records it all, with `planner_prompt_chars`.
+  whose execution prompt adds the reports and the observations' result shapes only while they
+  fit): observations are trimmed first, the on-request list second, never the digest or the
+  reports. Planning runs on the scout's still-open session, so the local planner's probe is
+  recorded in the same `scout.json`, which records it all, with `planner_prompt_chars`.
 * **Judge as aggregator.** See §2 "Judge": the reports and flags are in the prompt, the
   subject's statements are never evidence, `fail` effects are a deterministic layer after the
   matcher and the scope check.
@@ -368,7 +400,11 @@ connects a `ClientSession` to it through the SDK's in-memory transport. `tests/f
 scripted `LLM` that returns canned assistant turns (including `tool_use` blocks) and canned
 judge verdicts. Tests then cover: scenario loading and validation errors; catalog discovery; the
 matcher operator table (every operator, both outcomes, type strictness, `[*]`/`[any]`); planner
-plan validation (unknown tool rejected, re-ask once); executor loop (tool_use → MCP call →
+plan validation (unknown tool rejected, re-ask once); the local execution planner (the exact
+prompt, the grammar and its single pair of anchors, each derived checkpoint, lineage checks and
+repairs, the recovery and boundary paths built from a real probe of the fake server, no probe of
+a write, costly or open-world tool or of a call that sends a URL, no volatile boundary fact, a
+malformed probe result costing only the variant, policy questions, the hosted profile untouched); executor loop (tool_use → MCP call →
 tool_result; error results; budget stop; final_result extraction, including a malformed block);
 judge majority and the "matcher failure overrides votes" rule; report aggregation and exit
 code; the CLI end-to-end on the fake server in dry-run mode. An `integration` marker runs one

@@ -7,8 +7,10 @@ nothing else was edited. The `dry-run/` set was regenerated after the observers 
 scenario denies `submit_*`/`review_*`, discloses progressively and declares three observers)
 from a copy of the scenario whose `DB_URL` points at a separate seeded SQLite file, so a live run
 on `runs/pantry-sim.db` was not disturbed; the `db` field in its `pipeline_status` result is that
-file's path on this machine, as the server returned it. `local-plan/` and `local-run/` predate
-scoping and observers and are unchanged.
+file's path on this machine, as the server returned it. `local-plan/` was regenerated on
+2026-10-03 by the execution planner (the local profile, docs/LOCAL_MODELS.md "The execution
+planner"); `local-run/` predates scoping and observers, is unchanged, and ran the earlier local
+plan it holds a copy of.
 
 ```
 cheapest-penne/
@@ -19,10 +21,11 @@ cheapest-penne/
 │   ├── verdicts/happy-dry-run-guided-0.json
 │   ├── report.json
 │   └── report.md
-├── local-plan/     mcpsim plan scenarios/pantry/cheapest-penne.yaml --models planner=ollama:command-r7b
-│   └── plan.json                     2 paths; 1,438 s wall on a CPU shared with a test suite
+├── local-plan/     mcpsim plan scenarios/pantry/cheapest-penne.yaml   (models.planner is ollama:command-r7b)
+│   ├── scout.json                    4 scout calls, then the planner's probe find_product(query="pene")
+│   └── plan.json                     happy, boundary and policy paths; 513 s wall, CPU limited to 24-80 %
 └── local-run/      mcpsim run … --models agent=ollama:command-r7b,user=ollama:llama3.2:3b,judge=ollama:qwen2.5:7b
-    ├── plan.json                     --allow-same-judge --repeat 1 --only-path 1 --plan local-plan/plan.json
+    ├── plan.json                     the earlier local plan: --allow-same-judge --repeat 1 --only-path 1
     └── transcripts/1-guided-0.jsonl  the guided cell; see below
 ```
 
@@ -96,11 +99,28 @@ and `origin_status` are expected at the top level of an agent's answer and live 
 the run. Read it as proof that the scout, the informants, the planner and the agent loop reach
 the server in the right order and record what it says, not as a verdict on the server.
 
-**local-plan.** The 8B Cohere model, constrained to the catalog's tool names and
-schema-checked arguments, produced a correct happy path (`find_product(query="penne", limit=1)`)
-with a checkpoint in the required shape, plus a thin recovery path whose "expected error" step
-repeats the happy call and would not actually fail. The validator enforces shape, not substance;
-a stronger planner model or a judge over the plan itself is the next step.
+**local-plan.** Written by the execution planner: the 8B Cohere model planned the tool
+execution and said where each answer field comes from; the framework built the paths. The
+model's first answer traced five fields into `items[2]` of a two-item result; the re-ask
+listed what the scout's own `find_product(query="penne")` returned and where each field
+actually is, and the second answer was accepted. `plan.json` holds:
+
+* **happy**: `find_product(query="penne")` and an answer step; fourteen checkpoints, seven from
+  the model's lineage (`final_result: store equals tool_result[find_product] items[0].store`,
+  `query equals tool_result[find_product] query`, …) and seven from `expected_outcome.json`
+  (`final_result: price is greater than 0`, `match equals direct`, …);
+* **boundary-find_product**: the planner probed `find_product(query="pene")` on the scout's
+  session (the last call of the scout's budget, recorded in `scout.json` with `probe: true`);
+  the server answered `match: "none"` with no items, so the path sends `pene`, then `penne`,
+  and checks `tool_result[find_product]: match equals none when query is pene` and that the
+  answer does not come from that result;
+* **policy-plan_recipe**: instruction 1 ("do not run a planning tool for a lookup") forbids
+  `plan_recipe`, according to one 13-token answer from the model; the path checks
+  `transcript: no call to plan_recipe`.
+
+`notes` record every model call's tokens and seconds, and the two policy answers the framework
+did not use: `get_product_origins` for "never round a price or guess a store" (the rule names
+no tool) and `find_product` (the happy path calls it).
 
 **local-run.** The simulated user (`llama3.2:3b`) opened in role. The agent (`command-r7b`,
 guided by the plan, with all fifteen tool definitions in a 4,771-token prompt) **made no tool
@@ -121,7 +141,7 @@ MCPSIM_DRY_RUN=1 .venv/bin/mcpsim run scenarios/pantry/cheapest-penne.yaml
 .venv/bin/mcpsim plan scenarios/pantry/cheapest-penne.yaml   # models.planner is ollama:command-r7b in the file
 .venv/bin/mcpsim run scenarios/pantry/cheapest-penne.yaml \
   --models agent=ollama:command-r7b,user=ollama:llama3.2:3b,judge=ollama:qwen2.5:7b \
-  --allow-same-judge --repeat 1 --only-path 1 --plan runs/cheapest-penne/<timestamp>/plan.json
+  --allow-same-judge --repeat 1 --only-path happy --plan runs/cheapest-penne/<timestamp>/plan.json
 ```
 
 Local models are slow on a CPU-only laptop (minutes per LLM turn); see `docs/LOCAL_MODELS.md`.

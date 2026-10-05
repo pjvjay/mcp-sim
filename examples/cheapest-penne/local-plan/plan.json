@@ -1,56 +1,134 @@
 {
   "scenario": "cheapest-penne",
-  "catalog_digest": "fda001da06264e04d9ff84f9888abe6249fbbe5ee7859f23945979b453c94ee2",
+  "catalog_digest": "b99516d95a4cde90f4bc8495644f445b62fa181dc41de455cd0552e0279a346f",
   "paths": [
     {
-      "id": "1",
+      "id": "happy",
       "kind": "happy",
-      "title": "Find the cheapest penne product",
-      "rationale": "The agent needs to find the cheapest penne product in the catalog.",
+      "title": "Happy path: find_product",
+      "rationale": "The tool execution ollama:command-r7b planned for the user's request; the checkpoints are derived by the framework from its answer_fields lineage and from expected_outcome.json.",
       "steps": [
         {
-          "intent": "Use find_product to find the cheapest penne product",
+          "intent": "To find the cheapest penne product",
           "tool": "find_product",
           "arguments_sketch": {
-            "query": "penne",
-            "limit": 1
+            "query": "penne"
           },
-          "success_looks_like": "",
+          "success_looks_like": "The cheapest penne product details.",
+          "expect_error": false
+        },
+        {
+          "intent": "Compose the final answer from the results above",
+          "tool": null,
+          "arguments_sketch": {},
+          "success_looks_like": "A final_result with query, match, product_id, product_name, store, price, origin_status taken from the tool results",
           "expect_error": false
         }
       ],
       "checkpoints": [
-        "final_result: origin_status equals the value tool_result[find_product] carried"
+        "final_result: query equals tool_result[find_product] query",
+        "final_result: match equals tool_result[find_product] match",
+        "final_result: product_id equals tool_result[find_product] items[0].id",
+        "final_result: product_name equals tool_result[find_product] items[0].name",
+        "final_result: store equals tool_result[find_product] items[0].store",
+        "final_result: price equals tool_result[find_product] items[0].price",
+        "final_result: origin_status equals tool_result[find_product] items[0].origin_status",
+        "final_result: query equals penne",
+        "final_result: match equals direct",
+        "final_result: product_id is a number",
+        "final_result: product_name matches the pattern (?i)penne",
+        "final_result: store is a string",
+        "final_result: price is greater than 0",
+        "final_result: origin_status is one of unknown, resolved, verified, unverified, pending, conflicting"
       ]
     },
     {
-      "id": "2",
-      "kind": "recovery",
-      "title": "Handle relaxed or none matches",
-      "rationale": "The agent needs to handle cases where find_product returns 'relaxed' or 'none' matches.",
+      "id": "boundary-find_product",
+      "kind": "boundary",
+      "title": "Boundary: find_product answers query=\"pene\" without an error",
+      "rationale": "Probed at plan time on the scout's session: find_product(query=\"pene\") answered without an error (match equals none when query is pene; items has 0 entries when query is pene). The agent must not present that result as the answer to the request.",
       "steps": [
         {
-          "intent": "Use find_product to find the cheapest penne product",
+          "intent": "Call find_product with query=\"pene\" (penne with one character dropped)",
           "tool": "find_product",
           "arguments_sketch": {
-            "query": "penne",
-            "limit": 1
+            "query": "pene"
           },
-          "success_looks_like": "",
-          "expect_error": true
+          "success_looks_like": "The server answers without an error (match equals none when query is pene; items has 0 entries when query is pene); that result is not the answer to the request",
+          "expect_error": false
         },
         {
-          "intent": "The agent should report the result of the find_product call",
+          "intent": "To find the cheapest penne product",
+          "tool": "find_product",
+          "arguments_sketch": {
+            "query": "penne"
+          },
+          "success_looks_like": "The cheapest penne product details.",
+          "expect_error": false
+        },
+        {
+          "intent": "Compose the final answer from the results above",
           "tool": null,
           "arguments_sketch": {},
-          "success_looks_like": "",
+          "success_looks_like": "A final_result with query, match, product_id, product_name, store, price, origin_status taken from the tool results",
           "expect_error": false
         }
       ],
       "checkpoints": [
-        "transcript: find_product returns 'relaxed' or 'none'",
-        "transcript: find_product returns the product details"
+        "tool_result[find_product]: match equals none when query is pene",
+        "tool_result[find_product]: items has 0 entries when query is pene",
+        "final_result: does not present the find_product result for query=\"pene\" as the answer; its values come from the call with query penne",
+        "final_result: query equals tool_result[find_product] query (step 2, the call with query penne)",
+        "final_result: match equals tool_result[find_product] match (step 2, the call with query penne)",
+        "final_result: product_id equals tool_result[find_product] items[0].id (step 2, the call with query penne)",
+        "final_result: product_name equals tool_result[find_product] items[0].name (step 2, the call with query penne)",
+        "final_result: store equals tool_result[find_product] items[0].store (step 2, the call with query penne)",
+        "final_result: price equals tool_result[find_product] items[0].price (step 2, the call with query penne)",
+        "final_result: origin_status equals tool_result[find_product] items[0].origin_status (step 2, the call with query penne)"
+      ]
+    },
+    {
+      "id": "policy-plan_recipe",
+      "kind": "policy",
+      "title": "Policy: reach the answer without calling plan_recipe",
+      "rationale": "Instruction 1 (Use find_product (results come back cheapest first); do not run a planning tool for a lookup.) forbids calling plan_recipe, according to ollama:command-r7b; the agent must reach the same answer without it.",
+      "steps": [
+        {
+          "intent": "To find the cheapest penne product",
+          "tool": "find_product",
+          "arguments_sketch": {
+            "query": "penne"
+          },
+          "success_looks_like": "The cheapest penne product details.",
+          "expect_error": false
+        },
+        {
+          "intent": "Compose the final answer, keeping this rule: Use find_product (results come back cheapest first); do not run a planning tool for a lookup.",
+          "tool": null,
+          "arguments_sketch": {},
+          "success_looks_like": "A final_result with query, match, product_id, product_name, store, price, origin_status taken from the tool results",
+          "expect_error": false
+        }
+      ],
+      "checkpoints": [
+        "transcript: no call to plan_recipe",
+        "final_result: query equals tool_result[find_product] query",
+        "final_result: match equals tool_result[find_product] match",
+        "final_result: product_id equals tool_result[find_product] items[0].id",
+        "final_result: product_name equals tool_result[find_product] items[0].name",
+        "final_result: store equals tool_result[find_product] items[0].store",
+        "final_result: price equals tool_result[find_product] items[0].price",
+        "final_result: origin_status equals tool_result[find_product] items[0].origin_status"
       ]
     }
+  ],
+  "notes": [
+    "local planner (ollama:command-r7b): execution plan call 1: 1243 prompt + 134 output tokens in 205 s, 7 problem(s): answer_fields.query: items[2].name is not in what step 1 (find_product) returned when the scout made that call: {query=\"penne\", tokens[1], match=\"direct\", tota…; answer_fields.match: items[2].store is not in what step 1 (find_product) returned when the scout made that call: {query=\"penne\", tokens[1], match=\"direct\", tot…; answer_fields.product_id: items[2].id is not in what step 1 (find_product) returned when the scout made that call: {query=\"penne\", tokens[1], match=\"direct\", t…; answer_fields.product_name: items[2].name is not in what step 1 (find_product) returned when the scout made that call: {query=\"penne\", tokens[1], match=\"direct…",
+    "local planner (ollama:command-r7b): execution plan call 2: 2127 prompt + 126 output tokens in 174 s, accepted",
+    "local planner (ollama:command-r7b): probe: find_product(query=\"pene\") returned an answer in 13 ms",
+    "local planner (ollama:command-r7b): policy question 1 (instruction 1): 543 prompt + 13 output tokens in 41 s, answer plan_recipe",
+    "local planner (ollama:command-r7b): policy question 2 (instruction 2): 547 prompt + 16 output tokens in 43 s, answer get_product_origins; ignored, the prohibition (never round a price or guess a store) does not name get_product_origins",
+    "local planner (ollama:command-r7b): policy question 3 (instruction 3): 557 prompt + 13 output tokens in 41 s, answer find_product; ignored, the happy path calls find_product",
+    "local planner (ollama:command-r7b): instruction 4 not asked about: at most 3 policy questions per plan"
   ]
 }

@@ -20,11 +20,21 @@ sees no conversation); their effects grow or shrink the disclosed set, enable go
 flags. Tools an effect enabled get one pass of steps 2–3 (no unbounded loops). The result is
 saved as ``scout.json`` beside ``plan.json`` and is what the orchestrating planner reads instead
 of raw tool output.
+
+**Probes.** The local planner (:mod:`mcpsim.execution_planner`) grounds its variant paths in
+what the server actually does with a mutated input: :func:`probe` makes that call on the same
+read-only session, counts it against the same budget (the runner has the scout leave
+``reserve`` calls unspent for it) and records it as an observation with ``probe: true``. A probe
+is refused (:class:`ProbeRefusedError`) before anything reaches the server when the tool writes,
+claims a cost or reaches outside the server (:func:`probe_refusal`), or when the call would send
+a URL, host name or e-mail address (:func:`probe_argument_refusal`): a mutated URL is a request
+to somebody else's domain, and its answer is a third party's text, not the server's.
 """
 
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path as FsPath
 from typing import Any, Literal
 
@@ -32,7 +42,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from mcpsim.mcpclient import Catalog, Session, ToolInfo
 from mcpsim.observers import ObserverRunner
-from mcpsim.planner import dry_run_arguments, is_expensive
+from mcpsim.planner import dry_run_arguments, is_expensive, resolve_ref
 from mcpsim.scenario import Scenario
 from mcpsim.scoping import (
     initial_tools,
@@ -50,11 +60,37 @@ from mcpsim.transcript import (
 
 SCOUT_FILE = "scout.json"
 MIN_SCOUT_CALLS = 2
+# Calls of the scout budget a local planner keeps for its variant probe (one per plan).
+PROBE_RESERVE = 1
 SUMMARY_LIMIT = 600
 RESOURCE_BODY_LIMIT = 50_000
 _KEYS_SHOWN = 12
 _ITEMS_SHOWN = 3
 _ITEM_CHARS = 120
+
+# A tool without an ``openWorldHint`` whose description says it reaches the internet.
+OPEN_WORLD_DESCRIPTION = re.compile(
+    r"\b(internet|world wide web|the web|web ?pages?|web ?sites?|web search)\b", re.IGNORECASE
+)
+# JSON-schema ``format`` values, argument-name words and value shapes that address something
+# outside the server: a probe never sends (or mutates) one.
+ADDRESS_FORMATS = frozenset({
+    "uri", "url", "uri-reference", "iri", "iri-reference", "uri-template",
+    "hostname", "idn-hostname", "email", "idn-email", "ipv4", "ipv6",
+})
+ADDRESS_NAME_WORDS = frozenset({
+    "url", "urls", "uri", "uris", "link", "links", "href", "host", "hostname", "domain",
+    "domains", "email", "emails", "endpoint", "website", "webpage",
+})
+_NAME_WORD = re.compile(r"[A-Z]?[a-z]+|[A-Z]+(?![a-z])|[0-9]+")
+_ADDRESS_VALUES = (
+    re.compile(r"^\s*([a-z][a-z0-9+.-]*://|www\.|mailto:)", re.IGNORECASE),  # a URL
+    re.compile(  # a host name, with an optional port and path
+        r"^\s*[a-z0-9-]+(\.[a-z0-9-]+)*\.[a-z]{2,}(:[0-9]+)?([/?#]\S*)?\s*$", re.IGNORECASE
+    ),
+    re.compile(r"^\s*[^@\s]+@[^@\s]+\.[a-z]{2,}\s*$", re.IGNORECASE),  # an e-mail address
+    re.compile(r"^\s*[0-9]{1,3}(\.[0-9]{1,3}){3}(:[0-9]+)?([/?#]\S*)?\s*$"),  # an IPv4 address
+)
 
 
 class Observation(BaseModel):
@@ -78,6 +114,8 @@ class Observation(BaseModel):
     chars: int = 0
     mime_type: str | None = None
     from_expected: list[str] = Field(default_factory=list)
+    # A planner probe (a mutated input sent on purpose, see :func:`probe`), not a scout call.
+    probe: bool = False
 
     def call_label(self) -> str:
         """``find_product(query="penne")`` or the resource URI."""
@@ -218,6 +256,164 @@ def is_zero_argument(tool: ToolInfo) -> bool:
     return not (isinstance(required, list) and required)
 
 
+def is_read_only(tool: ToolInfo) -> bool:
+    """The server's ``readOnlyHint`` when it sent one, else not a write tool by name.
+
+    A tool whose hint says read-only is still refused when its name or ``destructiveHint`` says
+    it writes (:func:`mcpsim.scoping.is_write_tool`): either signal is enough to stay away.
+    """
+    annotations = tool.annotations or {}
+    hint = annotations.get("read_only_hint", annotations.get("readOnlyHint"))
+    if hint is not None and hint is not True:
+        return False
+    return not is_write_tool(tool)
+
+
+class ProbeRefusedError(ValueError):
+    """:func:`probe` was asked for a call it must never send (:func:`probe_refusal`,
+    :func:`probe_argument_refusal`). The planner applies the same checks before it asks, so
+    this is a bug to surface, unlike a failure of the call itself."""
+
+
+def open_world_refusal(tool: ToolInfo) -> str | None:
+    """Why ``tool``'s answers come from outside the server, or ``None``.
+
+    The server's ``openWorldHint`` when it sent one (``false`` is believed); without it, a
+    description that says the tool reaches the internet. An unannotated tool that says neither
+    (``mcp-server-fetch`` behind a gateway lists ``annotations: {}``) is caught by its
+    arguments instead (:func:`probe_argument_refusal`).
+    """
+    annotations = tool.annotations or {}
+    hint = annotations.get("open_world_hint", annotations.get("openWorldHint"))
+    if hint is True:
+        return "the server marks it open-world (openWorldHint), so its answers come from outside"
+    if hint is None and OPEN_WORLD_DESCRIPTION.search(tool.description or ""):
+        return "its description says it reaches the internet"
+    return None
+
+
+def probe_refusal(tool: ToolInfo) -> str | None:
+    """Why ``tool`` must not be probed with a mutated input, or ``None`` when it may be."""
+    if not is_read_only(tool):
+        return "it is not read-only (a write tool)"
+    if is_expensive(tool):
+        return "its description says it costs money, credits or time"
+    return open_world_refusal(tool)
+
+
+def _formats(prop: Any, root: dict[str, Any]) -> set[str]:
+    """The ``format`` of a property schema and of its ``anyOf``/``oneOf``/``allOf`` variants."""
+    if not isinstance(prop, dict):
+        return set()
+    node = resolve_ref(prop, root)
+    found = {str(node["format"])} if isinstance(node.get("format"), str) else set()
+    for key in ("anyOf", "oneOf", "allOf"):
+        variants = node.get(key)
+        if isinstance(variants, list):
+            for variant in variants:
+                if isinstance(variant, dict):
+                    inner = resolve_ref(variant, root).get("format")
+                    if isinstance(inner, str):
+                        found.add(inner)
+    return found
+
+
+def _strings(value: Any) -> list[str]:
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, dict):
+        return [s for inner in value.values() for s in _strings(inner)]
+    if isinstance(value, list):
+        return [s for inner in value for s in _strings(inner)]
+    return []
+
+
+def looks_like_address(text: str) -> bool:
+    """Is ``text`` a URL, a host name (``omnivorescookbook.com/mala-chicken/``), an e-mail or
+    an IPv4 address? A false positive only costs the probe."""
+    return any(p.match(text) for p in _ADDRESS_VALUES)
+
+
+def probe_argument_refusal(tool: ToolInfo, arguments: dict[str, Any]) -> str | None:
+    """Why a call of ``tool`` with ``arguments`` must not be probed, or ``None``.
+
+    An argument that addresses something outside the server (a ``format`` such as ``uri`` or
+    ``hostname``, a name such as ``url`` or ``email``, or a value that looks like a URL, host
+    name, e-mail or IP address, nested values included) makes the call's answer a third
+    party's: mutating ``https://omnivorescookbook.com/…`` sends a request to
+    ``omnivorescookook.com``, and even the unmutated call would fetch somebody else's page.
+    """
+    schema = tool.input_schema or {}
+    properties = schema.get("properties")
+    properties = properties if isinstance(properties, dict) else {}
+    for name, value in arguments.items():
+        formats = _formats(properties.get(name), schema) & ADDRESS_FORMATS
+        if formats:
+            return f"argument {name!r} is a {sorted(formats)[0]} (an address outside the server)"
+        words = {w.lower() for w in _NAME_WORD.findall(name)}
+        if words & ADDRESS_NAME_WORDS:
+            return f"argument {name!r} names an address outside the server"
+        if any(looks_like_address(s) for s in _strings(value)):
+            return f"argument {name!r} holds an address outside the server"
+    return None
+
+
+async def observe_call(
+    session: Session, tool: ToolInfo, arguments: dict[str, Any], from_expected: list[str]
+) -> Observation:
+    """Call ``tool`` once and describe the result as an :class:`Observation`."""
+    result = await session.call_tool(tool.name, arguments)
+    if result.structured is not None:
+        summary = summarise_json(result.structured)
+    else:
+        summary = _clip(result.text, SUMMARY_LIMIT) or (
+            "(error, no message)" if result.is_error else "(empty)"
+        )
+    return Observation(
+        kind="tool",
+        name=tool.name,
+        arguments=dict(arguments),
+        is_error=result.is_error,
+        summary=summary,
+        structured_keys=structured_keys(result.structured),
+        structured=result.structured,
+        ms=result.ms,
+        chars=result.chars,
+        from_expected=list(from_expected),
+    )
+
+
+async def probe(
+    result: ScoutResult,
+    session: Session,
+    tool: ToolInfo,
+    arguments: dict[str, Any],
+    *,
+    why: str,
+) -> Observation | None:
+    """One planner probe on the scout's session: ``None`` when the scout budget is spent.
+
+    Raises :class:`ProbeRefusedError` for a tool :func:`probe_refusal` rejects or arguments
+    :func:`probe_argument_refusal` rejects, before anything is sent: the planner never asks for
+    one, so a request is a bug to surface, not to skip. Whatever the call itself raises (a
+    dropped session, a result the SDK cannot validate) propagates unchanged. The call is
+    counted in ``result.tool_calls``, appended to ``result.observations`` with ``probe=True``
+    and noted (``why`` says what the probe is for).
+    """
+    refusal = probe_refusal(tool) or probe_argument_refusal(tool, arguments)
+    if refusal is not None:
+        raise ProbeRefusedError(f"refusing to probe {tool.name}: {refusal}")
+    if result.tool_calls >= result.budget:
+        return None
+    observation = await observe_call(session, tool, arguments, [])
+    observation.probe = True
+    result.tool_calls += 1
+    result.observations.append(observation)
+    status = "error" if observation.is_error else "ok"
+    result.notes.append(f"probe: {observation.call_label()} → {status} ({why})")
+    return observation
+
+
 # --- the scout --------------------------------------------------------------------------------
 
 
@@ -229,13 +425,19 @@ class _Scouting:
         session: Session,
         observers: ObserverRunner | None,
         budget: int,
+        reserve: int = 0,
     ) -> None:
         self.scenario = scenario
         self.catalog = catalog
         self.session = session
         self.observers = observers
         self.budget = budget
+        self.reserve = max(0, min(reserve, budget))
         self.result = ScoutResult(disclosed=initial_disclosed(scenario, catalog), budget=budget)
+        if self.reserve:
+            self.result.notes.append(
+                f"{self.reserve} of {budget} tool call(s) left for the planner's probes"
+            )
         self.called: set[str] = set()
 
     @property
@@ -243,7 +445,7 @@ class _Scouting:
         return self.result.observations
 
     def remaining(self) -> int:
-        return self.budget - self.result.tool_calls
+        return self.budget - self.reserve - self.result.tool_calls
 
     async def read_resources(self) -> None:
         seen: set[str] = set()
@@ -281,29 +483,10 @@ class _Scouting:
     async def call(
         self, tool: ToolInfo, arguments: dict[str, Any], from_expected: list[str]
     ) -> None:
-        result = await self.session.call_tool(tool.name, arguments)
+        observation = await observe_call(self.session, tool, arguments, from_expected)
         self.result.tool_calls += 1
         self.called.add(tool.name)
-        if result.structured is not None:
-            summary = summarise_json(result.structured)
-        else:
-            summary = _clip(result.text, SUMMARY_LIMIT) or (
-                "(error, no message)" if result.is_error else "(empty)"
-            )
-        self.observations.append(
-            Observation(
-                kind="tool",
-                name=tool.name,
-                arguments=dict(arguments),
-                is_error=result.is_error,
-                summary=summary,
-                structured_keys=structured_keys(result.structured),
-                structured=result.structured,
-                ms=result.ms,
-                chars=result.chars,
-                from_expected=list(from_expected),
-            )
-        )
+        self.observations.append(observation)
 
     def _readable(self, names: list[str]) -> list[ToolInfo]:
         """The disclosed tools the scout may call: never a write tool, never one whose
@@ -402,14 +585,21 @@ async def scout(
     *,
     observers: ObserverRunner | None = None,
     budget: int | None = None,
+    reserve: int = 0,
 ) -> ScoutResult:
     """Observe the server read-only, let the observers report, return the :class:`ScoutResult`.
 
     ``catalog`` is the *allowed* catalog. ``observers`` is the scenario's runner (``None`` runs
     no observer at all; the dry run passes one with ``include_llm=False``). ``budget`` overrides
-    :func:`scout_budget`.
+    :func:`scout_budget`. ``reserve`` tool calls of the budget are left unspent for the planner's
+    :func:`probe` calls (the runner reserves :data:`PROBE_RESERVE` for a local planner).
     """
     scouting = _Scouting(
-        scenario, catalog, session, observers, scout_budget(scenario) if budget is None else budget
+        scenario,
+        catalog,
+        session,
+        observers,
+        scout_budget(scenario) if budget is None else budget,
+        reserve,
     )
     return await scouting.run()
