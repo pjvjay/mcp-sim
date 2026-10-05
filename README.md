@@ -158,10 +158,11 @@ and queue tools with `plan` disclosure, so a volunteer can submit a reading but 
 `review_origin_submission`. None of the six names a model: every role, the planner
 included, keeps its Anthropic default unless `--models` overrides it. And each
 declares observers (see Observers): every one the built-in `fabrication_auditor`;
-`cheapest-penne` a code `shelf_clerk` (a direct match enables `get_product` and the quoting
-goal) and the LLM `shelf_auditor`; `unknown-recipe` a `librarian`; `misspelled-country` a
-`desk_clerk`; the boycott and the week `honesty_about_coverage`; `label-submission` a
-`records_clerk`.
+`cheapest-penne` a code `shelf_clerk` (a direct match enables `get_product`);
+`unknown-recipe` a code `librarian` (reports whether the slug exists); the boycott and the week
+`honesty_about_coverage`; `label-submission` a code `records_clerk` (a pending submission
+enables `list_origin_submissions`). None of them gives the agent a goal: an observer that told
+the agent what to say would hand it the expected behaviour the judge then grades.
 
 ## Scenario file
 
@@ -532,7 +533,8 @@ verdict and a report.
 machine against the real pantry server (DEMO_MODE, seeded SQLite), described in
 [`examples/README.md`](examples/README.md):
 
-* `dry-run/` — the smoke above, regenerated with observers: a `scout.json` with eight
+* `dry-run/` — the smoke above, regenerated with observers (recorded while `shelf_clerk` still
+  enabled a quoting goal; it no longer does): a `scout.json` with eight
   observations and the `shelf_clerk.direct_match = true` report that disclosed `get_product` and
   enabled the quoting goal, a plan over the ten goal-relevant free tools (the write tools are
   denied, the costly planners skipped) with a `report:` checkpoint, a transcript whose first

@@ -8,6 +8,10 @@ a scripted fake (``tests/fake_llm.py``). Two real implementations:
 * :class:`OllamaLLM` — a local Ollama server over ``POST {host}/api/chat`` with the mapping
   table from docs/LOCAL_MODELS.md; retries on connection errors and 5xx (max 3 attempts); a
   404 for an unknown model fails at once with the ``ollama pull`` hint. Cost is always 0.
+* :class:`GeminiLLM` — Google's Gemini API through its OpenAI-compatible endpoint
+  (``POST {base}/chat/completions``, key in ``GEMINI_API_KEY``); retries on 429/5xx and
+  connection errors (max 5 attempts, honouring ``Retry-After``). Cost is reported as 0 (the
+  free tier; there is no Gemini row in :data:`RATE_TABLE`).
 
 A model is addressed as ``provider:model`` (:func:`parse_model_spec`); a bare name means
 ``anthropic``. :func:`make_llm` builds (and caches) one client per provider; the runner's
@@ -32,7 +36,8 @@ DEFAULT_MAX_TOKENS = 4096
 
 ANTHROPIC = "anthropic"
 OLLAMA = "ollama"
-PROVIDERS: tuple[str, ...] = (ANTHROPIC, OLLAMA)
+GEMINI = "gemini"
+PROVIDERS: tuple[str, ...] = (ANTHROPIC, OLLAMA, GEMINI)
 DEFAULT_PROVIDER = ANTHROPIC
 
 API_KEY_ENV = "ANTHROPIC_API_KEY"
@@ -49,6 +54,14 @@ MAX_OLLAMA_DEADLINE_S = 600.0
 # Keep the model loaded between calls: Ollama's own default (5 minutes) unloads it while the
 # hosted agent and judge run, and every scenario then pays the load again with a cold cache.
 DEFAULT_OLLAMA_KEEP_ALIVE = "30m"
+GEMINI_API_KEY_ENV = "GEMINI_API_KEY"
+GEMINI_BASE_URL_ENV = "MCPSIM_GEMINI_BASE_URL"
+GEMINI_REASONING_EFFORT_ENV = "MCPSIM_GEMINI_REASONING_EFFORT"
+DEFAULT_GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai"
+# Gemini 3 thinks before it answers, and the thinking is billed against max_tokens; "low" keeps
+# a role's max_tokens for the answer itself. Set the variable to "" to send no reasoning_effort.
+DEFAULT_GEMINI_REASONING_EFFORT = "low"
+GEMINI_TIMEOUT_S = 300.0
 # Rendered after "Cost is an ..." in report.md, hence the leading noun.
 LOCAL_COST_NOTE = "estimate; local model(s) via Ollama cost 0 (no API spend)"
 
@@ -845,6 +858,352 @@ class OllamaLLM:
             return result
 
 
+# --- Gemini (OpenAI-compatible endpoint) --------------------------------------------------------
+
+
+class GeminiError(RuntimeError):
+    """A Gemini API failure worth showing as-is (bad key, unknown model, retries exhausted)."""
+
+
+def gemini_base_url(env: Mapping[str, str] | None = None) -> str:
+    source = os.environ if env is None else env
+    return (source.get(GEMINI_BASE_URL_ENV, "").strip() or DEFAULT_GEMINI_BASE_URL).rstrip("/")
+
+
+def gemini_reasoning_effort(env: Mapping[str, str] | None = None) -> str | None:
+    source = os.environ if env is None else env
+    value = source.get(GEMINI_REASONING_EFFORT_ENV)
+    if value is None:
+        return DEFAULT_GEMINI_REASONING_EFFORT
+    return value.strip() or None
+
+
+def to_openai_tool_choice(tool_choice: dict[str, Any] | None) -> Any:
+    """Anthropic ``tool_choice`` -> OpenAI's: a named tool is forced, ``any`` is ``required``."""
+    if not tool_choice:
+        return None
+    kind = tool_choice.get("type")
+    if kind == "tool" and tool_choice.get("name"):
+        return {"type": "function", "function": {"name": tool_choice["name"]}}
+    if kind == "any":
+        return "required"
+    if kind in ("auto", "none"):
+        return kind
+    return None
+
+
+def to_openai_messages(system: str, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Anthropic-shaped messages -> OpenAI chat messages.
+
+    Like :func:`to_ollama_messages`, except that tool calls keep their ids (``tool`` messages
+    answer by ``tool_call_id``), arguments travel as a JSON string, and a ``tool_use`` block's
+    ``provider_extra`` (Gemini 3's thought signature) is sent back as the call's
+    ``extra_content``: Gemini answers 400 to a function call replayed without it.
+    """
+    out: list[dict[str, Any]] = []
+    if system.strip():
+        out.append({"role": "system", "content": system})
+    for message in messages:
+        role = str(message.get("role", "user"))
+        content = message.get("content")
+        if isinstance(content, str) or content is None:
+            out.append({"role": role, "content": content or ""})
+            continue
+        if role == "assistant":
+            texts: list[str] = []
+            tool_calls: list[dict[str, Any]] = []
+            for block in content:
+                kind = block.get("type")
+                if kind == "text":
+                    texts.append(str(block.get("text", "")))
+                elif kind == "tool_use":
+                    call: dict[str, Any] = {
+                        "id": str(block.get("id", "")),
+                        "type": "function",
+                        "function": {
+                            "name": block["name"],
+                            "arguments": json.dumps(block.get("input") or {}, ensure_ascii=False),
+                        },
+                    }
+                    if block.get("provider_extra"):
+                        call["extra_content"] = block["provider_extra"]
+                    tool_calls.append(call)
+            entry: dict[str, Any] = {"role": "assistant", "content": "\n".join(texts) or None}
+            if tool_calls:
+                entry["tool_calls"] = tool_calls
+            out.append(entry)
+            continue
+        pending: list[str] = []
+        for block in content:
+            kind = block.get("type")
+            if kind == "tool_result":
+                if pending:
+                    out.append({"role": role, "content": "\n".join(pending)})
+                    pending = []
+                text = _block_text(block.get("content"))
+                if block.get("is_error"):
+                    text = f"ERROR: {text}" if text else "ERROR"
+                out.append(
+                    {"role": "tool", "tool_call_id": str(block.get("tool_use_id", "")),
+                     "content": text}
+                )
+            elif kind == "text":
+                pending.append(str(block.get("text", "")))
+            else:
+                pending.append(json.dumps(block, ensure_ascii=False))
+        if pending:
+            out.append({"role": role, "content": "\n".join(pending)})
+    return out
+
+
+def is_retryable_gemini(exc: BaseException) -> bool:
+    """429 (the free tier's per-minute limit), any 5xx (503 "high demand" is common), or a
+    connection-level failure."""
+    if isinstance(exc, httpx.HTTPStatusError):
+        status = exc.response.status_code
+        return status == 429 or status >= 500
+    return isinstance(exc, httpx.TransportError)
+
+
+def gemini_arguments(raw: Any, tool: str) -> dict[str, Any]:
+    """A tool call's ``arguments`` as an object. The OpenAI shape sends a JSON string; an empty
+    one means no arguments. Anything that is not a JSON object raises :class:`GeminiError`, so a
+    malformed call fails visibly instead of reaching the server with its arguments dropped."""
+    if isinstance(raw, dict):
+        return raw
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        return {}
+    if isinstance(raw, str):
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise GeminiError(
+                f"Gemini returned arguments for {tool!r} that are not valid JSON ({exc}): "
+                f"{raw[:200]}"
+            ) from exc
+        if isinstance(parsed, dict):
+            return parsed
+    raise GeminiError(
+        f"Gemini returned arguments for {tool!r} that are not a JSON object: {str(raw)[:200]}"
+    )
+
+
+def _retry_after_s(response: httpx.Response | None) -> float | None:
+    if response is None:
+        return None
+    raw = response.headers.get("retry-after", "").strip()
+    try:
+        return float(raw) if raw else None
+    except ValueError:
+        return None
+
+
+class GeminiLLM:
+    """Gemini behind the :class:`LLM` protocol, via ``POST {base}/chat/completions``."""
+
+    def __init__(
+        self,
+        api_key: str | None = None,
+        *,
+        base_url: str | None = None,
+        reasoning_effort: str | None | object = ...,
+        client: httpx.AsyncClient | None = None,
+        max_attempts: int = 5,
+        base_delay: float = 2.0,
+        max_delay: float = 60.0,
+        sleep: SleepFn = asyncio.sleep,
+        jitter: Callable[[], float] = random.random,
+    ) -> None:
+        if max_attempts < 1:
+            raise ValueError("max_attempts must be >= 1")
+        self.api_key = api_key if api_key is not None else os.environ.get(GEMINI_API_KEY_ENV, "")
+        self.base_url = (base_url or gemini_base_url()).rstrip("/")
+        self.reasoning_effort = (
+            gemini_reasoning_effort() if reasoning_effort is ... else reasoning_effort
+        )
+        self._client = client or httpx.AsyncClient(timeout=httpx.Timeout(GEMINI_TIMEOUT_S))
+        self._max_attempts = max_attempts
+        self._base_delay = base_delay
+        self._max_delay = max_delay
+        self._sleep = sleep
+        self._jitter = jitter
+        self.usage: dict[str, Usage] = {}
+        self.calls = 0
+        self.retries = 0
+        self._next_call_id = 0
+
+    def cost_usd(self) -> float:
+        """0: the free tier is not billed, and RATE_TABLE has no Gemini prices."""
+        return 0.0
+
+    def build_request(
+        self,
+        *,
+        model: str,
+        system: str,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None,
+        tool_choice: dict[str, Any] | None,
+        max_tokens: int,
+        temperature: float | None = None,
+    ) -> dict[str, Any]:
+        """The request body for one call (pure; tests inspect it). Temperature is sent only
+        when a role sets one: Gemini 3 is tuned for its default of 1.0."""
+        forced_tool(tools, tool_choice)  # raises when tool_choice names a tool not in tools
+        body: dict[str, Any] = {
+            "model": model,
+            "messages": to_openai_messages(system, messages),
+            "max_tokens": max_tokens,
+        }
+        if tools:
+            body["tools"] = to_ollama_tools(tools)  # the same OpenAI function shape
+            choice = to_openai_tool_choice(tool_choice)
+            if choice is not None:
+                body["tool_choice"] = choice
+        if temperature is not None:
+            body["temperature"] = temperature
+        if self.reasoning_effort:
+            body["reasoning_effort"] = self.reasoning_effort
+        return body
+
+    def _call_id(self) -> str:
+        self._next_call_id += 1
+        return f"gemini_call_{self._next_call_id}"
+
+    def parse_response(self, data: dict[str, Any], *, model: str) -> LLMResponse:
+        """OpenAI chat-completion JSON -> provider-neutral :class:`LLMResponse`. A call without an
+        id gets one unique to this client, so ids never repeat across turns."""
+        choices = data.get("choices") or [{}]
+        choice = choices[0] or {}
+        message = choice.get("message") or {}
+        content: list[dict[str, Any]] = []
+        text = str(message.get("content") or "")
+        if text:
+            content.append({"type": "text", "text": text})
+        for call in message.get("tool_calls") or []:
+            function = call.get("function") or {}
+            name = str(function.get("name", ""))
+            block: dict[str, Any] = {
+                "type": "tool_use",
+                "id": str(call.get("id") or self._call_id()),
+                "name": name,
+                "input": gemini_arguments(function.get("arguments"), name),
+            }
+            if call.get("extra_content"):
+                block["provider_extra"] = call["extra_content"]
+            content.append(block)
+        finish = choice.get("finish_reason")
+        if finish == "length":
+            stop_reason = "max_tokens"
+        elif any(b["type"] == "tool_use" for b in content):
+            stop_reason = "tool_use"
+        else:
+            stop_reason = "end_turn"
+        raw = data.get("usage") or {}
+        prompt = int(raw.get("prompt_tokens") or 0)
+        # total includes the thinking tokens, which are billed as output
+        output = max(int(raw.get("total_tokens") or 0) - prompt,
+                     int(raw.get("completion_tokens") or 0))
+        return LLMResponse(
+            content=content,
+            stop_reason=stop_reason,
+            usage=Usage(input_tokens=prompt, output_tokens=output),
+            model=str(data.get("model") or model),
+        )
+
+    def _error_for(self, model: str, response: httpx.Response) -> GeminiError | None:
+        """A user-facing error for a non-retryable 4xx; ``None`` for 429 and 5xx."""
+        status = response.status_code
+        if status == 429 or status >= 500:
+            return None
+        try:
+            payload = response.json()
+            if isinstance(payload, list) and payload:
+                payload = payload[0]
+            detail = str((payload.get("error") or {}).get("message", "")).strip()
+        except (ValueError, AttributeError):
+            detail = response.text.strip()
+        detail = detail[:300]
+        if status in (401, 403):
+            return GeminiError(
+                f"Gemini rejected the key in {GEMINI_API_KEY_ENV} ({status}): {detail}"
+            )
+        if status == 404:
+            return GeminiError(f"Gemini has no model {model!r} for this key: {detail}")
+        return GeminiError(f"Gemini rejected the request ({status}): {detail}")
+
+    async def complete(
+        self,
+        *,
+        model: str,
+        system: str,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        tool_choice: dict[str, Any] | None = None,
+        max_tokens: int = DEFAULT_MAX_TOKENS,
+        temperature: float | None = None,
+    ) -> LLMResponse:
+        if not self.api_key:
+            raise RuntimeError(missing_gemini_key_message())
+        _, model_id = parse_model_spec(model)
+        body = self.build_request(
+            model=model_id,
+            system=system,
+            messages=messages,
+            tools=tools,
+            tool_choice=tool_choice,
+            max_tokens=max_tokens,
+            temperature=temperature,
+        )
+        url = f"{self.base_url}/chat/completions"
+        headers = {"Authorization": f"Bearer {self.api_key}"}
+        attempt = 0
+        while True:
+            attempt += 1
+            self.calls += 1
+            response: httpx.Response | None = None
+            try:
+                response = await self._client.post(url, json=body, headers=headers)
+                if response.status_code >= 400:
+                    error = self._error_for(model_id, response)
+                    if error is not None:
+                        raise error
+                    response.raise_for_status()
+            except GeminiError:
+                raise
+            except Exception as exc:
+                if attempt >= self._max_attempts or not is_retryable_gemini(exc):
+                    if isinstance(exc, httpx.HTTPStatusError):
+                        raise GeminiError(
+                            f"Gemini failed with {exc.response.status_code} after {attempt} "
+                            f"attempt(s): {exc.response.text.strip()[:300]}"
+                        ) from exc
+                    if isinstance(exc, httpx.TransportError):
+                        raise GeminiError(
+                            f"cannot reach Gemini at {self.base_url} after {attempt} attempt(s) "
+                            f"({type(exc).__name__}: {exc})"
+                        ) from exc
+                    raise
+                self.retries += 1
+                wait = _retry_after_s(response)
+                if wait is None:
+                    wait = min(self._base_delay * (2 ** (attempt - 1)), self._max_delay)
+                await self._sleep(min(wait, self._max_delay) + self._jitter())
+                continue
+            try:
+                data = response.json()
+            except ValueError as exc:
+                raise GeminiError(
+                    f"Gemini returned a reply that is not JSON (HTTP {response.status_code}): "
+                    f"{response.text.strip()[:300]}"
+                ) from exc
+            if not isinstance(data, dict):
+                raise GeminiError(f"Gemini returned a non-object reply: {str(data)[:300]}")
+            result = self.parse_response(data, model=model_id)
+            self.usage[model] = self.usage.get(model, Usage()) + result.usage
+            return result
+
+
 # --- provider factory ---------------------------------------------------------------------------
 
 
@@ -889,6 +1248,13 @@ def clear_llm_cache() -> None:
     _CLIENTS.clear()
 
 
+def missing_gemini_key_message(purpose: str | None = None) -> str:
+    return (
+        f"{GEMINI_API_KEY_ENV} is not set; export it (or put it in mcp-sim/.env) to address a "
+        "model as gemini:<model>" + (f" (needed for the {purpose})" if purpose else "")
+    )
+
+
 def missing_api_key_message(purpose: str | None = None) -> str:
     return (
         f"{API_KEY_ENV} is not set; export it for a real run, use --dry-run (MCPSIM_DRY_RUN=1) "
@@ -899,9 +1265,10 @@ def missing_api_key_message(purpose: str | None = None) -> str:
 
 def make_llm(provider: str, *, purpose: str | None = None) -> LLM:
     """One cached client per provider: ``anthropic`` -> :class:`AnthropicLLM`, ``ollama`` ->
-    :class:`OllamaLLM`. ``purpose`` names the role for the error message.
+    :class:`OllamaLLM`, ``gemini`` -> :class:`GeminiLLM`. ``purpose`` names the role for the
+    error message.
 
-    Raises ``RuntimeError`` when ``anthropic`` is asked for without ``ANTHROPIC_API_KEY`` (the
+    Raises ``RuntimeError`` when ``anthropic`` or ``gemini`` is asked for without its key (the
     key is checked on every call so a cache cannot hide a missing key) and ``ValueError`` for an
     unknown provider.
     """
@@ -909,6 +1276,9 @@ def make_llm(provider: str, *, purpose: str | None = None) -> LLM:
     if key == ANTHROPIC:
         if not os.environ.get(API_KEY_ENV):
             raise RuntimeError(missing_api_key_message(purpose))
+    elif key == GEMINI:
+        if not os.environ.get(GEMINI_API_KEY_ENV):
+            raise RuntimeError(missing_gemini_key_message(purpose))
     elif key != OLLAMA:
         raise ValueError(
             f"unknown model provider {provider!r}; use one of "
@@ -916,6 +1286,6 @@ def make_llm(provider: str, *, purpose: str | None = None) -> LLM:
         )
     cached = _CLIENTS.get(key)
     if cached is None:
-        cached = AnthropicLLM() if key == ANTHROPIC else OllamaLLM()
+        cached = {ANTHROPIC: AnthropicLLM, OLLAMA: OllamaLLM, GEMINI: GeminiLLM}[key]()
         _CLIENTS[key] = cached
     return cached
