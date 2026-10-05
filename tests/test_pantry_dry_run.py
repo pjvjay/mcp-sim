@@ -14,6 +14,7 @@ import yaml
 
 from mcpsim import runner
 from mcpsim.plan import ExecutionPlan
+from mcpsim.scenario import load_scenario
 from mcpsim.scout import ScoutResult
 from mcpsim.transcript import Transcript
 from mcpsim.verdict import Verdict
@@ -23,8 +24,10 @@ TEST_DB = FsPath(__file__).resolve().parent.parent / "runs" / "pantry-sim-fable.
 
 
 def _server_command() -> str:
-    data = yaml.safe_load(SCENARIO.read_text(encoding="utf-8"))
-    return str(data["server"]["stdio"]["command"])
+    # As the loader expands it: the file reads ${PANTRY_API_HOME:-...}.
+    stdio = load_scenario(SCENARIO).server.stdio
+    assert stdio is not None
+    return stdio.command
 
 
 pytestmark = pytest.mark.skipif(
@@ -58,9 +61,9 @@ def test_cheapest_penne_dry_run_yields_find_products_result_and_passes_the_match
     assert reports[("shelf_clerk.direct_match", "scout")].evidence == (
         "find_product.match == 'direct', find_product.total == 2"
     )
-    assert "get_product" in scout.disclosed and scout.goals == [
-        "Quote the cheapest direct hit by exact name, price and store."
-    ]
+    # The clerk unlocks get_product and hands the agent no goal: what to say is the judge's to
+    # grade, not the observer's to hand over.
+    assert "get_product" in scout.disclosed and scout.goals == []
     assert scout.planner_prompt_chars > 0
 
     plan = ExecutionPlan.load(run_dir / "plan.json")
@@ -93,8 +96,7 @@ def test_cheapest_penne_dry_run_yields_find_products_result_and_passes_the_match
     ]
     offered = [e for e in transcript.events if e.kind == "tools_offered"]
     assert offered[1].reason == "observer:shelf_clerk.direct_match"  # type: ignore[union-attr]
-    goals = [e for e in transcript.events if e.kind == "goal_enabled"]
-    assert goals and goals[0].observer == "shelf_clerk"  # type: ignore[union-attr]
+    assert not [e for e in transcript.events if e.kind == "goal_enabled"]
 
     verdict = Verdict.load(run_dir / "verdicts" / f"{only.id}-guided-0.json")
     assert verdict.judge_model == "dry-run" and verdict.votes == 0

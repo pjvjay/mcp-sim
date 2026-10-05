@@ -9,3 +9,4 @@ runs/
 dist/
 *.egg-info/
 .env
+build/

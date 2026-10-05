@@ -82,7 +82,7 @@ def test_parse_model_spec_rejects_empty_name(spec: str) -> None:
 def test_is_local_model_and_rates() -> None:
     assert is_local_model("ollama:command-r7b") is True
     assert is_local_model("claude-sonnet-5-5") is False
-    assert rate_for("anthropic:claude-sonnet-5-5") == (3.0, 15.0)
+    assert rate_for("anthropic:claude-sonnet-5-5") == (2.0, 10.0)
     assert rate_for("ollama:claude-sonnet-5-5") is None  # local, whatever it is called
 
 
@@ -96,9 +96,19 @@ def test_models_defaults_and_new_fields() -> None:
         DEFAULT_PLANNER_MODEL,
         DEFAULT_JUDGE_MODEL,
     )
-    assert m.user is None and m.allow_same_judge is False
-    assert m.user_model == m.agent
-    assert m.for_role("user") == m.agent
+    # Every role defaults to an Anthropic API model; the simulated user to Haiku.
+    assert (m.user, m.observer) == ("claude-haiku-4-5-20251001", "claude-sonnet-5-5")
+    assert m.allow_same_judge is False
+    assert m.user_model == m.for_role("user") == "claude-haiku-4-5-20251001"
+    assert m.observer_model == m.for_role("observer") == "claude-sonnet-5-5"
+    assert {r: m.for_role(r) for r in MODEL_ROLES} == {
+        "planner": "claude-opus-5-5",
+        "agent": "claude-sonnet-5-5",
+        "user": "claude-haiku-4-5-20251001",
+        "observer": "claude-sonnet-5-5",
+        "judge": "claude-opus-5-5",
+    }
+    assert not any(is_local_model(m.for_role(r)) for r in MODEL_ROLES)
     assert MODEL_ROLES == ("planner", "agent", "judge", "user", "observer")
     with_user = Models(user="ollama:llama3.2:3b", allow_same_judge=True)
     assert with_user.user_model == "ollama:llama3.2:3b"
@@ -107,8 +117,11 @@ def test_models_defaults_and_new_fields() -> None:
         DEFAULT_AGENT_MODEL,
         DEFAULT_JUDGE_MODEL,
         "ollama:llama3.2:3b",
-        DEFAULT_AGENT_MODEL,  # observers default to the agent model, not the user's
+        "claude-sonnet-5-5",  # observers keep their own default, not the user's
     ]
+    # A v1 scenario.json holds null for user / observer: that is the default, not an error.
+    legacy = Models.model_validate({"user": None, "observer": None})
+    assert (legacy.user, legacy.observer) == ("claude-haiku-4-5-20251001", "claude-sonnet-5-5")
     with pytest.raises(KeyError, match="unknown model role"):
         with_user.for_role("critic")
 
@@ -213,10 +226,18 @@ def test_make_llm_for_picks_the_provider_per_role(
         update={"models": Models(planner="ollama:command-r7b", agent="ollama:command-r7b")}
     )
     assert isinstance(runner.make_llm_for(local, "planner"), OllamaLLM)
-    assert isinstance(runner.make_llm_for(local, "agent"), OllamaLLM)  # user shares the agent's
-    assert isinstance(runner.make_llm_for(local, "user"), OllamaLLM)
+    # The simulated user keeps its Anthropic default, so the agent's client needs the key too.
+    with pytest.raises(RuntimeError, match="needed for the simulated user"):
+        runner.make_llm_for(local, "agent")
+    with pytest.raises(RuntimeError, match="needed for the user"):
+        runner.make_llm_for(local, "user")
     with pytest.raises(RuntimeError, match="needed for the judge"):
         runner.make_llm_for(local, "judge")  # still the default Anthropic judge, no key
+    all_local = scenario.model_copy(
+        update={"models": Models(agent="ollama:command-r7b", user="ollama:llama3.2:3b")}
+    )
+    assert isinstance(runner.make_llm_for(all_local, "agent"), OllamaLLM)
+    assert isinstance(runner.make_llm_for(all_local, "user"), OllamaLLM)
 
     mixed = scenario.model_copy(
         update={"models": Models(agent="ollama:command-r7b", user="claude-haiku-4-5-20251001")}
@@ -236,10 +257,16 @@ def test_make_llm_for_observers_follows_each_observers_model(
         return {"name": name, "identity": "i", "conditions": [{"id": "c", "when": "w"}], **fields}
 
     monkeypatch.delenv(API_KEY_ENV, raising=False)
-    # No LLM observer: the default observer model (the agent's) decides the provider.
+    # No LLM observer: the default observer model decides the provider (Anthropic by
+    # default, whatever the agent runs on; a local one when models.observer says so).
     local = scenario.model_copy(update={"models": Models(agent="ollama:command-r7b")})
     assert runner.llm_observers(local) == [] and runner.observer_providers(local) == []
-    assert isinstance(runner.make_llm_for(local, "observer"), OllamaLLM)
+    with pytest.raises(RuntimeError, match="needed for the observer"):
+        runner.make_llm_for(local, "observer")
+    local_observer = scenario.model_copy(
+        update={"models": Models(agent="ollama:command-r7b", observer="ollama:command-r7b")}
+    )
+    assert isinstance(runner.make_llm_for(local_observer, "observer"), OllamaLLM)
     # models.observer overrides the agent's; a per-observer model overrides that.
     hosted = local.model_copy(
         update={"models": Models(agent="ollama:command-r7b", observer="claude-sonnet-5-5")}

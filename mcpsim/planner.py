@@ -45,7 +45,7 @@ from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from mcpsim.llm import LLM, OLLAMA, LLMResponse, parse_model_spec
+from mcpsim.llm import LLM, OLLAMA, LLMResponse, parse_model_spec, sampling
 from mcpsim.mcpclient import Catalog, Session, ToolInfo
 from mcpsim.plan import (
     CHECKPOINT_PATTERN,
@@ -67,9 +67,11 @@ from mcpsim.scoping import (
     scenario_terms,
     write_intent,
 )
+from mcpsim.skill import SkillRef, role_of
 from mcpsim.transcript import InformantReport
 
 if TYPE_CHECKING:
+    from mcpsim.prompt_template import Value
     from mcpsim.scout import Observation, ScoutResult
 
 PLAN_TOOL_NAME = "emit_execution_plan"
@@ -546,24 +548,20 @@ def _dash(description: str) -> str:
     return f" — {flat}" if flat else ""
 
 
-def render_scenario_for_prompt(scenario: Scenario) -> str:
-    lines: list[str] = [f"SCENARIO: {scenario.name}", "", "ROLE:", scenario.role.strip(), ""]
-    lines += ["GOAL:", scenario.goal.strip(), ""]
-    lines.append("INSTRUCTIONS (policies the agent must follow; each is a judge checklist item):")
-    if scenario.instructions:
-        lines += [f"{i + 1}. {item.strip()}" for i, item in enumerate(scenario.instructions)]
-    else:
-        lines.append("(none)")
-    lines.append("")
-    lines.append("EXPECTED OUTCOME:")
-    if scenario.expected_outcome.text:
-        lines.append(f"text: {scenario.expected_outcome.text.strip()}")
-    if scenario.expected_outcome.json is not None:
-        lines.append(
-            "json (matched deterministically against the agent's final_result): "
-            + _compact_json(scenario.expected_outcome.json)
-        )
-    return "\n".join(lines)
+def scenario_values(scenario: Scenario) -> dict[str, Value]:
+    """The scenario as the planner's ``user`` prompt shows it: name, role, goal, the numbered
+    instructions and the expected outcome (the text, and the JSON spec compact)."""
+    outcome = scenario.expected_outcome
+    return {
+        "name": scenario.name,
+        "role": scenario.role.strip(),
+        "goal": scenario.goal.strip(),
+        "instructions": "\n".join(
+            f"{i + 1}. {item.strip()}" for i, item in enumerate(scenario.instructions)
+        ),
+        "outcome_text": outcome.text.strip() if outcome.text else "",
+        "outcome_json": _compact_json(outcome.json) if outcome.json is not None else "",
+    }
 
 
 def example_literal(schema: dict[str, Any], root: dict[str, Any]) -> Any:
@@ -631,84 +629,32 @@ def example_step(catalog: Catalog, tools: list[ToolInfo] | None = None) -> Step:
     )
 
 
-def build_system_prompt(
+def system_values(
     catalog: Catalog, view: PlannerView | None = None, *, on_request_shown: int | None = None
+) -> dict[str, Value]:
+    """The planner's ``system`` prompt values: the path kinds, the reference syntax, a real
+    example step from this catalog and the catalog digest (:func:`render_catalog_for_prompt`)."""
+    return {
+        "path_kinds": ", ".join(PATH_KINDS),
+        "reference_example": _compact_json({REFERENCE_KEY: 1, "path": "items[*].id"}),
+        "reference_key": REFERENCE_KEY,
+        "discover_tool": DISCOVER_TOOL_NAME,
+        "example_step": _compact_json(example_step(catalog).model_dump(mode="json")),
+        "plan_tool": PLAN_TOOL_NAME,
+        "catalog": render_catalog_for_prompt(catalog, view, on_request_shown=on_request_shown),
+    }
+
+
+def build_system_prompt(
+    catalog: Catalog,
+    view: PlannerView | None = None,
+    *,
+    on_request_shown: int | None = None,
+    skill: SkillRef = None,
 ) -> str:
-    kinds = ", ".join(PATH_KINDS)
-    example = example_step(catalog).model_dump(mode="json")
-    reference = _compact_json({REFERENCE_KEY: 1, "path": "items[*].id"})
-    return "\n".join(
-        [
-            "You are the planner of an LLM-as-a-judge simulation framework for MCP servers.",
-            "Given a scenario (role, goal, instructions, expected outcome) and the live catalog of",
-            "an MCP server, design an execution plan: several DISTINCT paths an agent could take",
-            "through the server to reach the goal, so the simulation can check that an agentic",
-            "process can use the server along every one of them.",
-            "",
-            f"Path kinds (field `kind`), one of: {kinds}.",
-            "- happy: the straightforward route to the goal. ALWAYS include exactly one.",
-            "- recovery: the agent sends bad input the server rejects and must correct itself"
-            " from the server's error or suggestion.",
-            "- alternative: a different tool sequence that reaches the same end.",
-            "- boundary: limits, pagination, empty results, unknown identifiers.",
-            "- policy: a route that tempts the agent to break one of the instructions; the"
-            " checkpoints state what obeying it looks like.",
-            "Include every kind the catalog can support; omit a kind only when the server has",
-            "no tool that could exercise it, and say so in another path's rationale.",
-            "",
-            "Rules (a plan that breaks one is rejected and you are asked to fix it):",
-            "1. `tool` is a tool name from the TOOLS list below, spelled exactly, or null for a",
-            "   step that calls no tool (e.g. composing the final answer). Never invent tools,",
-            "   resources or arguments that are not in the catalog.",
-            "2. Every key in `arguments_sketch` is an argument of that tool as listed in its",
-            "   digest line, and every literal value has the listed JSON type (string, integer,",
-            "   number, boolean, array, object). Never write prose or '<placeholder>' text where",
-            "   an integer, boolean or array is required; a tool listed with `()` takes no",
-            "   arguments at all.",
-            "3. A value that only an earlier step's result can supply (an id, a slug the server",
-            "   returned) is written as a reference, not guessed:",
-            f"   {reference}  — `{REFERENCE_KEY}` is the 1-based index of an EARLIER step in the",
-            "   same path that calls a tool; `path` is a dotted path into that step's result,",
-            "   `[*]` meaning every element. The executor resolves it at run time.",
-            "4. A `recovery` path must contain the failure: at least one step with",
-            "   `expect_error: true` whose `success_looks_like` names the server's rejection",
-            "   (error text, suggestions), followed by the corrected call.",
-            "5. Every checkpoint has the shape `<where>: <observable condition>` with `<where>`",
-            "   one of final_result, tool_result[<tool_name>] or transcript, e.g.",
-            "   'final_result: origin_status equals the value tool_result[plan_recipe] carried'",
-            "   or 'transcript: no call to a tool whose description says it costs credits'.",
-            "   Never vague ('the agent did well').",
-            "6. The `→ returns` part of a digest line lists what a tool already gives back; do",
-            "   not add a call to learn something an earlier step's result already contains.",
-            "   Prefer cheap tools; one whose description says it is slow or costs credits is",
-            "   used only when the goal needs it, and the rationale says so.",
-            "7. You are the orchestrator of a team of informants. Plan from the INFORMANT",
-            "   REPORTS and the OBSERVATIONS below and from the disclosed tools. Use observed",
-            "   ids, slugs and values in `arguments_sketch` instead of placeholders, and cite",
-            "   the observation in `success_looks_like` when one exists.",
-            "8. A report that is FALSE makes honest handling the happy path: when the thing the",
-            "   goal names does not exist, the plan says so and stops; when fabrication is a",
-            "   risk, the plan verifies before answering. A report that is UNKNOWN makes the",
-            "   observation that would settle it the first step.",
-            f"9. A tool listed as available on request is used only after a `{DISCOVER_TOOL_NAME}`",
-            "   step (its `query` says what the agent needs) or after a step whose result an",
-            "   observer effect reacts to by enabling it; name it directly otherwise and the plan",
-            "   is rejected.",
-            "Also: `id` is a short slug (letters, digits, '.', '_', '-'), unique per path;",
-            "`rationale` says why this path matters for this scenario; `success_looks_like`",
-            "describes the result a good call returns; a checkpoint may also read",
-            "'report: <observer>.<condition> is true|false'.",
-            "",
-            "Example of ONE well-formed step (a real tool from this catalog; the values are",
-            "illustrative, choose ones that fit the scenario):",
-            _compact_json(example),
-            "",
-            f"Respond ONLY by calling the `{PLAN_TOOL_NAME}` tool.",
-            "",
-            "CATALOG:",
-            render_catalog_for_prompt(catalog, view, on_request_shown=on_request_shown),
-        ]
-    )
+    """The hosted planner's system prompt (``roles/planner.md``, prompt ``system``)."""
+    values = system_values(catalog, view, on_request_shown=on_request_shown)
+    return role_of(skill, "planner").render("system", values)
 
 
 def render_observation_line(
@@ -722,44 +668,40 @@ def render_observation_line(
     return f"- {observation.call_label()} → {status}: {summary or '(empty)'}"
 
 
-def render_informants_for_prompt(
-    view: PlannerView,
+def informant_values(
+    view: PlannerView | None,
     *,
     observations_shown: int | None = None,
     line_limit: int = OBSERVATION_LINE_LIMIT,
-) -> str:
-    """The INFORMANT REPORTS, GOALS ENABLED BY OBSERVATION and OBSERVATIONS sections.
+) -> dict[str, Value]:
+    """The scout's informant reports, the goals observers enabled and the observations, as the
+    planner's ``user`` prompt shows them (all empty without a scout).
 
     ``observations_shown`` keeps only the LAST that many observations (the prompt budget trims
-    the oldest first) and says how many were left out.
+    the oldest first); ``observations_left_out`` says how many were dropped.
     """
-    lines: list[str] = ["INFORMANT REPORTS (observers watched the scout's calls; plan from these):"]
-    if view.reports:
-        lines += [f"- {r.line()}" for r in view.reports]
-    else:
-        lines.append("(none)")
-    lines.append("")
-    lines.append("GOALS ENABLED BY OBSERVATION (the agent will be told these too):")
-    if view.goals:
-        lines += [f"- {g.strip()}" for g in view.goals]
-    else:
-        lines.append("(none)")
-    lines.append("")
+    if view is None:
+        return {
+            "has_scout": False,
+            "reports": "",
+            "goals": "",
+            "observations": "",
+            "observations_left_out": "",
+        }
     observations = list(view.observations)
     trimmed = 0
     if observations_shown is not None and observations_shown < len(observations):
         trimmed = len(observations) - observations_shown
         observations = observations[len(observations) - observations_shown :]
-    lines.append(
-        "OBSERVATIONS (read-only calls already made against the live server; use these values):"
-    )
-    if trimmed:
-        lines.append(f"({trimmed} earlier observation(s) left out to fit the prompt budget)")
-    if observations:
-        lines += [render_observation_line(o, limit=line_limit) for o in observations]
-    elif not trimmed:
-        lines.append("(none)")
-    return "\n".join(lines)
+    return {
+        "has_scout": True,
+        "reports": "\n".join(f"- {r.line()}" for r in view.reports),
+        "goals": "\n".join(f"- {g.strip()}" for g in view.goals),
+        "observations": "\n".join(
+            render_observation_line(o, limit=line_limit) for o in observations
+        ),
+        "observations_left_out": str(trimmed) if trimmed else "",
+    }
 
 
 def build_user_prompt(
@@ -767,12 +709,14 @@ def build_user_prompt(
     view: PlannerView | None = None,
     *,
     observations_shown: int | None = None,
+    skill: SkillRef = None,
 ) -> str:
-    sections = [render_scenario_for_prompt(scenario)]
-    if view is not None:
-        sections.append(render_informants_for_prompt(view, observations_shown=observations_shown))
-    sections.append("Produce the execution plan for this scenario now.")
-    return "\n\n".join(sections)
+    """The hosted planner's user message (``roles/planner.md``, prompt ``user``)."""
+    values = {
+        **scenario_values(scenario),
+        **informant_values(view, observations_shown=observations_shown),
+    }
+    return role_of(skill, "planner").render("user", values)
 
 
 def planner_prompt_budget(default: int = DEFAULT_PROMPT_BUDGET) -> int:
@@ -795,6 +739,7 @@ def build_prompts(
     view: PlannerView | None = None,
     *,
     budget: int | None = None,
+    skill: SkillRef = None,
 ) -> tuple[str, str]:
     """``(system, user)`` for the hosted planner, trimmed to ``budget`` characters in total.
 
@@ -804,17 +749,20 @@ def build_prompts(
     if budget is None:
         budget = planner_prompt_budget()
     if view is None:
-        return build_system_prompt(catalog), build_user_prompt(scenario)
+        return (
+            build_system_prompt(catalog, skill=skill),
+            build_user_prompt(scenario, skill=skill),
+        )
     shown = len(view.observations)
-    system = build_system_prompt(catalog, view)
-    user = build_user_prompt(scenario, view, observations_shown=shown)
+    system = build_system_prompt(catalog, view, skill=skill)
+    user = build_user_prompt(scenario, view, observations_shown=shown, skill=skill)
     while len(system) + len(user) > budget and shown > 0:
         shown -= 1
-        user = build_user_prompt(scenario, view, observations_shown=shown)
+        user = build_user_prompt(scenario, view, observations_shown=shown, skill=skill)
     on_request = len(view.on_request)
     while len(system) + len(user) > budget and on_request > 0:
         on_request = 0 if on_request <= 3 else on_request // 2
-        system = build_system_prompt(catalog, view, on_request_shown=on_request)
+        system = build_system_prompt(catalog, view, on_request_shown=on_request, skill=skill)
     return system, user
 
 
@@ -1036,26 +984,28 @@ def extract_draft(
     return draft, validate_draft(draft, catalog, view, scenario)
 
 
-def _reask_text(problems: list[str]) -> str:
-    bullet = "\n".join(f"- {p}" for p in problems)
-    return (
-        "The plan you emitted is invalid and was rejected:\n"
-        f"{bullet}\n\n"
-        "Fix every problem and emit the whole corrected plan again by calling "
-        f"`{PLAN_TOOL_NAME}`. Use only tools and argument names that appear in the CATALOG, "
-        "typed as listed; mark the deliberate failure in a recovery path with expect_error "
-        "true; shape every checkpoint as '<where>: <condition>'."
+def _reask_text(
+    problems: list[str], *, skill: SkillRef = None
+) -> str:
+    """The re-ask after a rejected plan (``roles/planner.md``, prompt ``reask``)."""
+    return role_of(skill, "planner").render(
+        "reask", problems="\n".join(f"- {p}" for p in problems), plan_tool=PLAN_TOOL_NAME
     )
 
 
-def reask_content(response: LLMResponse, problems: list[str]) -> str | list[dict[str, Any]]:
+def reask_content(
+    response: LLMResponse,
+    problems: list[str],
+    *,
+    skill: SkillRef = None,
+) -> str | list[dict[str, Any]]:
     """The user turn that follows a rejected plan.
 
     The Messages API requires every assistant ``tool_use`` to be answered by a ``tool_result``
     with the same id in the very next user message, so the validation error travels as an
     error tool result. When the model never called the tool, plain text is the only option.
     """
-    text = _reask_text(problems)
+    text = _reask_text(problems, skill=skill)
     blocks = [b for b in response.tool_uses() if b.get("name") == PLAN_TOOL_NAME]
     tool_use_id = blocks[0].get("id") if blocks else None
     if not isinstance(tool_use_id, str) or not tool_use_id:
@@ -1077,6 +1027,7 @@ async def plan_with_llm(
     *,
     prompt_budget: int | None = None,
     probe_session: Session | None = None,
+    skill: SkillRef = None,
 ) -> ExecutionPlan:
     """One structured-output call, plus a single re-ask when validation fails.
 
@@ -1090,10 +1041,17 @@ async def plan_with_llm(
         from mcpsim.execution_planner import plan_execution  # it imports this module
 
         return await plan_execution(
-            scenario, catalog, llm, scout, session=probe_session, prompt_budget=prompt_budget
+            scenario,
+            catalog,
+            llm,
+            scout,
+            session=probe_session,
+            prompt_budget=prompt_budget,
+            skill=skill,
         )
+    role = role_of(skill, "planner")
     view = planner_view(scenario, catalog, scout) if scout is not None else None
-    system, user = build_prompts(scenario, catalog, view, budget=prompt_budget)
+    system, user = build_prompts(scenario, catalog, view, budget=prompt_budget, skill=skill)
     if scout is not None:
         scout.planner_prompt_chars = len(system) + len(user)
     messages: list[dict[str, Any]] = [{"role": "user", "content": user}]
@@ -1108,7 +1066,8 @@ async def plan_with_llm(
             messages=list(messages),  # a snapshot: the re-ask below extends our own list
             tools=tools,
             tool_choice=tool_choice,
-            max_tokens=PLAN_MAX_TOKENS,
+            max_tokens=role.tokens(PLAN_MAX_TOKENS),
+            **sampling(role.temperature),
         )
         draft, problems = extract_draft(response, catalog, view, scenario)
         if draft is not None and not problems:
@@ -1121,7 +1080,9 @@ async def plan_with_llm(
             # Keep the rejected turn in context so the model can correct it rather than start
             # over blind. The assistant turn must carry the tool_use block exactly as returned.
             messages.append({"role": "assistant", "content": list(response.content)})
-            messages.append({"role": "user", "content": reask_content(response, problems)})
+            messages.append(
+                {"role": "user", "content": reask_content(response, problems, skill=skill)}
+            )
     raise PlanError(
         f"planner for scenario {scenario.name!r} produced an invalid plan "
         f"{MAX_PLAN_ATTEMPTS} times; last errors:\n" + "\n".join(f"- {p}" for p in problems)
@@ -1274,6 +1235,7 @@ def dry_run_plan(
     scout: ScoutResult | None = None,
     *,
     prompt_budget: int | None = None,
+    skill: SkillRef = None,
 ) -> ExecutionPlan:
     """A one-path happy plan over the goal-relevant tools: no LLM (DESIGN §6 ``MCPSIM_DRY_RUN``).
 
@@ -1436,7 +1398,11 @@ def dry_run_plan(
         raise PlanError("dry-run plan failed its own validation:\n" + "\n".join(problems))
     if scout is not None:
         system, user = build_prompts(
-            scenario, catalog, planner_view(scenario, catalog, scout), budget=prompt_budget
+            scenario,
+            catalog,
+            planner_view(scenario, catalog, scout),
+            budget=prompt_budget,
+            skill=skill,
         )
         scout.planner_prompt_chars = len(system) + len(user)
     return ExecutionPlan(scenario=scenario.name, catalog_digest=catalog.digest(), paths=[path])
@@ -1451,6 +1417,7 @@ async def plan(
     dry_run: bool = False,
     prompt_budget: int | None = None,
     probe_session: Session | None = None,
+    skill: SkillRef = None,
 ) -> ExecutionPlan:
     """Plan the scenario against the catalog.
 
@@ -1461,11 +1428,19 @@ async def plan(
     ``MCPSIM_PLANNER_PROMPT_BUDGET``. ``probe_session`` is the scout's still-open MCP session: the
     local profile probes one mutated read-only call on it (counted in ``scout.tool_calls`` and
     recorded in ``scout.observations``); the hosted profile and the dry run never touch it.
+    ``skill`` supplies the prompts and the role settings (:mod:`mcpsim.skill`; default: the
+    ``MCPSIM_SKILL`` or packaged skill).
     """
     if dry_run:
-        return dry_run_plan(scenario, catalog, scout, prompt_budget=prompt_budget)
+        return dry_run_plan(scenario, catalog, scout, prompt_budget=prompt_budget, skill=skill)
     if llm is None:
         raise PlanError("an LLM is required unless dry_run=True")
     return await plan_with_llm(
-        scenario, catalog, llm, scout, prompt_budget=prompt_budget, probe_session=probe_session
+        scenario,
+        catalog,
+        llm,
+        scout,
+        prompt_budget=prompt_budget,
+        probe_session=probe_session,
+        skill=skill,
     )

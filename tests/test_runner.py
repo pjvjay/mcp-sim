@@ -18,10 +18,10 @@ import pytest
 import yaml
 
 from mcpsim import runner
-from mcpsim.judge import DRY_RUN_JUDGE_MODEL, VERDICT_TOOL
-from mcpsim.llm import AnthropicLLM
+from mcpsim.judge import DRY_RUN_JUDGE_MODEL, HONESTY_ITEM, VERDICT_TOOL
+from mcpsim.llm import AnthropicLLM, Usage
 from mcpsim.mcpclient import MCPClientError, Session
-from mcpsim.plan import ExecutionPlan, Path, Step
+from mcpsim.plan import MODES, ExecutionPlan, Path, Step
 from mcpsim.planner import DRY_RUN_PATH_ID
 from mcpsim.report import Report, SuiteReport
 from mcpsim.scenario import Scenario, ServerSpec, parse_scenario
@@ -39,6 +39,10 @@ from mcpsim.transcript import (
 )
 from mcpsim.verdict import Verdict
 from tests.fake_llm import ScriptedLLM, structured_response
+
+# The runner's mechanics are tested over both modes. The shipped skills/simulate/config.yaml
+# runs only `free`, so the tests that count guided and free runs ask for both explicitly.
+BOTH_MODES = list(MODES)
 
 PENNE: dict[str, Any] = {
     "slug": "penne",
@@ -74,7 +78,7 @@ def _stems(run_dir: FsPath, folder: str, suffix: str) -> list[str]:
 
 
 def test_dry_run_writes_every_artefact(quick_path: FsPath, out_dir: FsPath) -> None:
-    run_dir = runner.run_scenario(quick_path, out_dir, dry_run=True)
+    run_dir = runner.run_scenario(quick_path, out_dir, dry_run=True, modes=BOTH_MODES)
 
     assert run_dir.parent == out_dir / "fake-lookup"
     assert (run_dir / "scenario.json").is_file()
@@ -125,8 +129,21 @@ def test_dry_run_writes_every_artefact(quick_path: FsPath, out_dir: FsPath) -> N
         (DRY_RUN_PATH_ID, "free"),
         (DRY_RUN_PATH_ID, "guided"),
     ]
+    # pass^1 holds: the one repeat of each path and mode passed. Nothing graded the goal.
+    assert report.pass_k.model_dump() == {"k": 1, "all_passed": True}
+    assert report.duration_s > 0 and report.wall_clock_s > 0
+    assert report.duration_s == pytest.approx(
+        sum(
+            Transcript.read_jsonl(run_dir / "transcripts" / f"{stem}.jsonl").duration_s
+            for stem in stems
+        ),
+        abs=0.01,
+    )
+    assert (report.judge_cost_usd, report.goal_achieved.graded, report.behavior) == (0.0, 0, [])
+    assert verdict.goal_achieved is None and verdict.sop_followed is None
     md = (run_dir / "report.md").read_text(encoding="utf-8")
     assert md.startswith("# mcp-sim report: fake-lookup\n")
+    assert "pass^1 yes" in md and "- pass^1: **yes**" in md
     assert f"| {DRY_RUN_PATH_ID} | guided | 1 | 1 |" in md
     assert "deterministic:" not in md
 
@@ -158,7 +175,7 @@ def test_dry_run_builds_no_llm(
 
 
 def test_judge_run_dir_rebuilds_verdicts_and_report(quick_path: FsPath, out_dir: FsPath) -> None:
-    run_dir = runner.run_scenario(quick_path, out_dir, dry_run=True)
+    run_dir = runner.run_scenario(quick_path, out_dir, dry_run=True, modes=BOTH_MODES)
     originals = {p.name: p.read_text(encoding="utf-8") for p in (run_dir / "verdicts").iterdir()}
     for p in (run_dir / "verdicts").iterdir():
         p.unlink()
@@ -202,6 +219,50 @@ def test_report_run_dir_lists_unjudged_transcripts(quick_path: FsPath, out_dir: 
     assert report.unjudged == [f"{DRY_RUN_PATH_ID}-guided-0"]
 
 
+def _stop_early(run_dir: FsPath) -> None:
+    """Make a finished repeat-3 run directory look like one that was cancelled (or whose judge
+    failed) part-way: only index 0 of each cell ran, the free run was never judged, and the
+    runner never got to write the report."""
+    for folder, suffix in (("transcripts", ".jsonl"), ("verdicts", ".json")):
+        for path in (run_dir / folder).glob(f"*{suffix}"):
+            if not path.stem.endswith("-0"):
+                path.unlink()
+    (run_dir / "verdicts" / f"{DRY_RUN_PATH_ID}-free-0.json").unlink()
+    (run_dir / "report.json").unlink()
+    (run_dir / "report.md").unlink()
+
+
+def test_report_and_judge_of_a_run_that_stopped_early_keep_the_recorded_repeat(
+    quick_path: FsPath, out_dir: FsPath, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from mcpsim.cli import main
+
+    run_dir = runner.run_scenario(quick_path, out_dir, dry_run=True, repeat=3, modes=BOTH_MODES)
+    assert json.loads((run_dir / "scenario.json").read_text())["repeat"] == 3, "--repeat recorded"
+    _stop_early(run_dir)
+
+    report = Report.load(runner.report_run_dir(run_dir)[0])
+    assert report.pass_k.model_dump() == {"k": 3, "all_passed": False}, "not pass^1"
+    assert report.unjudged == [f"{DRY_RUN_PATH_ID}-free-0"]
+    assert report.missing == [
+        f"{DRY_RUN_PATH_ID}-free-1",
+        f"{DRY_RUN_PATH_ID}-free-2",
+        f"{DRY_RUN_PATH_ID}-guided-1",
+        f"{DRY_RUN_PATH_ID}-guided-2",
+    ]
+    assert main(["report", str(run_dir)]) == 1, "an unjudged transcript is not a pass"
+    assert "pass^3 no" in capsys.readouterr().out
+
+    # Judged again, every recorded transcript has a verdict and all pass: still pass^3 no, and
+    # still exit 1, because four of the six asked-for runs never happened.
+    runner.judge_run_dir(run_dir)
+    report = Report.load(run_dir / "report.json")
+    assert (report.runs, report.passed, report.unjudged) == (2, 2, [])
+    assert report.pass_k.model_dump() == {"k": 3, "all_passed": False}
+    assert len(report.missing) == 4
+    assert main(["judge", str(run_dir)]) == 1
+
+
 def test_judge_and_report_refuse_a_directory_that_is_not_a_run(tmp_path: FsPath) -> None:
     with pytest.raises(FileNotFoundError, match="scenario.json"):
         runner.judge_run_dir(tmp_path)
@@ -209,19 +270,16 @@ def test_judge_and_report_refuse_a_directory_that_is_not_a_run(tmp_path: FsPath)
         runner.report_run_dir(tmp_path)
 
 
-def _vote(passed: bool, score: float, instruction_count: int) -> Any:
+def _vote(passed: bool, score: float, behavior_count: int) -> Any:
     ok = {"passed": True, "evidence": '[5] "price": 2.49'}
     bad = {"passed": False, "evidence": "no evidence"}
     item = ok if passed else bad
     return structured_response(
         VERDICT_TOOL,
         {
-            "goal": item,
-            "instructions": [item] * instruction_count,
+            "expected_behavior": [item] * behavior_count,
+            "goal_achieved": item,
             "honesty": item,
-            "recovery": ok,
-            "efficiency": ok,
-            "scope": ok,
             "passed": passed,
             "score": score,
             "failure_reasons": [] if passed else ["goal missed"],
@@ -283,7 +341,8 @@ def test_judge_run_dir_uses_the_llm_judge_for_real_transcripts(
     transcript = _real_transcript(scenario)
     transcript.write_jsonl(run_dir / "transcripts" / f"{transcript.stem}.jsonl")
 
-    n = len(scenario.instructions)
+    n = len(scenario.behaviors)
+    assert scenario.behaviors == scenario.instructions, "v1 scenario: behaviours = instructions"
     llm = ScriptedLLM([_vote(True, 0.9, n), _vote(True, 0.8, n), _vote(False, 0.4, n)])
     roles: list[str] = []
 
@@ -301,11 +360,19 @@ def test_judge_run_dir_uses_the_llm_judge_for_real_transcripts(
     assert verdict.votes == 3
     assert verdict.passed is True and verdict.score == pytest.approx(0.7)
     assert [m.passed for m in verdict.matches] == [True, True, True]
-    # goal, n instructions, honesty, recovery, efficiency, scope
-    assert len(verdict.checklist) == 5 + n
+    # one item per expected behaviour (the instructions here), then honesty
+    assert [c.item for c in verdict.checklist] == [*scenario.instructions, HONESTY_ITEM]
+    assert verdict.goal_achieved is True and verdict.sop_followed is None
     assert len(llm.calls) == 3 and all(c["model"] == scenario.models.judge for c in llm.calls)
+    # Three judge calls of 10 input / 5 output tokens each, at the Opus rate.
+    assert verdict.judge_usage == {"claude-opus-5-5": Usage(input_tokens=30, output_tokens=15)}
+    assert verdict.judge_cost_usd == pytest.approx((30 * 4 + 15 * 20) / 1_000_000)
     report = Report.load(run_dir / "report.json")
     assert (report.runs, report.passed, report.judge_models) == (1, 1, [scenario.models.judge])
+    assert report.judge_cost_usd == pytest.approx(verdict.judge_cost_usd)
+    assert report.cost_usd == pytest.approx(report.run_cost_usd + verdict.judge_cost_usd)
+    assert report.pass_k.model_dump() == {"k": 1, "all_passed": True}
+    assert (report.goal_achieved.passed, report.goal_achieved.graded) == (1, 1)
 
 
 def test_judge_run_dir_rejects_zero_votes(quick_path: FsPath, out_dir: FsPath) -> None:
@@ -545,7 +612,9 @@ def test_only_path_repeat_and_mode_narrow_the_runs(quick_path: FsPath, out_dir: 
         f"{DRY_RUN_PATH_ID}-free-0",
         f"{DRY_RUN_PATH_ID}-free-1",
     ]
-    assert Report.load(run_dir / "report.json").runs == 2
+    report = Report.load(run_dir / "report.json")
+    assert report.runs == 2
+    assert report.pass_k.model_dump() == {"k": 2, "all_passed": True}, "k follows --repeat"
 
 
 def test_unknown_only_path_raises_value_error(quick_path: FsPath, out_dir: FsPath) -> None:
@@ -623,7 +692,7 @@ def test_run_suite_returns_the_threshold_exit_code(
 ) -> None:
     folder = _suite_dir(tmp_path, quick_data)
 
-    assert runner.run_suite(folder, out_dir, threshold=1.0, dry_run=True) == 1
+    assert runner.run_suite(folder, out_dir, threshold=1.0, dry_run=True, modes=BOTH_MODES) == 1
     out = capsys.readouterr().out
     assert out.index("fake-a: 2/2 runs passed") < out.index("fake-b: 0/2 runs passed")
     assert "suite: 2/4 runs passed (50.0%)" in out
@@ -643,7 +712,7 @@ def test_run_suite_returns_the_threshold_exit_code(
     ]
 
     # Half the runs pass, so a threshold at or below the pass rate yields exit 0.
-    assert runner.run_suite(folder, out_dir, threshold=0.5, dry_run=True) == 0
+    assert runner.run_suite(folder, out_dir, threshold=0.5, dry_run=True, modes=BOTH_MODES) == 0
     assert len(sorted(out_dir.glob("suite-*"))) == 2
 
 
@@ -782,7 +851,7 @@ def test_a_session_that_fails_to_open_becomes_an_error_run(
             yield session
 
     monkeypatch.setattr(runner, "connect", flaky)
-    run_dir = runner.run_scenario(quick_path, out_dir, dry_run=True)
+    run_dir = runner.run_scenario(quick_path, out_dir, dry_run=True, modes=BOTH_MODES)
 
     stems = _stems(run_dir, "transcripts", ".jsonl")
     assert len(stems) == 2
@@ -797,3 +866,22 @@ def test_a_session_that_fails_to_open_becomes_an_error_run(
     report = Report.load(run_dir / "report.json")
     assert report.outcomes == {"error": 2}
     assert report.worst_failures[0].outcome == "error"
+
+
+def test_a_model_without_a_price_is_warned_about_before_a_live_run(
+    quick_path: FsPath, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Its calls would cost $0 in the report and escape budgets.max_cost_usd: say so."""
+    scenario, resolved, skill = runner.prepare_scenario(
+        quick_path, model_overrides={"agent": "claude-imaginary-9", "user": "ollama:llama3.2:3b"}
+    )
+    runner._log_resolution(scenario, resolved, skill)
+    err = capsys.readouterr().err
+    assert "warning: no price is known for claude-imaginary-9" in err
+    assert "budgets.max_cost_usd does not limit them" in err
+    assert "llama3.2" not in err.split("warning:")[1], "a local model is free by design"
+    runner._log_resolution(scenario, resolved, skill, dry_run=True)
+    assert "warning" not in capsys.readouterr().err, "a dry run calls no model"
+    plain, resolved, skill = runner.prepare_scenario(quick_path)
+    runner._log_resolution(plain, resolved, skill)
+    assert "warning" not in capsys.readouterr().err, "every default model is priced"

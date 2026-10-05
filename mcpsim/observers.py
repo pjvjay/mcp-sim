@@ -38,7 +38,7 @@ from typing import Any, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from mcpsim.llm import LLM, LLMResponse, Usage
+from mcpsim.llm import LLM, LLMResponse, Usage, sampling
 from mcpsim.matcher import match
 from mcpsim.scenario import (
     CHECK_SLICES,
@@ -57,6 +57,7 @@ from mcpsim.scenario import (
     Watch,
     tool_result_slice,
 )
+from mcpsim.skill import SkillRef, role_of
 from mcpsim.transcript import (
     EVIDENCE_LIMIT,
     NO_EVIDENCE,
@@ -84,7 +85,6 @@ __all__ = [
     "DEFAULT_TRIGGERS",
     "DEFAULT_WATCHES",
     "EVIDENCE_LIMIT",
-    "METHOD",
     "NO_EVIDENCE",
     "OBSERVER_MAX_CALLS_ENV",
     "OMITTED",
@@ -110,6 +110,7 @@ __all__ = [
     "observer",
     "observer_max_calls",
     "observer_system_prompt",
+    "observer_user_prompt",
     "report_tool",
     "render_slices",
 ]
@@ -123,11 +124,6 @@ BUDGET_EXHAUSTED = "observer budget exhausted"
 OMITTED = "observer omitted this condition"
 NO_MODEL = "no observer model available"
 NOTHING_TO_WATCH = "(nothing to watch yet)"
-METHOD = (
-    "You are an informant. You report on another AI's work from what you can see; you never "
-    "ask it and never take its own statements as proof of status. For each condition answer "
-    "true, false or unknown and quote the exact text that proves it."
-)
 _WORD = re.compile(r"\S+")
 _FENCE = re.compile(r"```.*?```", re.DOTALL)
 _REGEX_FLAGS = {"i": re.IGNORECASE, "m": re.MULTILINE, "s": re.DOTALL, "x": re.VERBOSE}
@@ -643,20 +639,29 @@ def report_tool() -> dict[str, Any]:
     }
 
 
-def observer_system_prompt(observer: Observer) -> str:
-    """Identity, the method, and the conditions to report on."""
+def observer_system_prompt(observer: Observer, *, skill: SkillRef = None) -> str:
+    """Identity, the method, and the conditions to report on (``roles/observer.md``, prompt
+    ``system``)."""
     conditions = "\n".join(f"- {c.id}: {c.when.strip()}" for c in observer.conditions)
-    return "\n\n".join(
-        [
-            f"## Who you are\n{observer.identity.strip()}",
-            f"## The method\n{METHOD}",
-            "## Conditions to report on (answer every one by its id)\n" + conditions,
-            "You see only the parts of the transcript you are allowed to watch, numbered "
-            "[n]; quote evidence with that number. Answer unknown (null) rather than guess "
-            f"when what you watch does not settle a condition. Respond ONLY by calling the "
-            f"`{REPORT_TOOL}` tool once with one entry per condition.",
-        ]
+    return role_of(skill, "observer").render(
+        "system",
+        identity=observer.identity.strip(),
+        conditions=conditions,
+        report_tool=REPORT_TOOL,
     )
+
+
+def observer_user_prompt(
+    observer: Observer,
+    transcript: Transcript | None,
+    scout: Sequence[ObservationLike] | None = None,
+    *,
+    skill: SkillRef = None,
+) -> str:
+    """Only the slices the observer watches (:func:`render_slices`; ``roles/observer.md``,
+    prompt ``user``)."""
+    watched = render_slices(observer.watches, transcript, scout)
+    return role_of(skill, "observer").render("user", watched=watched)
 
 
 def observer_max_calls(default: int = DEFAULT_OBSERVER_MAX_CALLS) -> int:
@@ -708,6 +713,7 @@ class ObserverRunner:
     llm: LLM | None = None
     include_llm: bool = True
     max_calls: int | None = None
+    skill: SkillRef = None
     calls: int = 0
     usage: dict[str, Usage] = field(default_factory=dict)
     latest: dict[tuple[str, str], InformantReport] = field(default_factory=dict)
@@ -910,16 +916,17 @@ class ObserverRunner:
             return self._unknown(observer, trigger, at_event, BUDGET_EXHAUSTED)
         self.calls += 1
         model = self.scenario.models.model_for_observer(observer)
+        role = role_of(self.skill, "observer")
+        user = observer_user_prompt(observer, transcript, scout, skill=self.skill)
         try:
             response = await self.llm.complete(
                 model=model,
-                system=observer_system_prompt(observer),
-                messages=[
-                    {"role": "user", "content": render_slices(observer.watches, transcript, scout)}
-                ],
+                system=observer_system_prompt(observer, skill=self.skill),
+                messages=[{"role": "user", "content": user}],
                 tools=[report_tool()],
                 tool_choice={"type": "tool", "name": REPORT_TOOL},
-                max_tokens=OBSERVER_MAX_TOKENS,
+                max_tokens=role.tokens(OBSERVER_MAX_TOKENS),
+                **sampling(role.temperature),
             )
         except Exception as exc:  # noqa: BLE001 - an observer must not crash the run
             text = str(exc).strip()

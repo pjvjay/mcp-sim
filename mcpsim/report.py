@@ -1,8 +1,10 @@
 """Report aggregation and rendering (DESIGN §1 "Report", §2 "Runner").
 
 :func:`aggregate` folds the verdicts and transcripts of one run directory into a
-:class:`Report`: pass rate per path × mode, overall pass rate and mean score, cost, and the
-worst failures with pointers to their transcripts. :func:`render_markdown` hand-renders it as
+:class:`Report`: pass rate per path × mode, overall pass rate and mean score, **pass^k** (every
+one of the ``k`` repeats of every path and mode passed), the expected-behaviour checklist
+tallied across runs, cost (runs and judge) and run time, and the worst failures with pointers
+to their transcripts. :func:`render_markdown` hand-renders it as
 ``report.md`` (no template engine, by design). :func:`exit_code` turns a report and a pass-rate
 threshold into a process exit status. :func:`aggregate_suite` and
 :func:`render_suite_markdown` do the same across scenarios for ``mcpsim suite``.
@@ -27,7 +29,7 @@ EXIT_FAIL = 1
 DEFAULT_MAX_FAILURES = 10
 COST_NOTE = (
     "estimate from the rate table; covers the agent, simulated-user and observer calls recorded "
-    "in transcripts, not the planner or judge"
+    "in transcripts and the judge calls recorded in verdicts, not the planner"
 )
 
 
@@ -45,7 +47,8 @@ def verdict_relpath(stem: str) -> str:
 
 
 class CellStats(BaseModel):
-    """Pass statistics for one path × mode cell."""
+    """Pass statistics for one path × mode cell (``cost_usd`` covers its runs and their
+    judging; ``duration_s`` sums its runs' durations)."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -56,7 +59,38 @@ class CellStats(BaseModel):
     pass_rate: float = 0.0
     mean_score: float = 0.0
     cost_usd: float = 0.0
+    duration_s: float = 0.0
     outcomes: dict[str, int] = Field(default_factory=dict)
+
+
+class PassK(BaseModel):
+    """pass^k: ``k`` is the number of repeats per path × mode (the scenario's ``repeat``, or
+    ``--repeat``), ``all_passed`` whether every repeat of every path and mode passed — the
+    strict reliability measure next to the pass rate."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    k: int = Field(default=0, ge=0)
+    all_passed: bool = False
+
+
+class Tally(BaseModel):
+    """How many graded runs met an item."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    passed: int = 0
+    graded: int = 0
+
+
+class BehaviorStats(BaseModel):
+    """One checklist item (an expected behaviour, or honesty) tallied across the judged runs."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    item: str
+    passed: int = 0
+    graded: int = 0
 
 
 class Failure(BaseModel):
@@ -90,14 +124,33 @@ class Report(BaseModel):
     passed: int = 0
     pass_rate: float = 0.0
     mean_score: float = 0.0
+    pass_k: PassK = Field(default_factory=PassK)
+    # Totals: cost_usd = run_cost_usd (transcripts) + judge_cost_usd (verdicts); duration_s
+    # sums every run's duration, wall_clock_s spans the first run's start to the last run's end.
     cost_usd: float = 0.0
+    run_cost_usd: float = 0.0
+    judge_cost_usd: float = 0.0
+    duration_s: float = 0.0
+    wall_clock_s: float = 0.0
     cost_note: str = COST_NOTE
     usage: dict[str, Usage] = Field(default_factory=dict)
     judge_models: list[str] = Field(default_factory=list)
     outcomes: dict[str, int] = Field(default_factory=dict)
+    goal_achieved: Tally = Field(default_factory=Tally)
+    sop_followed: Tally = Field(default_factory=Tally)
+    behavior: list[BehaviorStats] = Field(default_factory=list)
     cells: list[CellStats] = Field(default_factory=list)
     worst_failures: list[Failure] = Field(default_factory=list)
+    # Transcripts without a verdict, and the repeats (``<path>-<mode>-<i>`` with ``i < k``) of
+    # a path × mode that has runs but never recorded this one: either makes the run directory
+    # incomplete, so pass^k does not hold and :func:`exit_code` fails.
     unjudged: list[str] = Field(default_factory=list)
+    missing: list[str] = Field(default_factory=list)
+
+    @property
+    def complete(self) -> bool:
+        """Every recorded run was judged and every asked-for repeat was recorded."""
+        return not self.unjudged and not self.missing
 
     def save(self, path: str | FsPath) -> FsPath:
         fs_path = FsPath(path)
@@ -121,12 +174,25 @@ class ScenarioSummary(BaseModel):
     passed: int = 0
     pass_rate: float = 0.0
     mean_score: float = 0.0
+    pass_k: PassK = Field(default_factory=PassK)
     cost_usd: float = 0.0
+    duration_s: float = 0.0
     worst: str = ""
 
 
+class SuiteError(BaseModel):
+    """A scenario a suite could not run (it did not load, or its run raised)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    scenario: str
+    file: str = ""
+    error: str = ""
+
+
 class SuiteReport(BaseModel):
-    """Aggregation across scenarios (``suite.json``)."""
+    """Aggregation across scenarios (``suite.json``); ``errors`` lists the scenarios that could
+    not run."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -136,8 +202,12 @@ class SuiteReport(BaseModel):
     passed: int = 0
     pass_rate: float = 0.0
     mean_score: float = 0.0
+    # Scenarios whose pass^k held (every repeat of every path and mode passed).
+    pass_k_scenarios: int = 0
     cost_usd: float = 0.0
+    duration_s: float = 0.0
     cost_note: str = COST_NOTE
+    errors: list[SuiteError] = Field(default_factory=list)
 
     def save(self, path: str | FsPath) -> FsPath:
         fs_path = FsPath(path)
@@ -186,6 +256,90 @@ def failure_reasons(verdict: Verdict) -> list[str]:
     return reasons
 
 
+def pass_k(
+    verdicts: Sequence[Verdict],
+    transcripts: Sequence[Transcript] = (),
+    *,
+    repeat: int | None = None,
+) -> PassK:
+    """pass^k over one scenario's runs.
+
+    ``k`` is ``repeat`` (the runs asked for per path × mode: the scenario's ``repeat`` or
+    ``--repeat``) when the caller knows it, else the most runs any path × mode cell has.
+    ``all_passed`` holds only when every cell (from the verdicts and the transcripts) has at
+    least ``k`` runs and every one of them was judged and passed: a run that was recorded but
+    never judged, or a repeat that never ran, is not a pass. Nothing run at all is ``k = 0``,
+    not passed.
+    """
+    if repeat is not None and repeat < 1:
+        raise ValueError(f"repeat must be >= 1, got {repeat}")
+    cells: dict[tuple[str, str], dict[int, Verdict | None]] = {}
+    for t in transcripts:
+        cells.setdefault((t.path_id, t.mode), {}).setdefault(t.index, None)
+    for v in verdicts:
+        cells.setdefault((v.path_id, v.mode), {})[v.index] = v
+    if not cells:
+        return PassK(k=0, all_passed=False)
+    k = repeat if repeat is not None else max(len(runs) for runs in cells.values())
+    all_passed = all(
+        len(runs) >= k and all(v is not None and v.passed for v in runs.values())
+        for runs in cells.values()
+    )
+    return PassK(k=k, all_passed=all_passed)
+
+
+def missing_runs(
+    verdicts: Sequence[Verdict], transcripts: Sequence[Transcript], k: int
+) -> list[str]:
+    """For every path × mode with fewer than ``k`` recorded runs (transcripts or verdicts), the
+    stems ``<path>-<mode>-<i>`` of the repeats that never ran (a cancelled or crashed run),
+    lowest free indices first: as many as the cell is short of ``k``, matching :func:`pass_k`.
+    A path or mode with no run at all is not listed: the run may have been narrowed on purpose
+    (``--only-path``, ``--mode``)."""
+    seen: dict[tuple[str, str], set[int]] = {}
+    for t in transcripts:
+        seen.setdefault((t.path_id, t.mode), set()).add(t.index)
+    for v in verdicts:
+        seen.setdefault((v.path_id, v.mode), set()).add(v.index)
+    missing: list[str] = []
+    for (path_id, mode), indices in sorted(seen.items()):
+        short = k - len(indices)
+        i = 0
+        while short > 0:
+            if i not in indices:
+                missing.append(run_stem(path_id, mode, i))
+                short -= 1
+            i += 1
+    return missing
+
+
+def behavior_stats(verdicts: Sequence[Verdict]) -> list[BehaviorStats]:
+    """Every checklist item across the verdicts, in first-seen order, with how many runs met
+    it out of how many graded it."""
+    stats: dict[str, BehaviorStats] = {}
+    for v in verdicts:
+        for item in v.checklist:
+            row = stats.setdefault(item.item, BehaviorStats(item=item.item))
+            row.graded += 1
+            row.passed += 1 if item.passed else 0
+    return list(stats.values())
+
+
+def _tally(values: Iterable[bool | None]) -> Tally:
+    graded = [v for v in values if v is not None]
+    return Tally(passed=sum(1 for v in graded if v), graded=len(graded))
+
+
+def wall_clock_s(transcripts: Sequence[Transcript]) -> float:
+    """Seconds from the earliest run's first event to the latest run's last event."""
+    spans = [span for t in transcripts if (span := t.span()) is not None]
+    if not spans:
+        return 0.0
+    start = min(a for a, _ in spans)
+    end = max(b for _, b in spans)
+    return round(max(0.0, (end - start).total_seconds()), 3)
+
+
 def aggregate(
     verdicts: Sequence[Verdict],
     transcripts: Sequence[Transcript] = (),
@@ -193,14 +347,18 @@ def aggregate(
     scenario: str | None = None,
     run_dir: str | FsPath | None = None,
     max_failures: int = DEFAULT_MAX_FAILURES,
+    repeat: int | None = None,
 ) -> Report:
     """Fold verdicts (and the transcripts they were judged from) into a :class:`Report`.
 
-    Verdicts define the set of runs; transcripts add cost, token usage and outcomes and are
-    matched to verdicts by ``<path>-<mode>-<i>``. A transcript without a verdict is listed under
-    ``unjudged`` and still counts towards cost (the money was spent). Transcript and verdict
-    paths in ``worst_failures`` are relative to the run directory, or absolute when ``run_dir``
-    is given.
+    Verdicts define the set of runs; transcripts add cost, token usage, duration and outcomes and
+    are matched to verdicts by ``<path>-<mode>-<i>``. A transcript without a verdict is listed
+    under ``unjudged``, still counts towards cost (the money was spent) and keeps pass^k from
+    holding. The judge's cost and usage come from the verdicts. ``repeat`` is the ``k`` of
+    pass^k (see :func:`pass_k`; inferred from the runs when not given); with it, every
+    path × mode that has fewer runs than that lists the absent ones under ``missing``.
+    Transcript and verdict paths in ``worst_failures`` are relative to the run directory, or
+    absolute when ``run_dir`` is given.
     """
     by_stem: dict[str, Transcript] = {t.stem: t for t in transcripts}
     name = scenario or next((t.scenario for t in transcripts if t.scenario), "")
@@ -226,7 +384,10 @@ def aggregate(
                 passed=sum(1 for v in group if v.passed),
                 pass_rate=_rate(sum(1 for v in group if v.passed), len(group)),
                 mean_score=_mean([v.score for v in group]),
-                cost_usd=round(sum(t.cost_usd for t in present), 6),
+                cost_usd=round(
+                    sum(t.cost_usd for t in present) + sum(v.judge_cost_usd for v in group), 6
+                ),
+                duration_s=round(sum(t.duration_s for t in present), 3),
                 outcomes=_count(t.outcome for t in present),
             )
         )
@@ -234,6 +395,9 @@ def aggregate(
     usage: dict[str, Usage] = {}
     for t in transcripts:
         for model, u in t.usage.items():
+            usage[model] = usage.get(model, Usage()) + u
+    for v in ordered:
+        for model, u in v.judge_usage.items():
             usage[model] = usage.get(model, Usage()) + u
 
     judged = {run_stem(v.path_id, v.mode, v.index) for v in ordered}
@@ -263,6 +427,9 @@ def aggregate(
         )
 
     passed = sum(1 for v in ordered if v.passed)
+    reliability = pass_k(ordered, transcripts, repeat=repeat)
+    run_cost = round(sum(t.cost_usd for t in transcripts), 6)
+    judge_cost = round(sum(v.judge_cost_usd for v in ordered), 6)
     return Report(
         scenario=name,
         run_dir=str(base) if base is not None else "",
@@ -270,13 +437,23 @@ def aggregate(
         passed=passed,
         pass_rate=_rate(passed, len(ordered)),
         mean_score=_mean([v.score for v in ordered]),
-        cost_usd=round(sum(t.cost_usd for t in transcripts), 6),
+        pass_k=reliability,
+        cost_usd=round(run_cost + judge_cost, 6),
+        run_cost_usd=run_cost,
+        judge_cost_usd=judge_cost,
+        duration_s=round(sum(t.duration_s for t in transcripts), 3),
+        wall_clock_s=wall_clock_s(transcripts),
         usage=dict(sorted(usage.items())),
         judge_models=sorted({v.judge_model for v in ordered}),
         outcomes=_count(t.outcome for t in transcripts),
+        goal_achieved=_tally(v.goal_achieved for v in ordered),
+        sop_followed=_tally(v.sop_followed for v in ordered),
+        behavior=behavior_stats(ordered),
         cells=cells,
         worst_failures=failures,
         unjudged=sorted(stem for stem in by_stem if stem not in judged),
+        # Only against a known repeat: an inferred k says nothing about what was asked for.
+        missing=missing_runs(ordered, list(transcripts), repeat) if repeat is not None else [],
     )
 
 
@@ -293,7 +470,9 @@ def aggregate_suite(reports: Sequence[Report]) -> SuiteReport:
                 passed=r.passed,
                 pass_rate=r.pass_rate,
                 mean_score=r.mean_score,
+                pass_k=r.pass_k,
                 cost_usd=r.cost_usd,
+                duration_s=r.duration_s,
                 worst=r.worst_failures[0].stem if r.worst_failures else "",
             )
         )
@@ -306,12 +485,16 @@ def aggregate_suite(reports: Sequence[Report]) -> SuiteReport:
         passed=passed,
         pass_rate=_rate(passed, runs),
         mean_score=round(score_sum / runs, 4) if runs else 0.0,
+        pass_k_scenarios=sum(1 for r in reports if r.pass_k.all_passed),
         cost_usd=round(sum(r.cost_usd for r in reports), 6),
+        duration_s=round(sum(r.duration_s for r in reports), 3),
     )
 
 
 def exit_code(report: Report | SuiteReport, threshold: float = 1.0) -> int:
-    """0 when ``passed / runs >= threshold``, else 1. No judged runs is always 1.
+    """0 when ``passed / runs >= threshold``, else 1. No judged runs is always 1, and so is a
+    scenario report that is not :attr:`~Report.complete` (a transcript without a verdict, or a
+    repeat that never ran): the pass rate of a partial run says nothing about the rest.
 
     The comparison is done on the counts (``passed >= threshold * runs``) so a threshold such
     as 0.8 with 4 of 5 passes is exactly on the boundary and passes.
@@ -319,6 +502,8 @@ def exit_code(report: Report | SuiteReport, threshold: float = 1.0) -> int:
     if not 0.0 <= threshold <= 1.0:
         raise ValueError(f"threshold must be between 0 and 1, got {threshold}")
     if report.runs == 0:
+        return EXIT_FAIL
+    if isinstance(report, Report) and not report.complete:
         return EXIT_FAIL
     return EXIT_PASS if report.passed + 1e-9 >= threshold * report.runs else EXIT_FAIL
 
@@ -332,12 +517,54 @@ def _cell(text: object) -> str:
     return str(text).replace("\r", " ").replace("\n", " ").replace("|", "\\|")
 
 
+def pass_k_text(pk: PassK) -> str:
+    """``pass^3 yes`` / ``pass^3 no`` (``pass^k n/a`` with no judged runs)."""
+    if pk.k == 0:
+        return "pass^k n/a"
+    return f"pass^{pk.k} {'yes' if pk.all_passed else 'no'}"
+
+
 def summary_line(report: Report | SuiteReport) -> str:
     if report.runs == 0:
         return "no judged runs"
+    head = f"{report.passed}/{report.runs} runs passed ({_pct(report.pass_rate)})"
+    if isinstance(report, Report):
+        reliability = pass_k_text(report.pass_k)
+    else:
+        reliability = (
+            f"pass^k held in {report.pass_k_scenarios}/{len(report.scenarios)} scenario(s)"
+        )
+    line = (
+        f"{head}, {reliability}, mean score {report.mean_score:.2f}, "
+        f"est. cost ${report.cost_usd:.4f}, run time {report.duration_s:.1f}s"
+    )
+    if isinstance(report, Report) and not report.complete:
+        line += f"; incomplete: {incomplete_text(report)}"
+    return line
+
+
+def incomplete_text(report: Report) -> str:
+    """``1 transcript(s) not judged, 4 repeat(s) never ran``."""
+    parts = []
+    if report.unjudged:
+        parts.append(f"{len(report.unjudged)} transcript(s) not judged")
+    if report.missing:
+        parts.append(f"{len(report.missing)} repeat(s) never ran")
+    return ", ".join(parts)
+
+
+def _pass_k_bullet(report: Report) -> str:
+    pk = report.pass_k
+    if pk.k == 0:
+        return "- pass^k: no judged runs."
+    if pk.all_passed:
+        return (
+            f"- pass^{pk.k}: **yes**: all {pk.k} repeat(s) of every path and mode passed."
+        )
+    held = sum(1 for c in report.cells if c.runs >= pk.k and c.passed == c.runs)
     return (
-        f"{report.passed}/{report.runs} runs passed ({_pct(report.pass_rate)}), "
-        f"mean score {report.mean_score:.2f}, est. cost ${report.cost_usd:.4f}"
+        f"- pass^{pk.k}: **no**: {held} of {len(report.cells)} path × mode cell(s) passed all "
+        f"{pk.k} repeat(s)."
     )
 
 
@@ -351,24 +578,52 @@ def render_markdown(report: Report) -> str:
         lines.append(f"Run directory: `{report.run_dir}`.")
     if report.judge_models:
         lines.append(f"Judge model(s): {', '.join(f'`{m}`' for m in report.judge_models)}.")
+    lines += ["", "## Summary", "", _pass_k_bullet(report)]
+    if report.goal_achieved.graded:
+        g = report.goal_achieved
+        lines.append(f"- Goal achieved: {g.passed}/{g.graded} judged run(s).")
+    if report.sop_followed.graded:
+        o = report.sop_followed
+        lines.append(
+            f"- Standard operating procedure followed: {o.passed}/{o.graded} judged run(s)."
+        )
+    lines.append(
+        f"- Run time: {report.duration_s:.1f}s across {report.runs} run(s) "
+        f"(wall clock {report.wall_clock_s:.1f}s)."
+    )
+    lines.append(
+        f"- Cost: ${report.cost_usd:.4f} (runs ${report.run_cost_usd:.4f}, judge "
+        f"${report.judge_cost_usd:.4f})."
+    )
+    if report.behavior:
+        lines += ["", "## Expected behavior", ""]
+        lines.append("| item | met | graded | rate |")
+        lines.append("| --- | ---: | ---: | ---: |")
+        for b in report.behavior:
+            lines.append(
+                f"| {_cell(b.item)} | {b.passed} | {b.graded} | {_pct(_rate(b.passed, b.graded))} |"
+            )
     lines += ["", "## Pass rate by path and mode", ""]
     if not report.cells:
         lines.append("No judged runs.")
     else:
         lines.append(
-            "| path | mode | runs | passed | pass rate | mean score | outcomes | cost (USD) |"
+            "| path | mode | runs | passed | pass rate | mean score | outcomes | time (s) "
+            "| cost (USD) |"
         )
-        lines.append("| --- | --- | ---: | ---: | ---: | ---: | --- | ---: |")
+        lines.append("| --- | --- | ---: | ---: | ---: | ---: | --- | ---: | ---: |")
         for c in report.cells:
             outcomes = ", ".join(f"{k} {n}" for k, n in c.outcomes.items()) or "-"
             lines.append(
                 f"| {_cell(c.path_id)} | {_cell(c.mode)} | {c.runs} | {c.passed} | "
-                f"{_pct(c.pass_rate)} | {c.mean_score:.2f} | {_cell(outcomes)} | {c.cost_usd:.4f} |"
+                f"{_pct(c.pass_rate)} | {c.mean_score:.2f} | {_cell(outcomes)} | "
+                f"{c.duration_s:.1f} | {c.cost_usd:.4f} |"
             )
         all_outcomes = ", ".join(f"{k} {n}" for k, n in report.outcomes.items()) or "-"
         lines.append(
             f"| **all** | | {report.runs} | {report.passed} | {_pct(report.pass_rate)} | "
-            f"{report.mean_score:.2f} | {_cell(all_outcomes)} | {report.cost_usd:.4f} |"
+            f"{report.mean_score:.2f} | {_cell(all_outcomes)} | {report.duration_s:.1f} | "
+            f"{report.cost_usd:.4f} |"
         )
     lines += ["", "## Worst failures", ""]
     if not report.worst_failures:
@@ -386,6 +641,15 @@ def render_markdown(report: Report) -> str:
         lines += ["", "## Unjudged transcripts", ""]
         for stem in report.unjudged:
             lines.append(f"- `{transcript_relpath(stem)}`")
+    if report.missing:
+        lines += ["", "## Repeats that never ran", ""]
+        lines.append(
+            f"pass^{report.pass_k.k} asks for {report.pass_k.k} run(s) of every path and mode; "
+            "these were never recorded (the run stopped early):"
+        )
+        lines.append("")
+        for stem in report.missing:
+            lines.append(f"- `{stem}`")
     lines += ["", "## Cost and usage", ""]
     lines.append(f"Cost is an {report.cost_note}.")
     if report.usage:
@@ -404,22 +668,30 @@ def render_suite_markdown(suite: SuiteReport) -> str:
         lines.append("No scenarios ran.")
     else:
         lines.append(
-            "| scenario | runs | passed | pass rate | mean score | worst failure | cost (USD) |"
+            "| scenario | runs | passed | pass rate | pass^k | mean score | worst failure "
+            "| time (s) | cost (USD) |"
         )
-        lines.append("| --- | ---: | ---: | ---: | ---: | --- | ---: |")
+        lines.append("| --- | ---: | ---: | ---: | --- | ---: | --- | ---: | ---: |")
         for s in suite.scenarios:
             worst = f"`{_cell(s.worst)}`" if s.worst else "-"
             lines.append(
                 f"| {_cell(s.scenario)} | {s.runs} | {s.passed} | {_pct(s.pass_rate)} | "
-                f"{s.mean_score:.2f} | {worst} | {s.cost_usd:.4f} |"
+                f"{pass_k_text(s.pass_k)} | {s.mean_score:.2f} | {worst} | {s.duration_s:.1f} | "
+                f"{s.cost_usd:.4f} |"
             )
         lines.append(
             f"| **all** | {suite.runs} | {suite.passed} | {_pct(suite.pass_rate)} | "
-            f"{suite.mean_score:.2f} | | {suite.cost_usd:.4f} |"
+            f"{suite.pass_k_scenarios}/{len(suite.scenarios)} | {suite.mean_score:.2f} | | "
+            f"{suite.duration_s:.1f} | {suite.cost_usd:.4f} |"
         )
         lines += ["", "Run directories:", ""]
         for s in suite.scenarios:
             if s.run_dir:
                 lines.append(f"- {_cell(s.scenario)}: `{s.run_dir}`")
+    if suite.errors:
+        lines += ["", "## Scenarios that could not run", ""]
+        for e in suite.errors:
+            text = "; ".join(x.strip() for x in e.error.splitlines() if x.strip()) or "error"
+            lines.append(f"- {_cell(e.scenario)} (`{e.file}`): {_cell(text)}")
     lines += ["", f"Cost is an {suite.cost_note}.", ""]
     return "\n".join(lines)

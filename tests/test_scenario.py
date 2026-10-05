@@ -1,20 +1,32 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Any
 
 import pytest
 import yaml
 
+from mcpsim.llm import is_local_model
+from mcpsim.planner import planner_profile
 from mcpsim.scenario import (
     DEFAULT_AGENT_MODEL,
+    DEFAULT_CATEGORY,
     DEFAULT_JUDGE_MODEL,
     DEFAULT_PLANNER_MODEL,
+    MODEL_ROLES,
+    AgentSpec,
+    Context,
     Scenario,
     ScenarioError,
+    default_title,
+    default_user_instructions,
     load_scenario,
     parse_scenario,
+    read_skill,
+    resolve_skill_path,
+    split_frontmatter,
 )
 
 
@@ -72,6 +84,48 @@ def test_http_server_and_overrides(tmp_path: Path, scenario_data: dict[str, Any]
     assert s.budgets.max_turns == 3 and s.budgets.max_tool_calls == 20
     assert s.models.agent == "claude-haiku-4-5-20251001"
     assert s.models.judge == DEFAULT_JUDGE_MODEL
+
+
+def test_stdio_fields_expand_environment_references(
+    tmp_path: Path, scenario_data: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("MCPSIM_TEST_HOME", "/opt/pantry")
+    monkeypatch.setenv("MCPSIM_TEST_EMPTY", "")
+    monkeypatch.delenv("MCPSIM_TEST_UNSET", raising=False)
+    scenario_data["server"] = {
+        "stdio": {
+            "command": "${MCPSIM_TEST_HOME}/bin/serve",
+            "args": [
+                "--db",
+                "${MCPSIM_TEST_UNSET:-/tmp/x.db}",
+                "--mode=${MCPSIM_TEST_EMPTY:-demo}",
+            ],
+            # Only the braced form is a reference: $HOME, a bare $ and ${} stay as written.
+            "env": {"DB_URL": "sqlite:///${MCPSIM_TEST_HOME}/db.sqlite", "TOKEN": "a$b${}$HOME"},
+            "setup": "${MCPSIM_TEST_HOME}/bin/python -m seed",
+        }
+    }
+    stdio = load_scenario(_write(tmp_path, scenario_data)).server.stdio
+    assert stdio is not None
+    assert stdio.command == "/opt/pantry/bin/serve"
+    assert stdio.args == ["--db", "/tmp/x.db", "--mode=demo"]
+    assert stdio.env == {"DB_URL": "sqlite:////opt/pantry/db.sqlite", "TOKEN": "a$b${}$HOME"}
+    assert stdio.setup == "/opt/pantry/bin/python -m seed"
+
+
+def test_an_unset_variable_without_a_default_fails_the_load_naming_the_field(
+    tmp_path: Path, scenario_data: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("MCPSIM_TEST_UNSET", raising=False)
+    scenario_data["server"] = {
+        "stdio": {"command": "python", "env": {"DB_URL": "sqlite:///${MCPSIM_TEST_UNSET}/x.db"}}
+    }
+    path = _write(tmp_path, scenario_data)
+    with pytest.raises(ScenarioError) as exc_info:
+        load_scenario(path)
+    message = str(exc_info.value)
+    assert "server.stdio" in message
+    assert "env.DB_URL: MCPSIM_TEST_UNSET is not set" in message
 
 
 def test_expected_outcome_text_only_is_fine(scenario_data: dict[str, Any]) -> None:
@@ -190,3 +244,312 @@ def test_tools_policy_validation_errors_name_the_field(
     with pytest.raises(ScenarioError) as exc_info:
         load_scenario(path)
     assert needle in str(exc_info.value)
+
+
+# --- scenario v2 (DESIGN §3 "Scenario v2") ----------------------------------------------------
+
+SKILL_MD = """---
+name: penne-finder
+description: Finds the cheapest penne. Use when someone asks for penne prices.
+---
+
+# Penne finder
+
+1. Call lookup with the slug.
+2. Quote the price and store verbatim.
+"""
+SKILL_BODY = (
+    "# Penne finder\n\n1. Call lookup with the slug.\n2. Quote the price and store verbatim."
+)
+
+
+def _skill(folder: Path, text: str = SKILL_MD) -> Path:
+    folder.mkdir(parents=True, exist_ok=True)
+    path = folder / "SKILL.md"
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+def test_a_v1_file_gets_the_v2_defaults(scenario_path: Path, scenario_data: dict[str, Any]) -> None:
+    s = load_scenario(scenario_path)
+    assert s.category == DEFAULT_CATEGORY == "Uncategorized"
+    assert s.title == s.display_title == "Fake lookup"
+    assert s.user_instructions == s.simulated_user_instructions == (
+        "You are this person: A shopper who wants the price of penne and will not accept "
+        "guesses.\n\nWhat you want from the assistant: Find the price and store of penne."
+    )
+    assert s.user_instructions == default_user_instructions(s.role, s.goal)
+    assert s.expected_behavior == s.behaviors == scenario_data["instructions"]
+    assert s.context == Context() and s.context.is_empty() and s.context.items() == []
+    assert s.context.agent_visible is False
+    assert s.agent == AgentSpec() and s.agent.has_sop is False
+    assert s.models.explicit() == {}
+
+
+def test_v2_fields_are_parsed(scenario_data: dict[str, Any]) -> None:
+    scenario_data.update(
+        category="Product lookup",
+        title="Penne, cheapest first",
+        user_instructions="You are Dev, a bargain hunter. Ask for the cheapest penne.",
+        context={
+            "device": "desktop web",
+            "location": "Vancouver, BC (49.2827, -123.1207)",
+            "language": "en",
+            "details": {"time": "Friday 6 pm", "basket": ["penne"]},
+            "agent_visible": True,
+        },
+        expected_behavior=["  Calls lookup before quoting a price  ", "Quotes the store verbatim"],
+        agent={"notes": "There is no shell here."},
+        models={"agent": "claude-fable-5-1"},
+    )
+    s = parse_scenario(scenario_data)
+    assert (s.category, s.title) == ("Product lookup", "Penne, cheapest first")
+    assert s.user_instructions == "You are Dev, a bargain hunter. Ask for the cheapest penne."
+    assert s.context.items() == [
+        ("device", "desktop web"),
+        ("location", "Vancouver, BC (49.2827, -123.1207)"),
+        ("language", "en"),
+        ("time", "Friday 6 pm"),
+        ("basket", '["penne"]'),
+    ]
+    assert s.context.agent_visible is True
+    assert s.expected_behavior == [
+        "Calls lookup before quoting a price",
+        "Quotes the store verbatim",
+    ]
+    assert s.behaviors != s.instructions, "explicit expected behaviour replaces the default"
+    assert s.agent.notes == "There is no shell here." and s.agent.has_sop is False
+    assert s.models.explicit() == {"agent": "claude-fable-5-1"}
+    assert default_title("week_under-budget.v2") == "Week under budget v2"
+
+
+@pytest.mark.parametrize(
+    ("mutate", "needle"),
+    [
+        (lambda d: d.update(category="  "), "category must not be blank"),
+        (lambda d: d.update(title=""), "title must not be blank"),
+        (lambda d: d.update(user_instructions=" "), "user_instructions must not be blank"),
+        (lambda d: d.update(expected_behavior=["ok", " "]), "expected_behavior[1] is blank"),
+        (lambda d: d.update(context={"device": " "}), "context.device must not be blank"),
+        (lambda d: d.update(context={"timezone": "PST"}), "context.timezone"),
+        (lambda d: d.update(agent={"skill": " "}), "agent.skill must not be blank"),
+        (lambda d: d.update(agent={"notes": ""}), "agent.notes must not be blank"),
+        (lambda d: d.update(agent={"sop": "x"}), "agent.sop"),
+    ],
+)
+def test_v2_validation_errors_name_the_field(
+    tmp_path: Path, scenario_data: dict[str, Any], mutate: Any, needle: str
+) -> None:
+    mutate(scenario_data)
+    with pytest.raises(ScenarioError) as exc_info:
+        load_scenario(_write(tmp_path, scenario_data))
+    assert needle in str(exc_info.value)
+
+
+def test_a_relative_skill_resolves_against_the_scenario_file_not_the_cwd(
+    tmp_path: Path, scenario_data: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    suite = tmp_path / "suite"
+    skill = _skill(suite / "skills" / "penne-finder")
+    scenario_data["agent"] = {"skill": "skills/penne-finder/SKILL.md", "notes": "No shell."}
+    path = _write(suite, scenario_data)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+
+    s = load_scenario(path)
+    assert s.agent.skill == "skills/penne-finder/SKILL.md"
+    assert s.agent.skill_path == str(skill.resolve())
+    assert s.agent.skill_name == "penne-finder"
+    assert s.agent.skill_text == SKILL_BODY, "frontmatter stripped, body verbatim"
+    assert "description:" not in s.agent.skill_text and "---" not in s.agent.skill_text
+    assert s.agent.has_sop and s.agent.notes == "No shell."
+    # A directory means its SKILL.md.
+    scenario_data["agent"] = {"skill": "skills/penne-finder"}
+    assert load_scenario(_write(suite, scenario_data)).agent.skill_text == SKILL_BODY
+    # An absolute path works from anywhere.
+    scenario_data["agent"] = {"skill": str(skill)}
+    assert load_scenario(_write(tmp_path, scenario_data, "abs.yaml")).agent.skill_text == SKILL_BODY
+
+
+def test_an_env_skill_reads_the_path_from_the_variable(
+    tmp_path: Path, scenario_data: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    skill = _skill(tmp_path / "anywhere" / "penne-finder")
+    scenario_data["agent"] = {"skill": "env:PENNE_SKILL"}
+    path = _write(tmp_path, scenario_data)
+
+    monkeypatch.delenv("PENNE_SKILL", raising=False)
+    with pytest.raises(ScenarioError) as exc_info:
+        load_scenario(path)
+    assert "skill 'env:PENNE_SKILL': environment variable PENNE_SKILL is not set" in str(
+        exc_info.value
+    )
+
+    monkeypatch.setenv("PENNE_SKILL", str(skill))
+    s = load_scenario(path)
+    assert (s.agent.skill_name, s.agent.skill_text) == ("penne-finder", SKILL_BODY)
+    assert s.agent.skill_path == str(skill.resolve())
+    # A relative value resolves against the working directory the variable was set in.
+    monkeypatch.chdir(tmp_path / "anywhere")
+    monkeypatch.setenv("PENNE_SKILL", "penne-finder/SKILL.md")
+    assert load_scenario(path).agent.skill_path == str(skill.resolve())
+    assert resolve_skill_path("env:PENNE_SKILL") == skill.resolve()
+    with pytest.raises(ValueError, match="name the environment variable"):
+        resolve_skill_path("env:")
+
+
+def test_a_missing_skill_file_is_a_clear_error(
+    tmp_path: Path, scenario_data: dict[str, Any]
+) -> None:
+    scenario_data["agent"] = {"skill": "skills/nope/SKILL.md"}
+    path = _write(tmp_path, scenario_data)
+    with pytest.raises(ScenarioError) as exc_info:
+        load_scenario(path)
+    message = str(exc_info.value)
+    assert str(path) in message and "agent" in message
+    assert (
+        f"skill 'skills/nope/SKILL.md': no SKILL.md at {tmp_path / 'skills/nope/SKILL.md'}"
+        in message
+    )
+    (tmp_path / "empty").mkdir()
+    scenario_data["agent"] = {"skill": "empty"}
+    with pytest.raises(ScenarioError, match="no SKILL.md at .*empty/SKILL.md"):
+        load_scenario(_write(tmp_path, scenario_data))
+
+
+@pytest.mark.parametrize(
+    ("text", "needle"),
+    [
+        ("---\nname: x\n# never closed\n", "never closed"),
+        ("---\n- a list\n---\nbody\n", "must be a mapping"),
+        ("---\nname: [unclosed\n---\nbody\n", "not valid YAML"),
+        ("---\nname: x\n---\n\n   \n", "no procedure after the frontmatter"),
+    ],
+)
+def test_a_broken_skill_file_is_a_clear_error(
+    tmp_path: Path, scenario_data: dict[str, Any], text: str, needle: str
+) -> None:
+    _skill(tmp_path / "bad", text)
+    scenario_data["agent"] = {"skill": "bad/SKILL.md"}
+    with pytest.raises(ScenarioError, match=needle):
+        load_scenario(_write(tmp_path, scenario_data))
+
+
+def test_frontmatter_is_optional_and_the_name_falls_back_to_the_folder(tmp_path: Path) -> None:
+    assert split_frontmatter("# Just a body\n\nstep 1") == ({}, "# Just a body\n\nstep 1")
+    assert split_frontmatter("﻿---\nname: n\n---\nbody") == ({"name": "n"}, "body")
+    plain = _skill(tmp_path / "recipe-shopper", "# Recipe shopper\n\n1. Fetch the page.\n")
+    assert read_skill(plain) == ("recipe-shopper", "# Recipe shopper\n\n1. Fetch the page.")
+    nameless = _skill(tmp_path / "folder-name", "---\ndescription: d\n---\nbody\n")
+    assert read_skill(nameless) == ("folder-name", "body")
+
+
+def test_the_resolved_sop_travels_with_the_scenario_and_is_never_reread(
+    tmp_path: Path, scenario_data: dict[str, Any]
+) -> None:
+    """scenario.json records the procedure the agent ran on; a re-judge needs no SKILL.md."""
+    skill = _skill(tmp_path / "skills" / "penne-finder")
+    scenario_data["agent"] = {"skill": "skills/penne-finder"}
+    s = load_scenario(_write(tmp_path, scenario_data))
+    saved = s.model_dump_json()
+    skill.unlink()
+    again = Scenario.model_validate_json(saved)
+    assert again.agent == s.agent and again.agent.skill_text == SKILL_BODY
+    assert again.with_observers([]).agent.skill_text == SKILL_BODY
+    # An inline procedure needs no file at all.
+    inline = parse_scenario({**scenario_data, "agent": {"skill_text": "1. Look it up."}})
+    assert (inline.agent.skill_name, inline.agent.has_sop) == ("inline", True)
+
+
+# pantry-api's skills/recipe-shopper/SKILL.md, when this machine has it (the variable the
+# recipe scenarios use); the test is skipped elsewhere.
+RECIPE_SHOPPER = os.environ.get("RECIPE_SHOPPER_SKILL", "")
+
+
+@pytest.mark.skipif(
+    not RECIPE_SHOPPER or not Path(RECIPE_SHOPPER).is_file(),
+    reason="RECIPE_SHOPPER_SKILL does not point at pantry-api's recipe-shopper SKILL.md",
+)
+def test_the_real_recipe_shopper_skill_loads_without_its_frontmatter(
+    tmp_path: Path, scenario_data: dict[str, Any]
+) -> None:
+    scenario_data["agent"] = {"skill": "env:RECIPE_SHOPPER_SKILL"}
+    s = load_scenario(_write(tmp_path, scenario_data))
+    assert s.agent.skill_name == "recipe-shopper"
+    assert s.agent.skill_text is not None
+    assert s.agent.skill_text.startswith("# Recipe shopper")
+    assert not s.agent.skill_text.startswith("---") and "\ndescription:" not in s.agent.skill_text
+
+
+# --- the repository's own scenarios ------------------------------------------------------------
+
+SCENARIOS_DIR = Path(__file__).resolve().parent.parent / "scenarios"
+PANTRY_CATEGORIES = {"Product lookup", "Recipe planning", "Provenance", "Origin submissions"}
+VANCOUVER = "Vancouver, BC (49.2827, -123.1207)"
+
+
+def _repo_scenarios() -> list[Path]:
+    return sorted(p for p in SCENARIOS_DIR.rglob("*") if p.suffix in (".yaml", ".yml", ".json"))
+
+
+def test_no_scenario_in_the_repo_names_a_local_model() -> None:
+    files = _repo_scenarios()
+    assert len(files) >= 6
+    for path in files:
+        assert "ollama" not in path.read_text(encoding="utf-8").lower(), path
+        s = load_scenario(path)
+        for role in MODEL_ROLES:
+            assert not is_local_model(s.models.for_role(role)), (path, role)
+        for obs in s.observers:
+            assert not is_local_model(s.models.model_for_observer(obs)), (path, obs.name)
+        assert planner_profile(s) == "hosted", path
+
+
+def test_the_pantry_scenarios_are_portable_and_set_no_run_settings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    files = sorted((SCENARIOS_DIR / "pantry").glob("*.yaml"))
+    assert len(files) == 6
+    for path in files:
+        text = path.read_text(encoding="utf-8")
+        assert "/Users/" not in text, path.name
+        data = yaml.safe_load(text)
+        for key in ("repeat", "judge_votes", "concurrency"):
+            assert key not in data, (path.name, key)
+    # Unset: the sibling layout and a throwaway database in /tmp.
+    monkeypatch.delenv("PANTRY_API_HOME", raising=False)
+    monkeypatch.delenv("PANTRY_SIM_DB", raising=False)
+    for path in files:
+        stdio = load_scenario(path).server.stdio
+        assert stdio is not None
+        assert stdio.command == "../pantry-platform/pantry-api/.venv/bin/pantry-mcp", path.name
+        assert stdio.setup == (
+            "../pantry-platform/pantry-api/.venv/bin/python -m pantry_planner.db seed"
+        ), path.name
+        assert stdio.env == {"DEMO_MODE": "1", "DB_URL": "sqlite:////tmp/mcpsim-pantry-sim.db"}
+    # Set: every path follows the environment.
+    monkeypatch.setenv("PANTRY_API_HOME", "/srv/pantry-api")
+    monkeypatch.setenv("PANTRY_SIM_DB", "/srv/sim.db")
+    for path in files:
+        stdio = load_scenario(path).server.stdio
+        assert stdio is not None
+        assert stdio.command == "/srv/pantry-api/.venv/bin/pantry-mcp", path.name
+        assert stdio.setup == "/srv/pantry-api/.venv/bin/python -m pantry_planner.db seed"
+        assert stdio.env["DB_URL"] == "sqlite:////srv/sim.db", path.name
+
+
+def test_the_pantry_scenarios_are_v2() -> None:
+    for path in sorted((SCENARIOS_DIR / "pantry").glob("*.yaml")):
+        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+        for key in ("category", "title", "user_instructions", "context", "expected_behavior"):
+            assert key in data, (path.name, key)
+        s = load_scenario(path)
+        assert s.category in PANTRY_CATEGORIES, path.name
+        assert s.simulated_user_instructions.startswith("You are "), path.name
+        assert "Vancouver" in s.simulated_user_instructions, path.name
+        assert (s.context.location, s.context.language) == (VANCOUVER, "en"), path.name
+        assert s.context.device in ("desktop web", "mobile web"), path.name
+        assert len(s.behaviors) >= 4 and s.behaviors != s.instructions, path.name
+        assert s.expected_outcome.json, f"{path.name} keeps its deterministic checks"
+        assert not s.agent.has_sop, "the pantry suite tests the server, not a skill"

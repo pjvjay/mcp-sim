@@ -21,7 +21,7 @@ cheapest-penne/
 │   ├── verdicts/happy-dry-run-guided-0.json
 │   ├── report.json
 │   └── report.md
-├── local-plan/     mcpsim plan scenarios/pantry/cheapest-penne.yaml   (models.planner is ollama:command-r7b)
+├── local-plan/     mcpsim plan scenarios/pantry/cheapest-penne.yaml --models planner=ollama:command-r7b
 │   ├── scout.json                    4 scout calls, then the planner's probe find_product(query="pene")
 │   └── plan.json                     happy, boundary and policy paths; 513 s wall, CPU limited to 24-80 %
 └── local-run/      mcpsim run … --models agent=ollama:command-r7b,user=ollama:llama3.2:3b,judge=ollama:qwen2.5:7b
@@ -138,7 +138,7 @@ transcript and the scenario's `expected_outcome.json`.
 
 ```bash
 MCPSIM_DRY_RUN=1 .venv/bin/mcpsim run scenarios/pantry/cheapest-penne.yaml
-.venv/bin/mcpsim plan scenarios/pantry/cheapest-penne.yaml   # models.planner is ollama:command-r7b in the file
+.venv/bin/mcpsim plan scenarios/pantry/cheapest-penne.yaml --models planner=ollama:command-r7b   # the local profile, chosen explicitly
 .venv/bin/mcpsim run scenarios/pantry/cheapest-penne.yaml \
   --models agent=ollama:command-r7b,user=ollama:llama3.2:3b,judge=ollama:qwen2.5:7b \
   --allow-same-judge --repeat 1 --only-path happy --plan runs/cheapest-penne/<timestamp>/plan.json

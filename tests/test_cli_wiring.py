@@ -23,6 +23,7 @@ from mcpsim.cli import (
     dry_run_requested,
     main,
 )
+from mcpsim.mcpclient import MCPClientError
 from mcpsim.report import Report, aggregate, render_markdown
 from mcpsim.scenario import ScenarioError
 from mcpsim.verdict import Verdict
@@ -91,6 +92,36 @@ def fake_runner(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> FakeRunner:
     monkeypatch.setitem(sys.modules, RUNNER_MODULE, module)
     monkeypatch.delenv(DRY_RUN_ENV, raising=False)
     return runner
+
+
+def test_run_passes_modes_only_when_given_and_refuses_mode_with_modes(
+    fake_runner: FakeRunner, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _write_report(fake_runner.run_dir, passed=1, runs=1)
+    assert main(["run", "s.yaml", "--modes", "guided,free"]) == EXIT_OK
+    assert fake_runner.calls[-1][2]["modes"] == ["guided", "free"]
+    assert "mode" in fake_runner.calls[-1][2] and fake_runner.calls[-1][2]["mode"] is None
+    assert main(["run", "s.yaml"]) == EXIT_OK
+    assert "modes" not in fake_runner.calls[-1][2], "plain run keeps the documented keywords"
+    with pytest.raises(SystemExit) as info:
+        main(["run", "s.yaml", "--mode", "free", "--modes", "guided"])
+    assert info.value.code == EXIT_USAGE
+    assert "not allowed with argument" in capsys.readouterr().err
+
+
+def test_report_exits_1_for_an_incomplete_run_directory_even_at_100_percent(
+    fake_runner: FakeRunner, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """2 of 2 judged runs passed, but pass^3 asked for 3 per cell: the directory is partial."""
+    report = aggregate(
+        [_verdict(0, True)], scenario="s", run_dir=str(fake_runner.run_dir), repeat=3
+    )
+    assert report.missing == ["happy-guided-1", "happy-guided-2"] and not report.complete
+    report.save(fake_runner.run_dir / "report.json")
+    assert main(["report", str(fake_runner.run_dir)]) == EXIT_FAILURE
+    out = capsys.readouterr().out
+    assert "1/1 runs passed (100.0%), pass^3 no" in out
+    assert "incomplete: 2 repeat(s) never ran" in out
 
 
 def test_plan_calls_plan_scenario(
@@ -242,6 +273,18 @@ def test_user_errors_become_one_line_and_exit_1(
     assert main(["run", "s.yaml", "--only-path", "nope"]) == EXIT_FAILURE
     assert capsys.readouterr().err.strip() == "mcpsim run: no path with id 'nope'"
 
+    # A server's refusal inside an MCP session arrives wrapped in the SDK's task groups.
+    refusal = MCPClientError("HTTP 429 Too Many Requests from http://gw/mcp: locked")
+    fake_runner.raise_on_run = ExceptionGroup("tg", [ExceptionGroup("tg", [refusal])])
+    assert main(["run", "s.yaml"]) == EXIT_FAILURE
+    assert capsys.readouterr().err.strip() == (
+        "mcpsim run: HTTP 429 Too Many Requests from http://gw/mcp: locked"
+    )
+    fake_runner.raise_on_run = ExceptionGroup("tg", [ZeroDivisionError("bug")])
+    with pytest.raises(ExceptionGroup):
+        main(["run", "s.yaml"])  # a bug inside a group still shows its traceback
+
+    fake_runner.raise_on_run = KeyError("no path with id 'nope'")
     monkeypatch.setenv("MCPSIM_DEBUG", "1")
     with pytest.raises(KeyError):
         main(["run", "s.yaml", "--only-path", "nope"])

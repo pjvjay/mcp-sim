@@ -10,15 +10,17 @@ from mcpsim.agent import (
     LiveRun,
     SimulatedUser,
     StepReferenceError,
-    agent_prompt_sections,
+    agent_prompt_variables,
     build_agent_system_prompt,
+    build_user_system_prompt,
     extract_final_result,
     readable_sketch,
     resolve_arguments,
     resolve_reference,
     run_path,
-    steps_section,
+    step_lines,
     tool_result_block,
+    user_prompt_variables,
 )
 from mcpsim.judge import scope_violations
 from mcpsim.llm import Usage, estimate_cost_usd
@@ -137,7 +139,8 @@ async def test_two_tool_happy_path_produces_the_exact_event_sequence(scenario: S
     # The simulated user spoke first, in its own call, without tools.
     user_call, first_agent_call, second_agent_call, final_call = llm.calls
     assert user_call["tools"] is None
-    assert "Who you are" in user_call["system"]
+    assert user_call["model"] == scenario.models.user == "claude-haiku-4-5-20251001"
+    assert "## Your instructions\nYou are this person: A shopper" in user_call["system"]
     assert t.events[2].text.startswith("Hi, I need the price")
 
     # The agent saw the catalog's tool schemas and the opening message.
@@ -175,10 +178,14 @@ async def test_two_tool_happy_path_produces_the_exact_event_sequence(scenario: S
     assert t.events[3].tool_uses[0]["name"] == "lookup"
     assert t.events[10].raw == json.dumps(PENNE)
 
-    # Usage is summed per model and costed from the rate table.
-    assert t.usage == {scenario.models.agent: Usage(input_tokens=40, output_tokens=20)}
+    # Usage is summed per model (three Sonnet agent turns, one Haiku user turn) and costed
+    # from the rate table.
+    agent_usage = Usage(input_tokens=30, output_tokens=15)
+    user_usage = Usage(input_tokens=10, output_tokens=5)
+    assert t.usage == {"claude-sonnet-5-5": agent_usage, "claude-haiku-4-5-20251001": user_usage}
     assert t.cost_usd == pytest.approx(
-        estimate_cost_usd(scenario.models.agent, Usage(input_tokens=40, output_tokens=20))
+        estimate_cost_usd("claude-sonnet-5-5", agent_usage)
+        + estimate_cost_usd("claude-haiku-4-5-20251001", user_usage)
     )
     assert t.cost_usd > 0
     assert t.events[11].per_model == t.usage and t.events[11].estimate is True
@@ -400,7 +407,10 @@ async def test_system_event_records_prompts_models_and_mode(scenario: Scenario) 
         "free",
         2,
     )
-    assert system.models == {"agent": scenario.models.agent, "user": scenario.models.agent}
+    assert system.models == {
+        "agent": "claude-sonnet-5-5",
+        "user": "claude-haiku-4-5-20251001",
+    }
     assert system.prompts["agent"] == build_agent_system_prompt(scenario, two_tool_path(), "free")
     assert system.prompts["agent"] == llm.calls[1]["system"]
     assert system.prompts["user"] == llm.calls[0]["system"]
@@ -645,17 +655,34 @@ def test_resolve_reference_handles_scalars_wildcards_and_failures() -> None:
 # prompts
 
 
+STEPS_HEADING = "## Suggested approach"
+CONTRACT_HEADING = "## Answer contract"
+
+
+def section(prompt: str, heading: str) -> str:
+    """The ``heading`` section of a rendered prompt, up to the next section."""
+    start = prompt.index(heading)
+    end = prompt.find("\n\n## ", start)
+    return prompt[start:] if end == -1 else prompt[start:end]
+
+
 def test_guided_and_free_prompts_differ_exactly_by_the_steps_section(scenario: Scenario) -> None:
     path = two_tool_path()
-    guided = agent_prompt_sections(scenario, path, "guided")
-    free = agent_prompt_sections(scenario, path, "free")
-    assert len(guided) == len(free) + 1
-    assert [s for s in guided if s not in free] == [steps_section(path)]
-    assert [s for s in free if s not in guided] == []
-    # Order is preserved: the steps sit before the answer contract.
-    assert guided.index(steps_section(path)) == len(guided) - 2
-    assert build_agent_system_prompt(scenario, path, "guided") == "\n\n".join(guided)
-    assert steps_section(path) not in build_agent_system_prompt(scenario, path, "free")
+    guided = build_agent_system_prompt(scenario, path, "guided")
+    free = build_agent_system_prompt(scenario, path, "free")
+    steps = section(guided, STEPS_HEADING)
+    assert steps.endswith(step_lines(path))
+    assert STEPS_HEADING not in free
+    assert guided.replace(steps + "\n\n", "") == free
+    # The steps sit right before the answer contract.
+    assert guided.index(steps) + len(steps) + 2 == guided.index(CONTRACT_HEADING)
+
+
+def test_a_guided_path_without_steps_says_so(scenario: Scenario) -> None:
+    empty = Path(id="p", kind="happy", title="t", steps=[])
+    assert step_lines(empty) == ""
+    prompt = build_agent_system_prompt(scenario, empty, "guided")
+    assert section(prompt, STEPS_HEADING).endswith("(the plan lists no steps for this path)")
 
 
 def test_prompt_carries_role_goal_instructions_and_contract_fields(scenario: Scenario) -> None:
@@ -667,13 +694,14 @@ def test_prompt_carries_role_goal_instructions_and_contract_fields(scenario: Sce
     assert "`slug`, `price`, `origin_status`" in prompt
 
 
-def test_steps_section_lists_tools_and_sketches() -> None:
-    section = steps_section(two_tool_path())
-    assert section.startswith("## Suggested approach")
-    assert '1. Look up penne (tool: lookup, arguments roughly {"slug": "penne"})' in section
-    assert "success looks like: a price, a store and origin_status" in section
-    assert "2. List the first page of products (tool: list_items" in section
-    assert "EXPECT AN ERROR" not in section
+def test_steps_section_lists_tools_and_sketches(scenario: Scenario) -> None:
+    lines = step_lines(two_tool_path())
+    assert lines.startswith('1. Look up penne (tool: lookup, arguments roughly {"slug": "penne"})')
+    assert "success looks like: a price, a store and origin_status" in lines
+    assert "2. List the first page of products (tool: list_items" in lines
+    assert "EXPECT AN ERROR" not in lines
+    prompt = build_agent_system_prompt(scenario, two_tool_path(), "guided")
+    assert section(prompt, STEPS_HEADING).startswith("## Suggested approach\nThe following steps")
 
 
 def test_steps_section_renders_expect_error_and_references_readably() -> None:
@@ -696,17 +724,16 @@ def test_steps_section_renders_expect_error_and_references_readably() -> None:
             ),
         ],
     )
-    section = steps_section(path)
-    assert "An argument written <from step n: path> means" in section
+    lines = step_lines(path)
     assert (
         '1. Send a misspelt slug (tool: lookup, arguments roughly {"slug": "pene"}) — EXPECT AN '
         "ERROR: the server should reject this call; read its message and correct the next call "
         "from it — success looks like: an error naming the valid slugs"
-    ) in section
+    ) in lines
     assert (
         "2. Echo the store of the corrected lookup (tool: echo, arguments roughly "
         '{"text": "<from step 1: items[*].store>"})'
-    ) in section
+    ) in lines
     assert readable_sketch(path.steps[1]) == '{"text": "<from step 1: items[*].store>"}'
     # A half-written reference is shown as the literal it is, never crashes the prompt.
     broken = Step(intent="x", tool="echo", arguments_sketch={"text": {"$from_step": "one"}})
@@ -1262,9 +1289,10 @@ async def test_tool_result_observer_enables_a_tool_and_a_goal_for_the_next_turn(
     assert note[0]["type"] == "tool_result" and note[1]["text"].startswith("## Additional goal")
     assert goal_line in note[1]["text"]
     assert t.flags == [] and t.hard_failures == []
-    assert t.usage == {scenario.models.agent: Usage(input_tokens=40, output_tokens=20)}, (
-        "code observers cost nothing"
-    )
+    assert t.usage == {
+        scenario.models.agent: Usage(input_tokens=30, output_tokens=15),  # three agent turns
+        scenario.models.user: Usage(input_tokens=10, output_tokens=5),  # the opening
+    }, "code observers cost nothing"
 
 
 async def test_turn_observer_reports_after_every_assistant_turn(
@@ -1400,7 +1428,7 @@ async def test_llm_observer_usage_is_charged_to_the_run(scenario_data: dict[str,
         "identity": "An independent auditor.",
         "watches": ["final_answer"],
         "on": ["end"],
-        "model": "claude-haiku-4-5-20251001",
+        "model": "claude-fable-5-1",
         "conditions": [
             {"id": "ok", "when": "the answer quotes a price", "then": {"flag": "priced"}}
         ],
@@ -1424,8 +1452,9 @@ async def test_llm_observer_usage_is_charged_to_the_run(scenario_data: dict[str,
     assert "## Final answer" in observer_llm.calls[0]["messages"][0]["content"]
     assert "An independent auditor." in observer_llm.calls[0]["system"]
     assert t.usage == {
-        scenario.models.agent: Usage(input_tokens=20, output_tokens=10),
-        "claude-haiku-4-5-20251001": Usage(input_tokens=10, output_tokens=5),
+        "claude-sonnet-5-5": Usage(input_tokens=10, output_tokens=5),  # the agent's turn
+        "claude-haiku-4-5-20251001": Usage(input_tokens=10, output_tokens=5),  # the opening
+        "claude-fable-5-1": Usage(input_tokens=10, output_tokens=5),  # the observer
     }
     assert t.flags == ["priced"] and t.hard_failures == []
     [event] = report_events(t)
@@ -1465,7 +1494,10 @@ async def test_observer_cost_counts_against_the_cost_budget(scenario_data: dict[
             scenario, two_tool_path(), "guided", 0, session, agent_llm, observer_llm=observer_llm
         )
     assert t.outcome == "budget_exceeded" and t.reason.startswith("max_cost_usd=0.001 exceeded")
-    assert t.usage[scenario.models.agent].input_tokens == 100_020, "user + agent + observer"
+    # The observer defaults to claude-sonnet-5-5, the agent's model; the user is Haiku.
+    assert scenario.models.observer == scenario.models.agent == "claude-sonnet-5-5"
+    assert t.usage[scenario.models.agent].input_tokens == 100_010, "agent + observer"
+    assert t.usage[scenario.models.user] == Usage(input_tokens=10, output_tokens=5)
     assert t.kinds()[-3:] == ["informant_report", "usage", "end"]
 
 
@@ -1549,3 +1581,193 @@ async def test_dry_run_final_result_is_the_covering_result_not_the_last(
     assert t.final_result == PENNE
     final = next(e for e in t.events if isinstance(e, FinalResultEvent))
     assert final.raw == json.dumps(PENNE, ensure_ascii=False)
+
+
+# ------------------------------------------------------------------------------------------
+# scenario v2: the agent on its SOP, the simulated user on its instructions and context
+
+V2_SOP = "# Penne finder\n\n1. Call lookup with the slug.\n2. Quote the price and store verbatim."
+V2_USER = (
+    "You are Priya, a student in Vancouver. Ask for the price of penne and where to buy it. "
+    "You do not know any store names."
+)
+V2_BEHAVIOR = ["Calls lookup with slug penne", "Quotes the store exactly as returned"]
+
+
+def v2(scenario_data: dict[str, Any], **overrides: Any) -> Scenario:
+    data = {
+        **scenario_data,
+        "category": "Product lookup",
+        "user_instructions": V2_USER,
+        "context": {
+            "device": "mobile web",
+            "location": "Vancouver, BC (49.2827, -123.1207)",
+            "language": "fr",
+            "details": {"time": "Friday 6 pm"},
+        },
+        "expected_behavior": V2_BEHAVIOR,
+        "agent": {
+            "skill_text": V2_SOP,
+            "skill_name": "penne-finder",
+            "notes": "You cannot run scripts here; use the tools you are offered.",
+        },
+    }
+    data.update(overrides)
+    return parse_scenario(data)
+
+
+def test_agent_prompt_carries_the_sop_and_notes_but_never_the_users_brief_or_the_rubric(
+    scenario_data: dict[str, Any],
+) -> None:
+    s = v2(scenario_data)
+    prompt = build_agent_system_prompt(s, two_tool_path(), "guided")
+    sop = section(prompt, "## Standard operating procedure")
+    lines = sop.splitlines()
+    assert lines[0] == "## Standard operating procedure (skill: penne-finder)"
+    assert "Follow it step by step" in lines[1]
+    assert lines[2] == "<<<BEGIN SOP penne-finder>>>"
+    assert sop.endswith(f"<<<BEGIN SOP penne-finder>>>\n{V2_SOP}\n<<<END SOP penne-finder>>>")
+    notes = (
+        "## Notes on this environment\n"
+        "You cannot run scripts here; use the tools you are offered."
+    )
+    assert section(prompt, "## Notes on this environment") == notes
+    # Order: instructions, SOP, notes, steps, answer contract.
+    order = [
+        prompt.index("## Instructions you must follow"),
+        prompt.index(sop),
+        prompt.index(notes),
+        prompt.index(STEPS_HEADING),
+        prompt.index(CONTRACT_HEADING),
+    ]
+    assert order == sorted(order)
+    # Hidden from the agent: the user's brief, the judge's rubric and the expected outcome prose;
+    # and the context, because agent_visible is false.
+    assert "Priya" not in prompt and V2_USER not in prompt
+    for item in V2_BEHAVIOR:
+        assert item not in prompt
+    assert s.expected_outcome.text is not None and s.expected_outcome.text not in prompt
+    assert "mobile web" not in prompt and "Vancouver" not in prompt and "Friday" not in prompt
+    assert agent_prompt_variables(s, two_tool_path(), "guided")["context"] == ""
+    # The v1 parts are all still there.
+    assert s.role.strip() in prompt and s.goal.strip() in prompt
+    for item in s.instructions:
+        assert f"- {item}" in prompt
+
+
+def test_agent_sees_the_context_only_when_agent_visible(scenario_data: dict[str, Any]) -> None:
+    hidden = v2(scenario_data)
+    shown = v2(scenario_data, context={**hidden.context.model_dump(), "agent_visible": True})
+    expected = (
+        "## What you know about the person's situation\n"
+        "- device: mobile web\n"
+        "- location: Vancouver, BC (49.2827, -123.1207)\n"
+        "- language: fr\n"
+        "- time: Friday 6 pm"
+    )
+    prompt = build_agent_system_prompt(shown, two_tool_path(), "free")
+    assert section(prompt, "## What you know about") == expected
+    # Right after the environment notes.
+    notes = section(prompt, "## Notes on this environment")
+    assert prompt.index(expected) == prompt.index(notes) + len(notes) + 2
+    hidden_prompt = build_agent_system_prompt(hidden, two_tool_path(), "free")
+    assert "## What you know about" not in hidden_prompt
+
+
+def test_a_v1_scenario_keeps_the_v1_agent_prompt(scenario: Scenario) -> None:
+    prompt = build_agent_system_prompt(scenario, two_tool_path(), "free")
+    paragraphs = prompt.split("\n\n")
+    assert len(paragraphs) == 5, "intro, role, goal, instructions, answer contract; no empty ones"
+    assert paragraphs[0].startswith("You are an assistant acting on behalf of a person")
+    assert [p.split("\n", 1)[0] for p in paragraphs[1:]] == [
+        "## Who you are acting for",
+        "## Goal",
+        "## Instructions you must follow",
+        "## Answer contract",
+    ]
+    variables = agent_prompt_variables(scenario, two_tool_path(), "free")
+    assert set(variables) == {
+        "role",
+        "goal",
+        "instructions",
+        "skill_name",
+        "skill_text",
+        "notes",
+        "context",
+        "goals",
+        "guided",
+        "steps",
+        "answer_fields",
+        "final_result_name",
+    }
+    for empty in ("skill_name", "skill_text", "notes", "context", "goals", "steps"):
+        assert variables[empty] == "", empty
+    assert variables["guided"] is False
+    assert variables["answer_fields"] == "`slug`, `price`, `origin_status`"
+
+
+def test_an_agent_without_instructions_is_told_so(scenario: Scenario) -> None:
+    bare = scenario.model_copy(update={"instructions": []})
+    prompt = build_agent_system_prompt(bare, two_tool_path(), "free")
+    assert "## Instructions you must follow\n(none beyond the goal)" in prompt
+
+
+def test_user_prompt_is_driven_by_user_instructions_and_context(
+    scenario_data: dict[str, Any],
+) -> None:
+    s = v2(scenario_data)
+    prompt = build_user_system_prompt(s)
+    assert f"## Your instructions\n{V2_USER}" in prompt
+    assert (
+        "## Your situation\n"
+        "- device: mobile web\n"
+        "- location: Vancouver, BC (49.2827, -123.1207)\n"
+        "- language: fr\n"
+        "- time: Friday 6 pm\n"
+        "Write every message in this language: fr."
+    ) in prompt, "the user always gets its context, whatever agent_visible says"
+    assert "never volunteer facts" in prompt.lower()
+    assert "`final_result` block" in prompt, "the stop rule stays"
+    # Never: the agent's role/goal/instructions, the SOP, the notes, the rubric, the outcome.
+    assert s.role.strip() not in prompt and s.goal.strip() not in prompt
+    for item in [*s.instructions, *V2_BEHAVIOR]:
+        assert item not in prompt
+    assert V2_SOP not in prompt and "penne-finder" not in prompt and "scripts" not in prompt
+    assert s.expected_outcome.text is not None and s.expected_outcome.text not in prompt
+    assert "origin_status" not in prompt
+    assert user_prompt_variables(s) == {
+        "user_instructions": V2_USER,
+        "context": (
+            "- device: mobile web\n"
+            "- location: Vancouver, BC (49.2827, -123.1207)\n"
+            "- language: fr\n"
+            "- time: Friday 6 pm"
+        ),
+        "language": "fr",
+        "final_result_name": "final_result",
+    }
+
+
+def test_a_v1_user_prompt_plays_the_role_and_goal(scenario: Scenario) -> None:
+    prompt = build_user_system_prompt(scenario)
+    assert (
+        "## Your instructions\nYou are this person: " + scenario.role.strip() in prompt
+    ) and scenario.goal.strip() in prompt
+    assert "## Your situation" not in prompt, "no context, no section"
+
+
+async def test_a_v2_run_puts_the_sop_in_the_agents_calls_and_the_brief_in_the_users(
+    scenario_data: dict[str, Any],
+) -> None:
+    s = v2(scenario_data)
+    llm = ScriptedLLM([opening(), text_response(FINAL_TEXT)])
+    t = await run(s, llm, mode="free")
+    assert t.outcome == "completed"
+    user_call, agent_call = llm.calls
+    assert user_call["model"] == "claude-haiku-4-5-20251001"
+    assert V2_USER in user_call["system"] and V2_SOP not in user_call["system"]
+    assert agent_call["model"] == "claude-sonnet-5-5"
+    assert "<<<BEGIN SOP penne-finder>>>\n" + V2_SOP in agent_call["system"]
+    assert V2_USER not in agent_call["system"]
+    system = t.events[0]
+    assert system.prompts == {"agent": agent_call["system"], "user": user_call["system"]}
