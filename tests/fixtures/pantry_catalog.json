@@ -1,0 +1,864 @@
+{
+ "_comment": "Trimmed from `mcpsim catalog --json` against pantry-api's pantry-mcp (2026-10-02): names, descriptions, annotations, input schemas, and output schemas reduced to their top-level keys. Used by the scoping and dry-run tests.",
+ "server_name": "pantry-planner",
+ "tools": [
+  {
+   "name": "list_recipes",
+   "description": "List all seeded recipes (slug, name, servings, ingredient count).\n    Use the slug with get_recipe or plan_recipe. Free \u2014 no LLM calls.",
+   "input_schema": {
+    "type": "object",
+    "properties": {},
+    "required": []
+   },
+   "output_schema": {
+    "type": "object",
+    "properties": {
+     "result": {
+      "type": "array",
+      "items": {
+       "type": "object",
+       "properties": {
+        "ingredient_count": {},
+        "name": {},
+        "servings": {},
+        "slug": {}
+       }
+      }
+     }
+    }
+   },
+   "annotations": {
+    "read_only_hint": true,
+    "open_world_hint": false
+   }
+  },
+  {
+   "name": "get_recipe",
+   "description": "Fetch one seeded recipe with its full ingredient list.\n    Free \u2014 no LLM calls.",
+   "input_schema": {
+    "type": "object",
+    "properties": {
+     "slug": {
+      "type": "string"
+     }
+    },
+    "required": [
+     "slug"
+    ]
+   },
+   "output_schema": {
+    "type": "object",
+    "properties": {
+     "ingredients": {},
+     "name": {},
+     "servings": {},
+     "slug": {}
+    }
+   },
+   "annotations": {
+    "read_only_hint": true,
+    "open_world_hint": false
+   }
+  },
+  {
+   "name": "list_products",
+   "description": "Page through the store catalog, ordered by id. `search` is a\n    case-insensitive substring over name, brand, category and subcategory;\n    `category` is an exact (case-insensitive) category OR subcategory such\n    as \"pantry\", \"dairy\" or \"pasta\" \u2014 a value that is neither is an error\n    naming the vocabulary (pantry://catalog/categories has the full tree),\n    never a silent empty page. `total` counts every match and\n    `next_offset` is null on the last page. For an ingredient lookup the\n    way the planner sees it, prefer find_product. Free \u2014 no LLM calls.",
+   "input_schema": {
+    "type": "object",
+    "properties": {
+     "category": {
+      "anyOf": [
+       {
+        "maxLength": 200,
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null
+     },
+     "limit": {
+      "type": "integer",
+      "default": 50
+     },
+     "offset": {
+      "type": "integer",
+      "default": 0
+     },
+     "search": {
+      "anyOf": [
+       {
+        "maxLength": 200,
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null
+     }
+    },
+    "required": []
+   },
+   "output_schema": {
+    "type": "object",
+    "properties": {
+     "items": {},
+     "next_offset": {},
+     "total": {}
+    }
+   },
+   "annotations": {
+    "read_only_hint": true,
+    "open_world_hint": false
+   }
+  },
+  {
+   "name": "find_product",
+   "description": "Look up catalog products exactly the way the planner does, so a hit\n    here is a planning candidate there. `query` is an ingredient name\n    (\"basmati rice\", \"gluten free penne\"); every significant word must\n    match (lowercase, stemmed, \"fresh\"/\"of\" ignored \u2014 see `tokens`). Items\n    come back cheapest first, each priced at its cheapest store near\n    lat/lon (the default location when omitted). `total` is the hit count\n    before `limit` trims. Free \u2014 no LLM calls.\n\n    Read `match` before `items`: \"direct\" \u2014 every token matched;\n    \"relaxed\" \u2014 nothing matched all tokens, so these are same-aisle\n    alternatives on the last word only, which the planner would OFFER as\n    substitutes but never select; \"none\" \u2014 nothing at all (try\n    list_products(search=...) for substring matching). An empty result is\n    an answer, not an error. `origin_status`/`origin_country` come from\n    ingested evidence; \"unknown\" is the common case.",
+   "input_schema": {
+    "type": "object",
+    "properties": {
+     "lat": {
+      "anyOf": [
+       {
+        "type": "number"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null
+     },
+     "limit": {
+      "type": "integer",
+      "default": 8
+     },
+     "lon": {
+      "anyOf": [
+       {
+        "type": "number"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null
+     },
+     "query": {
+      "type": "string"
+     }
+    },
+    "required": [
+     "query"
+    ]
+   },
+   "output_schema": {
+    "type": "object",
+    "properties": {
+     "items": {},
+     "match": {},
+     "note": {},
+     "query": {},
+     "tokens": {},
+     "total": {}
+    }
+   },
+   "annotations": {
+    "read_only_hint": true,
+    "open_world_hint": false
+   }
+  },
+  {
+   "name": "get_product",
+   "description": "Everything the catalog knows about one product: every store offer\n    (cheapest first, distance from lat/lon or the default location), the\n    resolved origin summary, the evidence rows behind it \u2014 including rows\n    the resolver ignored, such as importer-only addresses \u2014 the number of\n    origin readings still awaiting review, and review stats. Read\n    `origin.status` before `origin.country`: only \"resolved\" is usable.\n    Get ids from find_product. Free \u2014 no LLM calls.",
+   "input_schema": {
+    "type": "object",
+    "properties": {
+     "lat": {
+      "anyOf": [
+       {
+        "type": "number"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null
+     },
+     "lon": {
+      "anyOf": [
+       {
+        "type": "number"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null
+     },
+     "product_id": {
+      "type": "integer"
+     }
+    },
+    "required": [
+     "product_id"
+    ]
+   },
+   "output_schema": {
+    "type": "object",
+    "properties": {
+     "avg_rating": {},
+     "brand": {},
+     "category": {},
+     "description": {},
+     "dietary_tags": {},
+     "evidence": {},
+     "id": {},
+     "list_price": {},
+     "name": {},
+     "offers": {},
+     "origin": {},
+     "pending_submissions": {},
+     "review_count": {},
+     "subcategory": {},
+     "unit_qty": {},
+     "unit_size": {},
+     "unit_uom": {}
+    }
+   },
+   "annotations": {
+    "read_only_hint": true,
+    "open_world_hint": false
+   }
+  },
+  {
+   "name": "plan_recipe",
+   "description": "Run the full shopping-plan pipeline for a seeded recipe: an LLM\n    matches every ingredient to the best-value product, with a model\n    router escalating hard cases. SLOW (10-60s) and costs real Claude\n    API credits. Get slugs from list_recipes first.\n\n    `exclude_origin` drops candidates positively evidenced as coming from\n    those countries (e.g. [\"United States\"]) before the model ever sees\n    them \u2014 never candidates that merely lack evidence. `preference` is soft\n    guidance. Read `summary.origin_status` and `summary.coverage`\n    (`spend_fraction`, `meets_floor`) before describing a basket as clean,\n    because unverified lines are not verified-clean lines; `summary.notes`\n    carries substitutions and the coverage warning. `summary` is the\n    token-lean result; `verbose=True` also attaches `full` (the complete\n    ShoppingPlan with per-line reasoning and every trip option).",
+   "input_schema": {
+    "type": "object",
+    "properties": {
+     "exclude_origin": {
+      "anyOf": [
+       {
+        "items": {
+         "type": "string"
+        },
+        "maxItems": 50,
+        "type": "array"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null
+     },
+     "preference": {
+      "anyOf": [
+       {
+        "items": {
+         "type": "string"
+        },
+        "maxItems": 50,
+        "type": "array"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null
+     },
+     "slug": {
+      "type": "string"
+     },
+     "verbose": {
+      "type": "boolean",
+      "default": false
+     }
+    },
+    "required": [
+     "slug"
+    ]
+   },
+   "output_schema": {
+    "type": "object",
+    "properties": {
+     "full": {},
+     "summary": {}
+    }
+   },
+   "annotations": {
+    "read_only_hint": true,
+    "idempotent_hint": false,
+    "open_world_hint": false
+   }
+  },
+  {
+   "name": "plan_from_text",
+   "description": "Plan a shopping basket from PASTED RECIPE TEXT \u2014 include the full\n    ingredient list (quantities optional) and any shopping notes\n    (budget, dietary exclusions); lat/lon optionally set the shopping\n    location. Parses the text, runs a staged SQL retrieval plan, then\n    the LLM selector. SLOW (10-60s) and costs real Claude API credits.\n    `summary.notes` starts with how the text was interpreted; `trip` is\n    the recommended store split. `verbose=True` attaches `full` with the\n    retrieval `plan_trace` and every trip option.",
+   "input_schema": {
+    "type": "object",
+    "properties": {
+     "exclude_origin": {
+      "anyOf": [
+       {
+        "items": {
+         "type": "string"
+        },
+        "maxItems": 50,
+        "type": "array"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null
+     },
+     "lat": {
+      "anyOf": [
+       {
+        "type": "number"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null
+     },
+     "lon": {
+      "anyOf": [
+       {
+        "type": "number"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null
+     },
+     "preference": {
+      "anyOf": [
+       {
+        "items": {
+         "type": "string"
+        },
+        "maxItems": 50,
+        "type": "array"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null
+     },
+     "recipe_text": {
+      "type": "string"
+     },
+     "verbose": {
+      "type": "boolean",
+      "default": false
+     }
+    },
+    "required": [
+     "recipe_text"
+    ]
+   },
+   "output_schema": {
+    "type": "object",
+    "properties": {
+     "full": {},
+     "summary": {}
+    }
+   },
+   "annotations": {
+    "read_only_hint": true,
+    "idempotent_hint": false,
+    "open_world_hint": false
+   }
+  },
+  {
+   "name": "plan_week",
+   "description": "Plan `days` dinners from the recipe library under an optional\n    budget, rewarding ingredient overlap (a shared product is bought\n    once). `summary` has the per-day lines, the merged shopping list\n    (each product once, with `used_by`), overlap savings, the recommended\n    trip and notes (skipped recipes, substitutions, coverage warnings).\n    exclude_tags filters out recipes containing those dietary tags (e.g.\n    [\"dairy\", \"gluten\"]). `verbose=True` attaches `full` with the retrieval\n    trace and every trip option. SLOW (runs the LLM selector per day) and\n    costs real Claude API credits \u2014 roughly one plan_recipe per day.",
+   "input_schema": {
+    "type": "object",
+    "properties": {
+     "days": {
+      "type": "integer",
+      "default": 5
+     },
+     "exclude_origin": {
+      "anyOf": [
+       {
+        "items": {
+         "type": "string"
+        },
+        "maxItems": 50,
+        "type": "array"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null
+     },
+     "exclude_tags": {
+      "anyOf": [
+       {
+        "items": {
+         "type": "string"
+        },
+        "maxItems": 50,
+        "type": "array"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null
+     },
+     "lat": {
+      "anyOf": [
+       {
+        "type": "number"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null
+     },
+     "lon": {
+      "anyOf": [
+       {
+        "type": "number"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null
+     },
+     "max_distance_km": {
+      "anyOf": [
+       {
+        "type": "number"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null
+     },
+     "max_total_budget": {
+      "anyOf": [
+       {
+        "type": "number"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null
+     },
+     "preference": {
+      "anyOf": [
+       {
+        "items": {
+         "type": "string"
+        },
+        "maxItems": 50,
+        "type": "array"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null
+     },
+     "verbose": {
+      "type": "boolean",
+      "default": false
+     }
+    },
+    "required": []
+   },
+   "output_schema": {
+    "type": "object",
+    "properties": {
+     "full": {},
+     "summary": {}
+    }
+   },
+   "annotations": {
+    "read_only_hint": true,
+    "idempotent_hint": false,
+    "open_world_hint": false
+   }
+  },
+  {
+   "name": "get_product_origins",
+   "description": "Resolved country-of-origin evidence per product - by ids, by a name\n    `search` filter, or the whole catalog - one page at a time, ordered by\n    product id. Free, no LLM calls.\n\n    `by_status` counts EVERY product the ids/search selected, before the\n    `status` filter and before paging, so one call answers \"62 products:\n    2 resolved, 60 unknown\"; then `status=\"resolved\"` pages through just\n    those. Read `status` before using `country`: only \"resolved\" carries\n    usable evidence. \"unknown\" means no source published an origin,\n    \"conflicting\" means sources disagreed and no winner was picked,\n    \"lookup_failed\" means a source did not answer, and \"guess\" is a\n    name-based hint that must not be treated as provenance. Coverage is\n    thin and biased - most Canadian products resolve to \"unknown\" - so\n    absence is never evidence of foreign origin.",
+   "input_schema": {
+    "type": "object",
+    "properties": {
+     "limit": {
+      "type": "integer",
+      "default": 50
+     },
+     "offset": {
+      "type": "integer",
+      "default": 0
+     },
+     "product_ids": {
+      "anyOf": [
+       {
+        "items": {
+         "type": "integer"
+        },
+        "maxItems": 200,
+        "type": "array"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null
+     },
+     "search": {
+      "anyOf": [
+       {
+        "maxLength": 200,
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null
+     },
+     "status": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null
+     }
+    },
+    "required": []
+   },
+   "output_schema": {
+    "type": "object",
+    "properties": {
+     "by_status": {},
+     "items": {},
+     "next_offset": {},
+     "total": {}
+    }
+   },
+   "annotations": {
+    "read_only_hint": true,
+    "open_world_hint": false
+   }
+  },
+  {
+   "name": "rank_products_by_origin",
+   "description": "Rank catalog products by where they come from, against a country\n    preference YOU supply. Free, no LLM calls.\n\n    `preference` is ordered, most-preferred first (e.g. [\"Canada\",\n    \"Mexico\"]). `exclude` filters out products with positive evidence of\n    those origins (e.g. [\"United States\"]) - a product is never excluded\n    merely for lacking evidence.\n\n    Exclusion checks ingredient origin as well as manufacturing origin,\n    because \"Made in Canada\" legally permits imported ingredients: peanut\n    butter made in Canada from American peanuts matches an exclusion of the\n    United States, which is intended.\n\n    Within a preferred country, a full origin claim (\"Product of Canada\",\n    >=98% domestic content) outranks a processing claim (\"Made in Canada\",\n    ingredients may be imported).\n\n    The result keeps `ranked`, `excluded` and `unranked` separate. Report\n    the `unranked` count - those products have no published origin, and\n    showing only the ranked list would imply a coverage this data does not\n    have.",
+   "input_schema": {
+    "type": "object",
+    "properties": {
+     "exclude": {
+      "anyOf": [
+       {
+        "items": {
+         "type": "string"
+        },
+        "maxItems": 50,
+        "type": "array"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null
+     },
+     "preference": {
+      "anyOf": [
+       {
+        "items": {
+         "type": "string"
+        },
+        "maxItems": 50,
+        "type": "array"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null
+     },
+     "search": {
+      "anyOf": [
+       {
+        "maxLength": 200,
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": null
+     }
+    },
+    "required": []
+   },
+   "output_schema": {
+    "type": "object",
+    "properties": {
+     "counts": {},
+     "coverage_note": {},
+     "exclude": {},
+     "excluded": {},
+     "preference": {},
+     "ranked": {},
+     "unranked": {}
+    }
+   },
+   "annotations": {
+    "read_only_hint": true,
+    "open_world_hint": false
+   }
+  },
+  {
+   "name": "origin_triage",
+   "description": "Products whose origin is unresolved and which are worth reading a\n    package label for. Free, no LLM calls.\n\n    These are hints derived from names and categories, NOT origins - they\n    say \"go check this\", never \"this is from X\". Seafood and fresh produce\n    appear often because their origin is not published online at all; only\n    the printed label carries it.",
+   "input_schema": {
+    "type": "object",
+    "properties": {},
+    "required": []
+   },
+   "output_schema": {
+    "type": "object",
+    "properties": {
+     "result": {
+      "type": "array",
+      "items": {
+       "type": "object",
+       "properties": {
+        "product_id": {},
+        "product_name": {},
+        "reason": {},
+        "status": {}
+       }
+      }
+     }
+    }
+   },
+   "annotations": {
+    "read_only_hint": true,
+    "open_world_hint": false
+   }
+  },
+  {
+   "name": "submit_origin_evidence",
+   "description": "Submit a country-of-origin reading from a package label for review.\n    Call find_product first to get the `product_id`. Free \u2014 no LLM calls.\n\n    `verbatim` is the EXACT printed wording, character for character \u2014\n    never a paraphrase, never a translation. A reviewer checks it against\n    the claim, so \"Product of U.S.A.\" must not become \"Made in USA\".\n\n    `claim_type` says what the wording legally asserts:\n      product-of / grown-in / farmed-in / harvested-in / caught-in \u2014 a FULL\n        claim: all or virtually all (>=98%) of the content is from that\n        country. Fills ingredient_origin and manufactured_in.\n      made-in / prepared-in / packaged-in \u2014 a PROCESSING claim: the last\n        substantial transformation happened there; the ingredients may\n        well be imported. Fills manufactured_in only.\n    An \"Imported by \u2026\" or \"Distributed by \u2026\" address is NOT an origin: set\n    `importer_only=True` so it is recorded but never ranked as provenance.\n    `confidence`: high = the full declaration is legible; medium = partial\n    or cropped; low = inferred from a flag, address or fragment.\n\n    Submissions are PENDING and change nothing \u2014 not the product's origin,\n    not any plan \u2014 until a reviewer approves them with\n    review_origin_submission. Resubmitting the same reading returns the\n    existing entry (`duplicate=True`) rather than queueing it twice; if it\n    was rejected you get the rejection and its note. Validation failures\n    name the field and the allowed values; unknown country spellings come\n    back with suggestions.",
+   "input_schema": {
+    "type": "object",
+    "properties": {
+     "claim_type": {
+      "type": "string"
+     },
+     "confidence": {
+      "type": "string",
+      "default": "medium"
+     },
+     "country": {
+      "type": "string"
+     },
+     "importer_only": {
+      "type": "boolean",
+      "default": false
+     },
+     "note": {
+      "type": "string",
+      "default": ""
+     },
+     "product_id": {
+      "type": "integer"
+     },
+     "source_ref": {
+      "type": "string",
+      "default": ""
+     },
+     "verbatim": {
+      "type": "string"
+     }
+    },
+    "required": [
+     "product_id",
+     "claim_type",
+     "country",
+     "verbatim"
+    ]
+   },
+   "output_schema": {
+    "type": "object",
+    "properties": {
+     "claim_type": {},
+     "confidence": {},
+     "country": {},
+     "duplicate": {},
+     "evidence_id": {},
+     "id": {},
+     "importer_only": {},
+     "ingredient_origin": {},
+     "manufactured_in": {},
+     "note": {},
+     "product_id": {},
+     "product_name": {},
+     "review_note": {},
+     "reviewed_at": {},
+     "reviewed_by": {},
+     "source_ref": {},
+     "status": {},
+     "submitted_at": {},
+     "submitted_by": {},
+     "verbatim": {}
+    }
+   },
+   "annotations": {
+    "read_only_hint": false,
+    "destructive_hint": false,
+    "idempotent_hint": true,
+    "open_world_hint": false
+   }
+  },
+  {
+   "name": "list_origin_submissions",
+   "description": "Page through the origin review queue, oldest first. `status` is\n    \"pending\" (default), \"approved\", \"rejected\" or null for every status.\n    `next_offset` is null on the last page. Free \u2014 no LLM calls.",
+   "input_schema": {
+    "type": "object",
+    "properties": {
+     "limit": {
+      "type": "integer",
+      "default": 50
+     },
+     "offset": {
+      "type": "integer",
+      "default": 0
+     },
+     "status": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "default": "pending"
+     }
+    },
+    "required": []
+   },
+   "output_schema": {
+    "type": "object",
+    "properties": {
+     "items": {},
+     "next_offset": {},
+     "total": {}
+    }
+   },
+   "annotations": {
+    "read_only_hint": true,
+    "open_world_hint": false
+   }
+  },
+  {
+   "name": "review_origin_submission",
+   "description": "Approve or reject a pending submission. `decision` is \"approve\" or\n    \"reject\"; a rejection needs a `note` (>= 3 chars) saying why, so the\n    next reader can tell a blurry photo from a wrong claim. Approval copies\n    the reading into the evidence table as source \"agent-label\", refreshes\n    the product's resolved origin, and from then on plan tools honour it.\n    Review each one against get_product first: does the verbatim wording\n    support the claim type and the country? A submission can be reviewed\n    once; reviewing it again is an error naming its status.",
+   "input_schema": {
+    "type": "object",
+    "properties": {
+     "decision": {
+      "type": "string"
+     },
+     "note": {
+      "type": "string",
+      "default": ""
+     },
+     "submission_id": {
+      "type": "integer"
+     }
+    },
+    "required": [
+     "submission_id",
+     "decision"
+    ]
+   },
+   "output_schema": {
+    "type": "object",
+    "properties": {
+     "claim_type": {},
+     "confidence": {},
+     "country": {},
+     "duplicate": {},
+     "evidence_id": {},
+     "id": {},
+     "importer_only": {},
+     "ingredient_origin": {},
+     "manufactured_in": {},
+     "note": {},
+     "product_id": {},
+     "product_name": {},
+     "review_note": {},
+     "reviewed_at": {},
+     "reviewed_by": {},
+     "source_ref": {},
+     "status": {},
+     "submitted_at": {},
+     "submitted_by": {},
+     "verbatim": {}
+    }
+   },
+   "annotations": {
+    "read_only_hint": false,
+    "destructive_hint": false,
+    "idempotent_hint": false,
+    "open_world_hint": false
+   }
+  },
+  {
+   "name": "pipeline_status",
+   "description": "Active configuration: routing strategy, models, confidence\n    threshold, DB target, and whether this caller may submit origin\n    readings (`write_tools`). Free \u2014 no LLM calls.",
+   "input_schema": {
+    "type": "object",
+    "properties": {},
+    "required": []
+   },
+   "output_schema": {
+    "type": "object",
+    "properties": {
+     "anthropic_key_configured": {},
+     "confidence_threshold": {},
+     "db": {},
+     "default_model": {},
+     "demo_mode": {},
+     "escalation_model": {},
+     "mcp_auth": {},
+     "routing_strategy": {},
+     "status": {},
+     "write_tools": {}
+    }
+   },
+   "annotations": {
+    "read_only_hint": true,
+    "open_world_hint": false
+   }
+  }
+ ]
+}

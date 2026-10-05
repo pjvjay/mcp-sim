@@ -1,0 +1,2396 @@
+{
+  "observations": [
+    {
+      "kind": "resource",
+      "name": "pantry://recipes",
+      "arguments": {},
+      "is_error": false,
+      "summary": "application/json, 849 chars: list of 7; [0]={\"ingredient_count\": 3, \"name\": \"Peanut Butter & Jelly Sandwich\", \"servings\": 2, \"slug\": \"pbj_sandwich\"}; [1]={\"ingredient_count\": 7, \"name\": \"Spaghetti Bolognese\", \"servings\": 4, \"slug\": \"spaghetti_bolognese\"}; [2]={\"ingredient_count\": 9, \"name\": \"Simple Chicken Curry\", \"servings\": 4, \"slug\": \"chicken_curry\"}",
+      "structured_keys": [
+        "slug",
+        "name",
+        "servings",
+        "ingredient_count"
+      ],
+      "structured": [
+        {
+          "slug": "pbj_sandwich",
+          "name": "Peanut Butter & Jelly Sandwich",
+          "servings": 2,
+          "ingredient_count": 3
+        },
+        {
+          "slug": "spaghetti_bolognese",
+          "name": "Spaghetti Bolognese",
+          "servings": 4,
+          "ingredient_count": 7
+        },
+        {
+          "slug": "chicken_curry",
+          "name": "Simple Chicken Curry",
+          "servings": 4,
+          "ingredient_count": 9
+        },
+        {
+          "slug": "grilled_cheese",
+          "name": "Grilled Cheese Sandwich",
+          "servings": 1,
+          "ingredient_count": 3
+        },
+        {
+          "slug": "veggie_stirfry",
+          "name": "Vegetable Stir Fry",
+          "servings": 2,
+          "ingredient_count": 5
+        },
+        {
+          "slug": "beef_rice_bowl",
+          "name": "Beef & Broccoli Rice Bowl",
+          "servings": 3,
+          "ingredient_count": 5
+        },
+        {
+          "slug": "tomato_penne",
+          "name": "Tomato Penne",
+          "servings": 2,
+          "ingredient_count": 5
+        }
+      ],
+      "ms": 331.95,
+      "chars": 849,
+      "mime_type": "application/json",
+      "from_expected": []
+    },
+    {
+      "kind": "resource",
+      "name": "pantry://catalog/categories",
+      "arguments": {},
+      "is_error": false,
+      "summary": "application/json, 480 chars: object with keys bakery, dairy, frozen, meat, pantry, produce, snacks; bakery={\"bread\": 4}; dairy={\"butter\": 1, \"cheese\": 5, \"eggs\": 1, \"milk\": 3, \"yogurt\": 2}; frozen={\"vegetables\": 1}; meat={\"beef\": 3, \"poultry\": 4, \"seafood\": 1}; pantry={\"baking\": 1, \"canned\": 6, \"oil\": 3, \"pasta\": 4, \"rice\": 2, \"sauce\": 3, \"spice\": 4, \"spread\": 2}; produce={\"herbs\": 1, \"vegetables\": 9}; snacks={\"chocolate\": 2}",
+      "structured_keys": [
+        "bakery",
+        "dairy",
+        "frozen",
+        "meat",
+        "pantry",
+        "produce",
+        "snacks"
+      ],
+      "structured": {
+        "bakery": {
+          "bread": 4
+        },
+        "dairy": {
+          "butter": 1,
+          "cheese": 5,
+          "eggs": 1,
+          "milk": 3,
+          "yogurt": 2
+        },
+        "frozen": {
+          "vegetables": 1
+        },
+        "meat": {
+          "beef": 3,
+          "poultry": 4,
+          "seafood": 1
+        },
+        "pantry": {
+          "baking": 1,
+          "canned": 6,
+          "oil": 3,
+          "pasta": 4,
+          "rice": 2,
+          "sauce": 3,
+          "spice": 4,
+          "spread": 2
+        },
+        "produce": {
+          "herbs": 1,
+          "vegetables": 9
+        },
+        "snacks": {
+          "chocolate": 2
+        }
+      },
+      "ms": 4.869,
+      "chars": 480,
+      "mime_type": "application/json",
+      "from_expected": []
+    },
+    {
+      "kind": "resource",
+      "name": "pantry://countries",
+      "arguments": {},
+      "is_error": false,
+      "summary": "application/json, 9480 chars: object with keys canonical, aliases, ambiguous; canonical: list of 231; canonical[0]=\"Afghanistan\"; canonical[1]=\"Albania\"; canonical[2]=\"Algeria\"; aliases={\"Austria\": [\"austria\", \"osterreich\"], \"Belgium\": [\"belgie\", \"belgique\", \"belgium\"], \"Bosnia and Herzegovina\": [\"bosnia…; ambiguous={\"congo\": [\"Republic of the Congo\", \"Democratic Republic of the Congo\"], \"eu\": [\"(a bloc, not a country — name the memb…",
+      "structured_keys": [
+        "canonical",
+        "aliases",
+        "ambiguous"
+      ],
+      "structured": {
+        "canonical": [
+          "Afghanistan",
+          "Albania",
+          "Algeria",
+          "American Samoa",
+          "Andorra",
+          "Angola",
+          "Anguilla",
+          "Antigua and Barbuda",
+          "Argentina",
+          "Armenia",
+          "Aruba",
+          "Australia",
+          "Austria",
+          "Azerbaijan",
+          "Bahamas",
+          "Bahrain",
+          "Bangladesh",
+          "Barbados",
+          "Belarus",
+          "Belgium",
+          "Belize",
+          "Benin",
+          "Bermuda",
+          "Bhutan",
+          "Bolivia",
+          "Bosnia and Herzegovina",
+          "Botswana",
+          "Brazil",
+          "British Virgin Islands",
+          "Brunei",
+          "Bulgaria",
+          "Burkina Faso",
+          "Burundi",
+          "Cabo Verde",
+          "Cambodia",
+          "Cameroon",
+          "Canada",
+          "Cayman Islands",
+          "Central African Republic",
+          "Chad",
+          "Chile",
+          "China",
+          "Colombia",
+          "Comoros",
+          "Cook Islands",
+          "Costa Rica",
+          "Cote D'ivoire",
+          "Croatia",
+          "Cuba",
+          "Curacao",
+          "Cyprus",
+          "Czechia",
+          "Democratic Republic of the Congo",
+          "Denmark",
+          "Djibouti",
+          "Dominica",
+          "Dominican Republic",
+          "Ecuador",
+          "Egypt",
+          "El Salvador",
+          "Equatorial Guinea",
+          "Eritrea",
+          "Estonia",
+          "Eswatini",
+          "Ethiopia",
+          "Falkland Islands",
+          "Faroe Islands",
+          "Fiji",
+          "Finland",
+          "France",
+          "French Polynesia",
+          "Gabon",
+          "Gambia",
+          "Georgia",
+          "Germany",
+          "Ghana",
+          "Gibraltar",
+          "Greece",
+          "Greenland",
+          "Grenada",
+          "Guadeloupe",
+          "Guam",
+          "Guatemala",
+          "Guernsey",
+          "Guinea",
+          "Guinea-bissau",
+          "Guyana",
+          "Haiti",
+          "Honduras",
+          "Hong Kong",
+          "Hungary",
+          "Iceland",
+          "India",
+          "Indonesia",
+          "Iran",
+          "Iraq",
+          "Ireland",
+          "Isle of Man",
+          "Israel",
+          "Italy",
+          "Jamaica",
+          "Japan",
+          "Jersey",
+          "Jordan",
+          "Kazakhstan",
+          "Kenya",
+          "Kiribati",
+          "Kosovo",
+          "Kuwait",
+          "Kyrgyzstan",
+          "Laos",
+          "Latvia",
+          "Lebanon",
+          "Lesotho",
+          "Liberia",
+          "Libya",
+          "Liechtenstein",
+          "Lithuania",
+          "Luxembourg",
+          "Macau",
+          "Madagascar",
+          "Malawi",
+          "Malaysia",
+          "Maldives",
+          "Mali",
+          "Malta",
+          "Marshall Islands",
+          "Martinique",
+          "Mauritania",
+          "Mauritius",
+          "Mayotte",
+          "Mexico",
+          "Micronesia",
+          "Moldova",
+          "Monaco",
+          "Mongolia",
+          "Montenegro",
+          "Montserrat",
+          "Morocco",
+          "Mozambique",
+          "Myanmar",
+          "Namibia",
+          "Nauru",
+          "Nepal",
+          "Netherlands",
+          "New Caledonia",
+          "New Zealand",
+          "Nicaragua",
+          "Niger",
+          "Nigeria",
+          "Niue",
+          "North Korea",
+          "North Macedonia",
+          "Northern Mariana Islands",
+          "Norway",
+          "Oman",
+          "Pakistan",
+          "Palau",
+          "Palestine",
+          "Panama",
+          "Papua New Guinea",
+          "Paraguay",
+          "Peru",
+          "Philippines",
+          "Poland",
+          "Portugal",
+          "Puerto Rico",
+          "Qatar",
+          "Republic of the Congo",
+          "Reunion",
+          "Romania",
+          "Russia",
+          "Rwanda",
+          "Saint Helena",
+          "Saint Kitts and Nevis",
+          "Saint Lucia",
+          "Saint Martin",
+          "Saint Vincent and the Grenadines",
+          "Samoa",
+          "San Marino",
+          "Sao Tome and Principe",
+          "Saudi Arabia",
+          "Senegal",
+          "Serbia",
+          "Seychelles",
+          "Sierra Leone",
+          "Singapore",
+          "Sint Maarten",
+          "Slovakia",
+          "Slovenia",
+          "Solomon Islands",
+          "Somalia",
+          "South Africa",
+          "South Korea",
+          "South Sudan",
+          "Spain",
+          "Sri Lanka",
+          "Sudan",
+          "Suriname",
+          "Sweden",
+          "Switzerland",
+          "Syria",
+          "Taiwan",
+          "Tajikistan",
+          "Tanzania",
+          "Thailand",
+          "Timor-leste",
+          "Togo",
+          "Tonga",
+          "Trinidad and Tobago",
+          "Tunisia",
+          "Turkey",
+          "Turkmenistan",
+          "Turks and Caicos Islands",
+          "Tuvalu",
+          "Uganda",
+          "Ukraine",
+          "United Arab Emirates",
+          "United Kingdom",
+          "United States",
+          "Uruguay",
+          "Us Virgin Islands",
+          "Uzbekistan",
+          "Vanuatu",
+          "Vatican City",
+          "Venezuela",
+          "Vietnam",
+          "Western Sahara",
+          "Yemen",
+          "Zambia",
+          "Zimbabwe"
+        ],
+        "aliases": {
+          "United States": [
+            "alabama",
+            "alaska",
+            "arizona",
+            "arkansas",
+            "california",
+            "colorado",
+            "connecticut",
+            "delaware",
+            "florida",
+            "hawaii",
+            "idaho",
+            "illinois",
+            "indiana",
+            "iowa",
+            "kansas",
+            "kentucky",
+            "louisiana",
+            "maine",
+            "maryland",
+            "massachusetts",
+            "michigan",
+            "minnesota",
+            "mississippi",
+            "missouri",
+            "montana",
+            "nebraska",
+            "nevada",
+            "new hampshire",
+            "new jersey",
+            "new mexico",
+            "new york",
+            "north carolina",
+            "north dakota",
+            "ohio",
+            "oklahoma",
+            "oregon",
+            "pennsylvania",
+            "rhode island",
+            "south carolina",
+            "south dakota",
+            "tennessee",
+            "texas",
+            "u.s",
+            "u.s.a",
+            "united states",
+            "united states of america",
+            "us",
+            "usa",
+            "utah",
+            "vermont",
+            "virginia",
+            "washington",
+            "west virginia",
+            "wisconsin",
+            "wyoming"
+          ],
+          "Canada": [
+            "alberta",
+            "british columbia",
+            "canada",
+            "canadian",
+            "manitoba",
+            "new brunswick",
+            "newfoundland",
+            "nova scotia",
+            "prince edward island",
+            "quebec",
+            "saskatchewan"
+          ],
+          "United Kingdom": [
+            "britain",
+            "england",
+            "great britain",
+            "northern ireland",
+            "scotland",
+            "u.k",
+            "uk",
+            "united kingdom",
+            "wales"
+          ],
+          "Netherlands": [
+            "dutch",
+            "holland",
+            "netherlands"
+          ],
+          "South Korea": [
+            "korea, south",
+            "republic of korea",
+            "south korea"
+          ],
+          "North Korea": [
+            "democratic people's republic of korea",
+            "dprk",
+            "korea, north",
+            "north korea"
+          ],
+          "Czechia": [
+            "czech republic",
+            "czechia"
+          ],
+          "Turkey": [
+            "turkey",
+            "turkiye"
+          ],
+          "Myanmar": [
+            "burma",
+            "myanmar"
+          ],
+          "Cote D'ivoire": [
+            "cote d'ivoire",
+            "ivory coast"
+          ],
+          "Cabo Verde": [
+            "cabo verde",
+            "cape verde"
+          ],
+          "Eswatini": [
+            "eswatini",
+            "swaziland"
+          ],
+          "Timor-leste": [
+            "east timor",
+            "timor-leste"
+          ],
+          "North Macedonia": [
+            "north macedonia",
+            "republic of north macedonia"
+          ],
+          "Vietnam": [
+            "viet nam",
+            "vietnam"
+          ],
+          "Russia": [
+            "russia",
+            "russian federation"
+          ],
+          "United Arab Emirates": [
+            "u.a.e",
+            "uae",
+            "united arab emirates"
+          ],
+          "Democratic Republic of the Congo": [
+            "congo-kinshasa",
+            "democratic republic of the congo",
+            "dr congo",
+            "drc"
+          ],
+          "Republic of the Congo": [
+            "congo brazzaville",
+            "congo-brazzaville",
+            "republic of the congo"
+          ],
+          "Germany": [
+            "deutschland",
+            "germany"
+          ],
+          "Italy": [
+            "italia",
+            "italy"
+          ],
+          "Spain": [
+            "espana",
+            "spain"
+          ],
+          "Brazil": [
+            "brasil",
+            "brazil"
+          ],
+          "Sweden": [
+            "sverige",
+            "sweden"
+          ],
+          "Norway": [
+            "norge",
+            "norway"
+          ],
+          "Finland": [
+            "finland",
+            "suomi"
+          ],
+          "Poland": [
+            "poland",
+            "polska"
+          ],
+          "Greece": [
+            "greece",
+            "hellas"
+          ],
+          "Japan": [
+            "japan",
+            "nihon",
+            "nippon"
+          ],
+          "Austria": [
+            "austria",
+            "osterreich"
+          ],
+          "Switzerland": [
+            "schweiz",
+            "suisse",
+            "svizzera",
+            "switzerland"
+          ],
+          "Belgium": [
+            "belgie",
+            "belgique",
+            "belgium"
+          ],
+          "Denmark": [
+            "danmark",
+            "denmark"
+          ],
+          "Hungary": [
+            "hungary",
+            "magyarorszag"
+          ],
+          "Croatia": [
+            "croatia",
+            "hrvatska"
+          ],
+          "Kyrgyzstan": [
+            "kyrgyz republic",
+            "kyrgyzstan"
+          ],
+          "Ireland": [
+            "ireland",
+            "republic of ireland"
+          ],
+          "Saint Vincent and the Grenadines": [
+            "saint vincent",
+            "saint vincent and the grenadines"
+          ],
+          "Macau": [
+            "macao",
+            "macau"
+          ],
+          "Bosnia and Herzegovina": [
+            "bosnia",
+            "bosnia and herzegovina"
+          ],
+          "Slovakia": [
+            "slovak republic",
+            "slovakia"
+          ],
+          "Vatican City": [
+            "holy see",
+            "vatican",
+            "vatican city"
+          ],
+          "Taiwan": [
+            "chinese taipei",
+            "republic of china (taiwan)",
+            "taiwan"
+          ],
+          "China": [
+            "china",
+            "people's republic of china",
+            "prc"
+          ],
+          "Iran": [
+            "iran",
+            "islamic republic of iran"
+          ],
+          "Laos": [
+            "lao pdr",
+            "lao people's democratic republic",
+            "laos"
+          ],
+          "Syria": [
+            "syria",
+            "syrian arab republic"
+          ],
+          "Tanzania": [
+            "tanzania",
+            "united republic of tanzania"
+          ],
+          "Brunei": [
+            "brunei",
+            "brunei darussalam"
+          ],
+          "Moldova": [
+            "moldova",
+            "republic of moldova"
+          ],
+          "Palestine": [
+            "palestine",
+            "palestinian territories",
+            "state of palestine"
+          ]
+        },
+        "ambiguous": {
+          "korea": [
+            "South Korea",
+            "North Korea"
+          ],
+          "congo": [
+            "Republic of the Congo",
+            "Democratic Republic of the Congo"
+          ],
+          "macedonia": [
+            "North Macedonia",
+            "(or a Greek region — name the country)"
+          ],
+          "ontario": [
+            "Canada"
+          ],
+          "eu": [
+            "(a bloc, not a country — name the member state)"
+          ],
+          "europe": [
+            "(a continent, not a country — name the country)"
+          ]
+        }
+      },
+      "ms": 6.261,
+      "chars": 9480,
+      "mime_type": "application/json",
+      "from_expected": []
+    },
+    {
+      "kind": "resource",
+      "name": "pantry://origins/coverage",
+      "arguments": {},
+      "is_error": false,
+      "summary": "application/json, 203 chars: object with keys products, by_status, evidence_rows, submissions, submissions_note, floor; products=62; by_status={\"unknown\": 62}; evidence_rows=0; submissions={\"approved\": 0, \"pending\": 0, \"rejected\": 0}; submissions_note=\"\"; floor=0.6",
+      "structured_keys": [
+        "products",
+        "by_status",
+        "evidence_rows",
+        "submissions",
+        "submissions_note",
+        "floor"
+      ],
+      "structured": {
+        "products": 62,
+        "by_status": {
+          "unknown": 62
+        },
+        "evidence_rows": 0,
+        "submissions": {
+          "pending": 0,
+          "approved": 0,
+          "rejected": 0
+        },
+        "submissions_note": "",
+        "floor": 0.6
+      },
+      "ms": 15.975,
+      "chars": 203,
+      "mime_type": "application/json",
+      "from_expected": []
+    },
+    {
+      "kind": "tool",
+      "name": "find_product",
+      "arguments": {
+        "query": "penne"
+      },
+      "is_error": false,
+      "summary": "object with keys query, tokens, match, total, items, note; query=\"penne\"; tokens: list of 1; tokens[0]=\"penne\"; match=\"direct\"; total=2; items: list of 2; items[0]={\"brand\": \"Fraser Farms\", \"category\": \"pantry\", \"distance_km\": 2.9, \"id\": 51, \"name\": \"Penne Rigate 500g\", \"origin_coun…; items[1]={\"brand\": \"Golden Gate\", \"category\": \"pantry\", \"distance_km\": 0.3, \"id\": 49, \"name\": \"Gluten-Free Penne 340g\", \"origin_…; note=\"2 product(s) match every token in 'penne'; each is priced at its cheapest store in range.\"",
+      "structured_keys": [
+        "query",
+        "tokens",
+        "match",
+        "total",
+        "items",
+        "note"
+      ],
+      "structured": {
+        "query": "penne",
+        "tokens": [
+          "penne"
+        ],
+        "match": "direct",
+        "total": 2,
+        "items": [
+          {
+            "id": 51,
+            "name": "Penne Rigate 500g",
+            "brand": "Fraser Farms",
+            "size": "500g",
+            "category": "pantry",
+            "subcategory": "pasta",
+            "store": "GreenLeaf Grocers Kitsilano",
+            "price": 1.97,
+            "distance_km": 2.9,
+            "origin_status": "unknown",
+            "origin_country": ""
+          },
+          {
+            "id": 49,
+            "name": "Gluten-Free Penne 340g",
+            "brand": "Golden Gate",
+            "size": "340g",
+            "category": "pantry",
+            "subcategory": "pasta",
+            "store": "Pantry Mart Downtown",
+            "price": 4.04,
+            "distance_km": 0.3,
+            "origin_status": "unknown",
+            "origin_country": ""
+          }
+        ],
+        "note": "2 product(s) match every token in 'penne'; each is priced at its cheapest store in range."
+      },
+      "ms": 845.552,
+      "chars": 863,
+      "mime_type": null,
+      "from_expected": [
+        "query"
+      ]
+    },
+    {
+      "kind": "tool",
+      "name": "get_product_origins",
+      "arguments": {},
+      "is_error": false,
+      "summary": "object with keys items, total, by_status, next_offset; items: list of 50; items[0]={\"claim_type\": \"unknown\", \"confidence\": \"low\", \"country\": \"\", \"evidence_count\": 0, \"ingredient_claim\": \"\", \"ingredient_…; items[1]={\"claim_type\": \"unknown\", \"confidence\": \"low\", \"country\": \"\", \"evidence_count\": 0, \"ingredient_claim\": \"\", \"ingredient_…; items[2]={\"claim_type\": \"unknown\", \"confidence\": \"low\", \"country\": \"\", \"evidence_count\": 0, \"ingredient_claim\": \"\", \"ingredient_…; total=62; by_status={\"unknown\": 62}; next_offset=50",
+      "structured_keys": [
+        "items",
+        "total",
+        "by_status",
+        "next_offset"
+      ],
+      "structured": {
+        "items": [
+          {
+            "product_id": 1,
+            "product_name": "Wheat Bread 1",
+            "status": "unknown",
+            "claim_type": "unknown",
+            "country": "",
+            "ingredient_origin": "",
+            "manufactured_in": "",
+            "verbatim": "",
+            "confidence": "low",
+            "source": "",
+            "note": "",
+            "evidence_count": 0,
+            "ingredient_claim": "",
+            "manufactured_claim": "",
+            "seen_countries": []
+          },
+          {
+            "product_id": 2,
+            "product_name": "Wheat Bread 2",
+            "status": "unknown",
+            "claim_type": "unknown",
+            "country": "",
+            "ingredient_origin": "",
+            "manufactured_in": "",
+            "verbatim": "",
+            "confidence": "low",
+            "source": "",
+            "note": "",
+            "evidence_count": 0,
+            "ingredient_claim": "",
+            "manufactured_claim": "",
+            "seen_countries": []
+          },
+          {
+            "product_id": 3,
+            "product_name": "Dark Chocolate Cadbury",
+            "status": "unknown",
+            "claim_type": "unknown",
+            "country": "",
+            "ingredient_origin": "",
+            "manufactured_in": "",
+            "verbatim": "",
+            "confidence": "low",
+            "source": "",
+            "note": "",
+            "evidence_count": 0,
+            "ingredient_claim": "",
+            "manufactured_claim": "",
+            "seen_countries": []
+          },
+          {
+            "product_id": 4,
+            "product_name": "Milk Chocolate Cadbury",
+            "status": "unknown",
+            "claim_type": "unknown",
+            "country": "",
+            "ingredient_origin": "",
+            "manufactured_in": "",
+            "verbatim": "",
+            "confidence": "low",
+            "source": "",
+            "note": "",
+            "evidence_count": 0,
+            "ingredient_claim": "",
+            "manufactured_claim": "",
+            "seen_countries": []
+          },
+          {
+            "product_id": 5,
+            "product_name": "Nestles PBJ",
+            "status": "unknown",
+            "claim_type": "unknown",
+            "country": "",
+            "ingredient_origin": "",
+            "manufactured_in": "",
+            "verbatim": "",
+            "confidence": "low",
+            "source": "",
+            "note": "",
+            "evidence_count": 0,
+            "ingredient_claim": "",
+            "manufactured_claim": "",
+            "seen_countries": []
+          },
+          {
+            "product_id": 6,
+            "product_name": "Canadian Peanut Butter Cream",
+            "status": "unknown",
+            "claim_type": "unknown",
+            "country": "",
+            "ingredient_origin": "",
+            "manufactured_in": "",
+            "verbatim": "",
+            "confidence": "low",
+            "source": "",
+            "note": "",
+            "evidence_count": 0,
+            "ingredient_claim": "",
+            "manufactured_claim": "",
+            "seen_countries": []
+          },
+          {
+            "product_id": 7,
+            "product_name": "Sourdough Loaf",
+            "status": "unknown",
+            "claim_type": "unknown",
+            "country": "",
+            "ingredient_origin": "",
+            "manufactured_in": "",
+            "verbatim": "",
+            "confidence": "low",
+            "source": "",
+            "note": "",
+            "evidence_count": 0,
+            "ingredient_claim": "",
+            "manufactured_claim": "",
+            "seen_countries": []
+          },
+          {
+            "product_id": 8,
+            "product_name": "Basmati Rice 2kg",
+            "status": "unknown",
+            "claim_type": "unknown",
+            "country": "",
+            "ingredient_origin": "",
+            "manufactured_in": "",
+            "verbatim": "",
+            "confidence": "low",
+            "source": "",
+            "note": "",
+            "evidence_count": 0,
+            "ingredient_claim": "",
+            "manufactured_claim": "",
+            "seen_countries": []
+          },
+          {
+            "product_id": 9,
+            "product_name": "Long Grain White Rice 1kg",
+            "status": "unknown",
+            "claim_type": "unknown",
+            "country": "",
+            "ingredient_origin": "",
+            "manufactured_in": "",
+            "verbatim": "",
+            "confidence": "low",
+            "source": "",
+            "note": "",
+            "evidence_count": 0,
+            "ingredient_claim": "",
+            "manufactured_claim": "",
+            "seen_countries": []
+          },
+          {
+            "product_id": 10,
+            "product_name": "Boneless Skinless Chicken Breast",
+            "status": "unknown",
+            "claim_type": "unknown",
+            "country": "",
+            "ingredient_origin": "",
+            "manufactured_in": "",
+            "verbatim": "",
+            "confidence": "low",
+            "source": "",
+            "note": "",
+            "evidence_count": 0,
+            "ingredient_claim": "",
+            "manufactured_claim": "",
+            "seen_countries": []
+          },
+          {
+            "product_id": 11,
+            "product_name": "Chicken Thighs Bone-In",
+            "status": "unknown",
+            "claim_type": "unknown",
+            "country": "",
+            "ingredient_origin": "",
+            "manufactured_in": "",
+            "verbatim": "",
+            "confidence": "low",
+            "source": "",
+            "note": "",
+            "evidence_count": 0,
+            "ingredient_claim": "",
+            "manufactured_claim": "",
+            "seen_countries": []
+          },
+          {
+            "product_id": 12,
+            "product_name": "Yellow Onion",
+            "status": "unknown",
+            "claim_type": "unknown",
+            "country": "",
+            "ingredient_origin": "",
+            "manufactured_in": "",
+            "verbatim": "",
+            "confidence": "low",
+            "source": "",
+            "note": "",
+            "evidence_count": 0,
+            "ingredient_claim": "",
+            "manufactured_claim": "",
+            "seen_countries": []
+          },
+          {
+            "product_id": 13,
+            "product_name": "Fresh Garlic",
+            "status": "unknown",
+            "claim_type": "unknown",
+            "country": "",
+            "ingredient_origin": "",
+            "manufactured_in": "",
+            "verbatim": "",
+            "confidence": "low",
+            "source": "",
+            "note": "",
+            "evidence_count": 0,
+            "ingredient_claim": "",
+            "manufactured_claim": "",
+            "seen_countries": []
+          },
+          {
+            "product_id": 14,
+            "product_name": "Roma Tomato",
+            "status": "unknown",
+            "claim_type": "unknown",
+            "country": "",
+            "ingredient_origin": "",
+            "manufactured_in": "",
+            "verbatim": "",
+            "confidence": "low",
+            "source": "",
+            "note": "",
+            "evidence_count": 0,
+            "ingredient_claim": "",
+            "manufactured_claim": "",
+            "seen_countries": []
+          },
+          {
+            "product_id": 15,
+            "product_name": "Canned Diced Tomatoes",
+            "status": "unknown",
+            "claim_type": "unknown",
+            "country": "",
+            "ingredient_origin": "",
+            "manufactured_in": "",
+            "verbatim": "",
+            "confidence": "low",
+            "source": "",
+            "note": "",
+            "evidence_count": 0,
+            "ingredient_claim": "",
+            "manufactured_claim": "",
+            "seen_countries": []
+          },
+          {
+            "product_id": 16,
+            "product_name": "Extra Virgin Olive Oil 500ml",
+            "status": "unknown",
+            "claim_type": "unknown",
+            "country": "",
+            "ingredient_origin": "",
+            "manufactured_in": "",
+            "verbatim": "",
+            "confidence": "low",
+            "source": "",
+            "note": "",
+            "evidence_count": 0,
+            "ingredient_claim": "",
+            "manufactured_claim": "",
+            "seen_countries": []
+          },
+          {
+            "product_id": 17,
+            "product_name": "Canola Oil 1L",
+            "status": "unknown",
+            "claim_type": "unknown",
+            "country": "",
+            "ingredient_origin": "",
+            "manufactured_in": "",
+            "verbatim": "",
+            "confidence": "low",
+            "source": "",
+            "note": "",
+            "evidence_count": 0,
+            "ingredient_claim": "",
+            "manufactured_claim": "",
+            "seen_countries": []
+          },
+          {
+            "product_id": 18,
+            "product_name": "Butter Salted 454g",
+            "status": "unknown",
+            "claim_type": "unknown",
+            "country": "",
+            "ingredient_origin": "",
+            "manufactured_in": "",
+            "verbatim": "",
+            "confidence": "low",
+            "source": "",
+            "note": "",
+            "evidence_count": 0,
+            "ingredient_claim": "",
+            "manufactured_claim": "",
+            "seen_countries": []
+          },
+          {
+            "product_id": 19,
+            "product_name": "Whole Milk 1L",
+            "status": "unknown",
+            "claim_type": "unknown",
+            "country": "",
+            "ingredient_origin": "",
+            "manufactured_in": "",
+            "verbatim": "",
+            "confidence": "low",
+            "source": "",
+            "note": "",
+            "evidence_count": 0,
+            "ingredient_claim": "",
+            "manufactured_claim": "",
+            "seen_countries": []
+          },
+          {
+            "product_id": 20,
+            "product_name": "Plain Greek Yogurt 750g",
+            "status": "unknown",
+            "claim_type": "unknown",
+            "country": "",
+            "ingredient_origin": "",
+            "manufactured_in": "",
+            "verbatim": "",
+            "confidence": "low",
+            "source": "",
+            "note": "",
+            "evidence_count": 0,
+            "ingredient_claim": "",
+            "manufactured_claim": "",
+            "seen_countries": []
+          },
+          {
+            "product_id": 21,
+            "product_name": "Spaghetti Pasta 500g",
+            "status": "unknown",
+            "claim_type": "unknown",
+            "country": "",
+            "ingredient_origin": "",
+            "manufactured_in": "",
+            "verbatim": "",
+            "confidence": "low",
+            "source": "",
+            "note": "",
+            "evidence_count": 0,
+            "ingredient_claim": "",
+            "manufactured_claim": "",
+            "seen_countries": []
+          },
+          {
+            "product_id": 22,
+            "product_name": "Ground Beef Lean",
+            "status": "unknown",
+            "claim_type": "unknown",
+            "country": "",
+            "ingredient_origin": "",
+            "manufactured_in": "",
+            "verbatim": "",
+            "confidence": "low",
+            "source": "",
+            "note": "",
+            "evidence_count": 0,
+            "ingredient_claim": "",
+            "manufactured_claim": "",
+            "seen_countries": []
+          },
+          {
+            "product_id": 23,
+            "product_name": "Cheddar Cheese Block 300g",
+            "status": "unknown",
+            "claim_type": "unknown",
+            "country": "",
+            "ingredient_origin": "",
+            "manufactured_in": "",
+            "verbatim": "",
+            "confidence": "low",
+            "source": "",
+            "note": "",
+            "evidence_count": 0,
+            "ingredient_claim": "",
+            "manufactured_claim": "",
+            "seen_countries": []
+          },
+          {
+            "product_id": 24,
+            "product_name": "Mozzarella Shredded 200g",
+            "status": "unknown",
+            "claim_type": "unknown",
+            "country": "",
+            "ingredient_origin": "",
+            "manufactured_in": "",
+            "verbatim": "",
+            "confidence": "low",
+            "source": "",
+            "note": "",
+            "evidence_count": 0,
+            "ingredient_claim": "",
+            "manufactured_claim": "",
+            "seen_countries": []
+          },
+          {
+            "product_id": 25,
+            "product_name": "Fresh Ginger",
+            "status": "unknown",
+            "claim_type": "unknown",
+            "country": "",
+            "ingredient_origin": "",
+            "manufactured_in": "",
+            "verbatim": "",
+            "confidence": "low",
+            "source": "",
+            "note": "",
+            "evidence_count": 0,
+            "ingredient_claim": "",
+            "manufactured_claim": "",
+            "seen_countries": []
+          },
+          {
+            "product_id": 26,
+            "product_name": "Cumin Ground 100g",
+            "status": "unknown",
+            "claim_type": "unknown",
+            "country": "",
+            "ingredient_origin": "",
+            "manufactured_in": "",
+            "verbatim": "",
+            "confidence": "low",
+            "source": "",
+            "note": "",
+            "evidence_count": 0,
+            "ingredient_claim": "",
+            "manufactured_claim": "",
+            "seen_countries": []
+          },
+          {
+            "product_id": 27,
+            "product_name": "Turmeric Ground 100g",
+            "status": "unknown",
+            "claim_type": "unknown",
+            "country": "",
+            "ingredient_origin": "",
+            "manufactured_in": "",
+            "verbatim": "",
+            "confidence": "low",
+            "source": "",
+            "note": "",
+            "evidence_count": 0,
+            "ingredient_claim": "",
+            "manufactured_claim": "",
+            "seen_countries": []
+          },
+          {
+            "product_id": 28,
+            "product_name": "Coriander Ground 100g",
+            "status": "unknown",
+            "claim_type": "unknown",
+            "country": "",
+            "ingredient_origin": "",
+            "manufactured_in": "",
+            "verbatim": "",
+            "confidence": "low",
+            "source": "",
+            "note": "",
+            "evidence_count": 0,
+            "ingredient_claim": "",
+            "manufactured_claim": "",
+            "seen_countries": []
+          },
+          {
+            "product_id": 29,
+            "product_name": "Garam Masala 100g",
+            "status": "unknown",
+            "claim_type": "unknown",
+            "country": "",
+            "ingredient_origin": "",
+            "manufactured_in": "",
+            "verbatim": "",
+            "confidence": "low",
+            "source": "",
+            "note": "",
+            "evidence_count": 0,
+            "ingredient_claim": "",
+            "manufactured_claim": "",
+            "seen_countries": []
+          },
+          {
+            "product_id": 30,
+            "product_name": "Frozen Broccoli 500g",
+            "status": "unknown",
+            "claim_type": "unknown",
+            "country": "",
+            "ingredient_origin": "",
+            "manufactured_in": "",
+            "verbatim": "",
+            "confidence": "low",
+            "source": "",
+            "note": "",
+            "evidence_count": 0,
+            "ingredient_claim": "",
+            "manufactured_claim": "",
+            "seen_countries": []
+          },
+          {
+            "product_id": 31,
+            "product_name": "Tomato Sauce Jar 650ml",
+            "status": "unknown",
+            "claim_type": "unknown",
+            "country": "",
+            "ingredient_origin": "",
+            "manufactured_in": "",
+            "verbatim": "",
+            "confidence": "low",
+            "source": "",
+            "note": "",
+            "evidence_count": 0,
+            "ingredient_claim": "",
+            "manufactured_claim": "",
+            "seen_countries": []
+          },
+          {
+            "product_id": 32,
+            "product_name": "Tomato Paste 156ml",
+            "status": "unknown",
+            "claim_type": "unknown",
+            "country": "",
+            "ingredient_origin": "",
+            "manufactured_in": "",
+            "verbatim": "",
+            "confidence": "low",
+            "source": "",
+            "note": "",
+            "evidence_count": 0,
+            "ingredient_claim": "",
+            "manufactured_claim": "",
+            "seen_countries": []
+          },
+          {
+            "product_id": 33,
+            "product_name": "Crushed Tomatoes Canned 796ml",
+            "status": "unknown",
+            "claim_type": "unknown",
+            "country": "",
+            "ingredient_origin": "",
+            "manufactured_in": "",
+            "verbatim": "",
+            "confidence": "low",
+            "source": "",
+            "note": "",
+            "evidence_count": 0,
+            "ingredient_claim": "",
+            "manufactured_claim": "",
+            "seen_countries": []
+          },
+          {
+            "product_id": 34,
+            "product_name": "Passata Strained Tomatoes 680ml",
+            "status": "unknown",
+            "claim_type": "unknown",
+            "country": "",
+            "ingredient_origin": "",
+            "manufactured_in": "",
+            "verbatim": "",
+            "confidence": "low",
+            "source": "",
+            "note": "",
+            "evidence_count": 0,
+            "ingredient_claim": "",
+            "manufactured_claim": "",
+            "seen_countries": []
+          },
+          {
+            "product_id": 35,
+            "product_name": "Ground Beef Medium 900g",
+            "status": "unknown",
+            "claim_type": "unknown",
+            "country": "",
+            "ingredient_origin": "",
+            "manufactured_in": "",
+            "verbatim": "",
+            "confidence": "low",
+            "source": "",
+            "note": "",
+            "evidence_count": 0,
+            "ingredient_claim": "",
+            "manufactured_claim": "",
+            "seen_countries": []
+          },
+          {
+            "product_id": 36,
+            "product_name": "Ground Beef Extra Lean 300g",
+            "status": "unknown",
+            "claim_type": "unknown",
+            "country": "",
+            "ingredient_origin": "",
+            "manufactured_in": "",
+            "verbatim": "",
+            "confidence": "low",
+            "source": "",
+            "note": "",
+            "evidence_count": 0,
+            "ingredient_claim": "",
+            "manufactured_claim": "",
+            "seen_countries": []
+          },
+          {
+            "product_id": 37,
+            "product_name": "Russet Potatoes 5lb Bag",
+            "status": "unknown",
+            "claim_type": "unknown",
+            "country": "",
+            "ingredient_origin": "",
+            "manufactured_in": "",
+            "verbatim": "",
+            "confidence": "low",
+            "source": "",
+            "note": "",
+            "evidence_count": 0,
+            "ingredient_claim": "",
+            "manufactured_claim": "",
+            "seen_countries": []
+          },
+          {
+            "product_id": 38,
+            "product_name": "Baby Potatoes 680g",
+            "status": "unknown",
+            "claim_type": "unknown",
+            "country": "",
+            "ingredient_origin": "",
+            "manufactured_in": "",
+            "verbatim": "",
+            "confidence": "low",
+            "source": "",
+            "note": "",
+            "evidence_count": 0,
+            "ingredient_claim": "",
+            "manufactured_claim": "",
+            "seen_countries": []
+          },
+          {
+            "product_id": 39,
+            "product_name": "Oat Milk 1L",
+            "status": "unknown",
+            "claim_type": "unknown",
+            "country": "",
+            "ingredient_origin": "",
+            "manufactured_in": "",
+            "verbatim": "",
+            "confidence": "low",
+            "source": "",
+            "note": "",
+            "evidence_count": 0,
+            "ingredient_claim": "",
+            "manufactured_claim": "",
+            "seen_countries": []
+          },
+          {
+            "product_id": 40,
+            "product_name": "Almond Milk 946ml",
+            "status": "unknown",
+            "claim_type": "unknown",
+            "country": "",
+            "ingredient_origin": "",
+            "manufactured_in": "",
+            "verbatim": "",
+            "confidence": "low",
+            "source": "",
+            "note": "",
+            "evidence_count": 0,
+            "ingredient_claim": "",
+            "manufactured_claim": "",
+            "seen_countries": []
+          },
+          {
+            "product_id": 41,
+            "product_name": "Vegan Cheese Shreds 200g",
+            "status": "unknown",
+            "claim_type": "unknown",
+            "country": "",
+            "ingredient_origin": "",
+            "manufactured_in": "",
+            "verbatim": "",
+            "confidence": "low",
+            "source": "",
+            "note": "",
+            "evidence_count": 0,
+            "ingredient_claim": "",
+            "manufactured_claim": "",
+            "seen_countries": []
+          },
+          {
+            "product_id": 42,
+            "product_name": "Coconut Yogurt 500g",
+            "status": "unknown",
+            "claim_type": "unknown",
+            "country": "",
+            "ingredient_origin": "",
+            "manufactured_in": "",
+            "verbatim": "",
+            "confidence": "low",
+            "source": "",
+            "note": "",
+            "evidence_count": 0,
+            "ingredient_claim": "",
+            "manufactured_claim": "",
+            "seen_countries": []
+          },
+          {
+            "product_id": 43,
+            "product_name": "Parmesan Wedge 200g",
+            "status": "unknown",
+            "claim_type": "unknown",
+            "country": "",
+            "ingredient_origin": "",
+            "manufactured_in": "",
+            "verbatim": "",
+            "confidence": "low",
+            "source": "",
+            "note": "",
+            "evidence_count": 0,
+            "ingredient_claim": "",
+            "manufactured_claim": "",
+            "seen_countries": []
+          },
+          {
+            "product_id": 44,
+            "product_name": "Cheddar Shredded 320g",
+            "status": "unknown",
+            "claim_type": "unknown",
+            "country": "",
+            "ingredient_origin": "",
+            "manufactured_in": "",
+            "verbatim": "",
+            "confidence": "low",
+            "source": "",
+            "note": "",
+            "evidence_count": 0,
+            "ingredient_claim": "",
+            "manufactured_claim": "",
+            "seen_countries": []
+          },
+          {
+            "product_id": 45,
+            "product_name": "Whole Chicken 1.6kg",
+            "status": "unknown",
+            "claim_type": "unknown",
+            "country": "",
+            "ingredient_origin": "",
+            "manufactured_in": "",
+            "verbatim": "",
+            "confidence": "low",
+            "source": "",
+            "note": "",
+            "evidence_count": 0,
+            "ingredient_claim": "",
+            "manufactured_claim": "",
+            "seen_countries": []
+          },
+          {
+            "product_id": 46,
+            "product_name": "Chicken Thighs Boneless 450g",
+            "status": "unknown",
+            "claim_type": "unknown",
+            "country": "",
+            "ingredient_origin": "",
+            "manufactured_in": "",
+            "verbatim": "",
+            "confidence": "low",
+            "source": "",
+            "note": "",
+            "evidence_count": 0,
+            "ingredient_claim": "",
+            "manufactured_claim": "",
+            "seen_countries": []
+          },
+          {
+            "product_id": 47,
+            "product_name": "Atlantic Salmon Fillet 400g",
+            "status": "unknown",
+            "claim_type": "unknown",
+            "country": "",
+            "ingredient_origin": "",
+            "manufactured_in": "",
+            "verbatim": "",
+            "confidence": "low",
+            "source": "",
+            "note": "",
+            "evidence_count": 0,
+            "ingredient_claim": "",
+            "manufactured_claim": "",
+            "seen_countries": []
+          },
+          {
+            "product_id": 48,
+            "product_name": "Canned Tuna Flaked 170g",
+            "status": "unknown",
+            "claim_type": "unknown",
+            "country": "",
+            "ingredient_origin": "",
+            "manufactured_in": "",
+            "verbatim": "",
+            "confidence": "low",
+            "source": "",
+            "note": "",
+            "evidence_count": 0,
+            "ingredient_claim": "",
+            "manufactured_claim": "",
+            "seen_countries": []
+          },
+          {
+            "product_id": 49,
+            "product_name": "Gluten-Free Penne 340g",
+            "status": "unknown",
+            "claim_type": "unknown",
+            "country": "",
+            "ingredient_origin": "",
+            "manufactured_in": "",
+            "verbatim": "",
+            "confidence": "low",
+            "source": "",
+            "note": "",
+            "evidence_count": 0,
+            "ingredient_claim": "",
+            "manufactured_claim": "",
+            "seen_countries": []
+          },
+          {
+            "product_id": 50,
+            "product_name": "Gluten-Free Bread 400g",
+            "status": "unknown",
+            "claim_type": "unknown",
+            "country": "",
+            "ingredient_origin": "",
+            "manufactured_in": "",
+            "verbatim": "",
+            "confidence": "low",
+            "source": "",
+            "note": "",
+            "evidence_count": 0,
+            "ingredient_claim": "",
+            "manufactured_claim": "",
+            "seen_countries": []
+          }
+        ],
+        "total": 62,
+        "by_status": {
+          "unknown": 62
+        },
+        "next_offset": 50
+      },
+      "ms": 30.189,
+      "chars": 21340,
+      "mime_type": null,
+      "from_expected": []
+    },
+    {
+      "kind": "tool",
+      "name": "origin_triage",
+      "arguments": {},
+      "is_error": false,
+      "summary": "object with keys result; result: list of 21; result[0]={\"product_id\": 3, \"product_name\": \"Dark Chocolate Cadbury\", \"reason\": \"British brand — verify, brands manufacture acros…; result[1]={\"product_id\": 4, \"product_name\": \"Milk Chocolate Cadbury\", \"reason\": \"British brand — verify, brands manufacture acros…; result[2]={\"product_id\": 8, \"product_name\": \"Basmati Rice 2kg\", \"reason\": \"Basmati is grown in India/Pakistan — verify which\", \"s…",
+      "structured_keys": [
+        "result"
+      ],
+      "structured": {
+        "result": [
+          {
+            "product_id": 3,
+            "product_name": "Dark Chocolate Cadbury",
+            "reason": "British brand — verify, brands manufacture across regions",
+            "status": "unknown"
+          },
+          {
+            "product_id": 4,
+            "product_name": "Milk Chocolate Cadbury",
+            "reason": "British brand — verify, brands manufacture across regions",
+            "status": "unknown"
+          },
+          {
+            "product_id": 8,
+            "product_name": "Basmati Rice 2kg",
+            "reason": "Basmati is grown in India/Pakistan — verify which",
+            "status": "unknown"
+          },
+          {
+            "product_id": 9,
+            "product_name": "Long Grain White Rice 1kg",
+            "reason": "Commonly imported category",
+            "status": "unknown"
+          },
+          {
+            "product_id": 16,
+            "product_name": "Extra Virgin Olive Oil 500ml",
+            "reason": "Blended oils are often multi-country — verify",
+            "status": "unknown"
+          },
+          {
+            "product_id": 21,
+            "product_name": "Spaghetti Pasta 500g",
+            "reason": "Commonly imported category",
+            "status": "unknown"
+          },
+          {
+            "product_id": 26,
+            "product_name": "Cumin Ground 100g",
+            "reason": "Likely imported spice",
+            "status": "unknown"
+          },
+          {
+            "product_id": 27,
+            "product_name": "Turmeric Ground 100g",
+            "reason": "Likely imported spice",
+            "status": "unknown"
+          },
+          {
+            "product_id": 28,
+            "product_name": "Coriander Ground 100g",
+            "reason": "Likely imported spice",
+            "status": "unknown"
+          },
+          {
+            "product_id": 29,
+            "product_name": "Garam Masala 100g",
+            "reason": "Likely imported spice",
+            "status": "unknown"
+          },
+          {
+            "product_id": 34,
+            "product_name": "Passata Strained Tomatoes 680ml",
+            "reason": "Italian designation — verify",
+            "status": "unknown"
+          },
+          {
+            "product_id": 42,
+            "product_name": "Coconut Yogurt 500g",
+            "reason": "Likely imported",
+            "status": "unknown"
+          },
+          {
+            "product_id": 43,
+            "product_name": "Parmesan Wedge 200g",
+            "reason": "Italian designation — verify",
+            "status": "unknown"
+          },
+          {
+            "product_id": 47,
+            "product_name": "Atlantic Salmon Fillet 400g",
+            "reason": "Seafood origin is not published online — needs a label photo",
+            "status": "unknown"
+          },
+          {
+            "product_id": 48,
+            "product_name": "Canned Tuna Flaked 170g",
+            "reason": "Seafood origin is not published online — needs a label photo",
+            "status": "unknown"
+          },
+          {
+            "product_id": 49,
+            "product_name": "Gluten-Free Penne 340g",
+            "reason": "Commonly imported category",
+            "status": "unknown"
+          },
+          {
+            "product_id": 51,
+            "product_name": "Penne Rigate 500g",
+            "reason": "Commonly imported category",
+            "status": "unknown"
+          },
+          {
+            "product_id": 52,
+            "product_name": "Fusilli Family Pack 900g",
+            "reason": "Commonly imported category",
+            "status": "unknown"
+          },
+          {
+            "product_id": 58,
+            "product_name": "Coconut Milk Canned 400ml",
+            "reason": "Likely imported",
+            "status": "unknown"
+          },
+          {
+            "product_id": 59,
+            "product_name": "Soy Sauce 500ml",
+            "reason": "Likely imported",
+            "status": "unknown"
+          },
+          {
+            "product_id": 62,
+            "product_name": "Olive Oil 1L",
+            "reason": "Blended oils are often multi-country — verify",
+            "status": "unknown"
+          }
+        ]
+      },
+      "ms": 15.607,
+      "chars": 2889,
+      "mime_type": null,
+      "from_expected": []
+    },
+    {
+      "kind": "tool",
+      "name": "list_products",
+      "arguments": {},
+      "is_error": false,
+      "summary": "object with keys items, total, next_offset; items: list of 50; items[0]={\"brand\": \"Fraser Farms\", \"category\": \"bakery\", \"dietary_tags\": \"gluten\", \"id\": 1, \"name\": \"Wheat Bread 1\", \"price\": 5.…; items[1]={\"brand\": \"Maple Ridge\", \"category\": \"bakery\", \"dietary_tags\": \"gluten\", \"id\": 2, \"name\": \"Wheat Bread 2\", \"price\": 3.0…; items[2]={\"brand\": \"Cadbury\", \"category\": \"snacks\", \"dietary_tags\": \"\", \"id\": 3, \"name\": \"Dark Chocolate Cadbury\", \"price\": 5.0,…; total=62; next_offset=50",
+      "structured_keys": [
+        "items",
+        "total",
+        "next_offset"
+      ],
+      "structured": {
+        "items": [
+          {
+            "id": 1,
+            "name": "Wheat Bread 1",
+            "brand": "Fraser Farms",
+            "category": "bakery",
+            "subcategory": "bread",
+            "price": 5.0,
+            "unit_size": "675g",
+            "dietary_tags": "gluten"
+          },
+          {
+            "id": 2,
+            "name": "Wheat Bread 2",
+            "brand": "Maple Ridge",
+            "category": "bakery",
+            "subcategory": "bread",
+            "price": 3.0,
+            "unit_size": "450g",
+            "dietary_tags": "gluten"
+          },
+          {
+            "id": 3,
+            "name": "Dark Chocolate Cadbury",
+            "brand": "Cadbury",
+            "category": "snacks",
+            "subcategory": "chocolate",
+            "price": 5.0,
+            "unit_size": "100g",
+            "dietary_tags": ""
+          },
+          {
+            "id": 4,
+            "name": "Milk Chocolate Cadbury",
+            "brand": "Cadbury",
+            "category": "snacks",
+            "subcategory": "chocolate",
+            "price": 10.0,
+            "unit_size": "100g",
+            "dietary_tags": "dairy"
+          },
+          {
+            "id": 5,
+            "name": "Nestles PBJ",
+            "brand": "Nestles",
+            "category": "pantry",
+            "subcategory": "spread",
+            "price": 8.0,
+            "unit_size": "340g",
+            "dietary_tags": "nuts"
+          },
+          {
+            "id": 6,
+            "name": "Canadian Peanut Butter Cream",
+            "brand": "Fraser Farms",
+            "category": "pantry",
+            "subcategory": "spread",
+            "price": 3.0,
+            "unit_size": "500g",
+            "dietary_tags": "nuts"
+          },
+          {
+            "id": 7,
+            "name": "Sourdough Loaf",
+            "brand": "Maple Ridge",
+            "category": "bakery",
+            "subcategory": "bread",
+            "price": 6.5,
+            "unit_size": "600g",
+            "dietary_tags": "gluten"
+          },
+          {
+            "id": 8,
+            "name": "Basmati Rice 2kg",
+            "brand": "Coastline Foods",
+            "category": "pantry",
+            "subcategory": "rice",
+            "price": 12.0,
+            "unit_size": "2kg",
+            "dietary_tags": ""
+          },
+          {
+            "id": 9,
+            "name": "Long Grain White Rice 1kg",
+            "brand": "Golden Gate",
+            "category": "pantry",
+            "subcategory": "rice",
+            "price": 4.5,
+            "unit_size": "1kg",
+            "dietary_tags": ""
+          },
+          {
+            "id": 10,
+            "name": "Boneless Skinless Chicken Breast",
+            "brand": "PantryCo",
+            "category": "meat",
+            "subcategory": "poultry",
+            "price": 8.99,
+            "unit_size": "500g",
+            "dietary_tags": "meat"
+          },
+          {
+            "id": 11,
+            "name": "Chicken Thighs Bone-In",
+            "brand": "Fraser Farms",
+            "category": "meat",
+            "subcategory": "poultry",
+            "price": 6.49,
+            "unit_size": "700g",
+            "dietary_tags": "meat"
+          },
+          {
+            "id": 12,
+            "name": "Yellow Onion",
+            "brand": "Maple Ridge",
+            "category": "produce",
+            "subcategory": "vegetables",
+            "price": 0.99,
+            "unit_size": "~200g",
+            "dietary_tags": ""
+          },
+          {
+            "id": 13,
+            "name": "Fresh Garlic",
+            "brand": "Coastline Foods",
+            "category": "produce",
+            "subcategory": "vegetables",
+            "price": 0.79,
+            "unit_size": "~50g",
+            "dietary_tags": ""
+          },
+          {
+            "id": 14,
+            "name": "Roma Tomato",
+            "brand": "Golden Gate",
+            "category": "produce",
+            "subcategory": "vegetables",
+            "price": 2.99,
+            "unit_size": "500g",
+            "dietary_tags": ""
+          },
+          {
+            "id": 15,
+            "name": "Canned Diced Tomatoes",
+            "brand": "PantryCo",
+            "category": "pantry",
+            "subcategory": "canned",
+            "price": 1.99,
+            "unit_size": "796ml",
+            "dietary_tags": ""
+          },
+          {
+            "id": 16,
+            "name": "Extra Virgin Olive Oil 500ml",
+            "brand": "Fraser Farms",
+            "category": "pantry",
+            "subcategory": "oil",
+            "price": 9.99,
+            "unit_size": "500ml",
+            "dietary_tags": ""
+          },
+          {
+            "id": 17,
+            "name": "Canola Oil 1L",
+            "brand": "Maple Ridge",
+            "category": "pantry",
+            "subcategory": "oil",
+            "price": 4.49,
+            "unit_size": "1L",
+            "dietary_tags": ""
+          },
+          {
+            "id": 18,
+            "name": "Butter Salted 454g",
+            "brand": "Coastline Foods",
+            "category": "dairy",
+            "subcategory": "butter",
+            "price": 6.99,
+            "unit_size": "454g",
+            "dietary_tags": "dairy"
+          },
+          {
+            "id": 19,
+            "name": "Whole Milk 1L",
+            "brand": "Golden Gate",
+            "category": "dairy",
+            "subcategory": "milk",
+            "price": 2.99,
+            "unit_size": "1L",
+            "dietary_tags": "dairy"
+          },
+          {
+            "id": 20,
+            "name": "Plain Greek Yogurt 750g",
+            "brand": "PantryCo",
+            "category": "dairy",
+            "subcategory": "yogurt",
+            "price": 5.99,
+            "unit_size": "750g",
+            "dietary_tags": "dairy"
+          },
+          {
+            "id": 21,
+            "name": "Spaghetti Pasta 500g",
+            "brand": "Fraser Farms",
+            "category": "pantry",
+            "subcategory": "pasta",
+            "price": 2.49,
+            "unit_size": "500g",
+            "dietary_tags": "gluten"
+          },
+          {
+            "id": 22,
+            "name": "Ground Beef Lean",
+            "brand": "Maple Ridge",
+            "category": "meat",
+            "subcategory": "beef",
+            "price": 7.99,
+            "unit_size": "450g",
+            "dietary_tags": "meat"
+          },
+          {
+            "id": 23,
+            "name": "Cheddar Cheese Block 300g",
+            "brand": "Coastline Foods",
+            "category": "dairy",
+            "subcategory": "cheese",
+            "price": 5.99,
+            "unit_size": "300g",
+            "dietary_tags": "dairy"
+          },
+          {
+            "id": 24,
+            "name": "Mozzarella Shredded 200g",
+            "brand": "Golden Gate",
+            "category": "dairy",
+            "subcategory": "cheese",
+            "price": 4.99,
+            "unit_size": "200g",
+            "dietary_tags": "dairy"
+          },
+          {
+            "id": 25,
+            "name": "Fresh Ginger",
+            "brand": "PantryCo",
+            "category": "produce",
+            "subcategory": "vegetables",
+            "price": 1.29,
+            "unit_size": "100g",
+            "dietary_tags": ""
+          },
+          {
+            "id": 26,
+            "name": "Cumin Ground 100g",
+            "brand": "Fraser Farms",
+            "category": "pantry",
+            "subcategory": "spice",
+            "price": 3.49,
+            "unit_size": "100g",
+            "dietary_tags": ""
+          },
+          {
+            "id": 27,
+            "name": "Turmeric Ground 100g",
+            "brand": "Maple Ridge",
+            "category": "pantry",
+            "subcategory": "spice",
+            "price": 3.99,
+            "unit_size": "100g",
+            "dietary_tags": ""
+          },
+          {
+            "id": 28,
+            "name": "Coriander Ground 100g",
+            "brand": "Coastline Foods",
+            "category": "pantry",
+            "subcategory": "spice",
+            "price": 3.49,
+            "unit_size": "100g",
+            "dietary_tags": ""
+          },
+          {
+            "id": 29,
+            "name": "Garam Masala 100g",
+            "brand": "Golden Gate",
+            "category": "pantry",
+            "subcategory": "spice",
+            "price": 4.99,
+            "unit_size": "100g",
+            "dietary_tags": ""
+          },
+          {
+            "id": 30,
+            "name": "Frozen Broccoli 500g",
+            "brand": "PantryCo",
+            "category": "frozen",
+            "subcategory": "vegetables",
+            "price": 3.49,
+            "unit_size": "500g",
+            "dietary_tags": ""
+          },
+          {
+            "id": 31,
+            "name": "Tomato Sauce Jar 650ml",
+            "brand": "Fraser Farms",
+            "category": "pantry",
+            "subcategory": "sauce",
+            "price": 3.99,
+            "unit_size": "650ml",
+            "dietary_tags": ""
+          },
+          {
+            "id": 32,
+            "name": "Tomato Paste 156ml",
+            "brand": "Maple Ridge",
+            "category": "pantry",
+            "subcategory": "canned",
+            "price": 1.29,
+            "unit_size": "156ml",
+            "dietary_tags": ""
+          },
+          {
+            "id": 33,
+            "name": "Crushed Tomatoes Canned 796ml",
+            "brand": "Coastline Foods",
+            "category": "pantry",
+            "subcategory": "canned",
+            "price": 2.29,
+            "unit_size": "796ml",
+            "dietary_tags": ""
+          },
+          {
+            "id": 34,
+            "name": "Passata Strained Tomatoes 680ml",
+            "brand": "Golden Gate",
+            "category": "pantry",
+            "subcategory": "sauce",
+            "price": 2.79,
+            "unit_size": "680ml",
+            "dietary_tags": ""
+          },
+          {
+            "id": 35,
+            "name": "Ground Beef Medium 900g",
+            "brand": "PantryCo",
+            "category": "meat",
+            "subcategory": "beef",
+            "price": 11.99,
+            "unit_size": "900g",
+            "dietary_tags": "meat"
+          },
+          {
+            "id": 36,
+            "name": "Ground Beef Extra Lean 300g",
+            "brand": "Fraser Farms",
+            "category": "meat",
+            "subcategory": "beef",
+            "price": 6.49,
+            "unit_size": "300g",
+            "dietary_tags": "meat"
+          },
+          {
+            "id": 37,
+            "name": "Russet Potatoes 5lb Bag",
+            "brand": "Maple Ridge",
+            "category": "produce",
+            "subcategory": "vegetables",
+            "price": 4.99,
+            "unit_size": "2.27kg",
+            "dietary_tags": ""
+          },
+          {
+            "id": 38,
+            "name": "Baby Potatoes 680g",
+            "brand": "Coastline Foods",
+            "category": "produce",
+            "subcategory": "vegetables",
+            "price": 3.99,
+            "unit_size": "680g",
+            "dietary_tags": ""
+          },
+          {
+            "id": 39,
+            "name": "Oat Milk 1L",
+            "brand": "Golden Gate",
+            "category": "dairy",
+            "subcategory": "milk",
+            "price": 3.49,
+            "unit_size": "1L",
+            "dietary_tags": ""
+          },
+          {
+            "id": 40,
+            "name": "Almond Milk 946ml",
+            "brand": "PantryCo",
+            "category": "dairy",
+            "subcategory": "milk",
+            "price": 3.29,
+            "unit_size": "946ml",
+            "dietary_tags": "nuts"
+          },
+          {
+            "id": 41,
+            "name": "Vegan Cheese Shreds 200g",
+            "brand": "Fraser Farms",
+            "category": "dairy",
+            "subcategory": "cheese",
+            "price": 5.49,
+            "unit_size": "200g",
+            "dietary_tags": "soy"
+          },
+          {
+            "id": 42,
+            "name": "Coconut Yogurt 500g",
+            "brand": "Maple Ridge",
+            "category": "dairy",
+            "subcategory": "yogurt",
+            "price": 5.99,
+            "unit_size": "500g",
+            "dietary_tags": ""
+          },
+          {
+            "id": 43,
+            "name": "Parmesan Wedge 200g",
+            "brand": "Coastline Foods",
+            "category": "dairy",
+            "subcategory": "cheese",
+            "price": 7.99,
+            "unit_size": "200g",
+            "dietary_tags": "dairy"
+          },
+          {
+            "id": 44,
+            "name": "Cheddar Shredded 320g",
+            "brand": "Golden Gate",
+            "category": "dairy",
+            "subcategory": "cheese",
+            "price": 6.99,
+            "unit_size": "320g",
+            "dietary_tags": "dairy"
+          },
+          {
+            "id": 45,
+            "name": "Whole Chicken 1.6kg",
+            "brand": "PantryCo",
+            "category": "meat",
+            "subcategory": "poultry",
+            "price": 12.99,
+            "unit_size": "1.6kg",
+            "dietary_tags": "meat"
+          },
+          {
+            "id": 46,
+            "name": "Chicken Thighs Boneless 450g",
+            "brand": "Fraser Farms",
+            "category": "meat",
+            "subcategory": "poultry",
+            "price": 7.49,
+            "unit_size": "450g",
+            "dietary_tags": "meat"
+          },
+          {
+            "id": 47,
+            "name": "Atlantic Salmon Fillet 400g",
+            "brand": "Maple Ridge",
+            "category": "meat",
+            "subcategory": "seafood",
+            "price": 13.99,
+            "unit_size": "400g",
+            "dietary_tags": "meat"
+          },
+          {
+            "id": 48,
+            "name": "Canned Tuna Flaked 170g",
+            "brand": "Coastline Foods",
+            "category": "pantry",
+            "subcategory": "canned",
+            "price": 1.79,
+            "unit_size": "170g",
+            "dietary_tags": "meat"
+          },
+          {
+            "id": 49,
+            "name": "Gluten-Free Penne 340g",
+            "brand": "Golden Gate",
+            "category": "pantry",
+            "subcategory": "pasta",
+            "price": 4.49,
+            "unit_size": "340g",
+            "dietary_tags": ""
+          },
+          {
+            "id": 50,
+            "name": "Gluten-Free Bread 400g",
+            "brand": "PantryCo",
+            "category": "bakery",
+            "subcategory": "bread",
+            "price": 6.99,
+            "unit_size": "400g",
+            "dietary_tags": "egg"
+          }
+        ],
+        "total": 62,
+        "next_offset": 50
+      },
+      "ms": 21.891,
+      "chars": 11608,
+      "mime_type": null,
+      "from_expected": []
+    }
+  ],
+  "disclosed": [
+    "find_product",
+    "get_product",
+    "get_product_origins",
+    "origin_triage",
+    "list_products"
+  ],
+  "on_request": [
+    "list_recipes",
+    "get_recipe",
+    "plan_recipe",
+    "plan_from_text",
+    "plan_week",
+    "rank_products_by_origin",
+    "list_origin_submissions",
+    "pipeline_status"
+  ],
+  "reports": [
+    {
+      "observer": "shelf_clerk",
+      "condition": "direct_match",
+      "value": true,
+      "evidence": "find_product.match == 'direct', find_product.total == 2",
+      "confidence": 1.0,
+      "trigger": "scout",
+      "at_event": -1
+    }
+  ],
+  "goals": [
+    "Quote the cheapest direct hit by exact name, price and store."
+  ],
+  "flags": [],
+  "failures": [],
+  "notes": [],
+  "events": [
+    {
+      "t": "2026-10-02T12:08:39.758+00:00",
+      "kind": "informant_report",
+      "trigger": "scout",
+      "reports": [
+        {
+          "observer": "shelf_clerk",
+          "condition": "direct_match",
+          "value": true,
+          "evidence": "find_product.match == 'direct', find_product.total == 2",
+          "confidence": 1.0,
+          "trigger": "scout",
+          "at_event": -1
+        }
+      ],
+      "flags": [],
+      "failures": [],
+      "notes": []
+    },
+    {
+      "t": "2026-10-02T12:08:39.758+00:00",
+      "kind": "tools_offered",
+      "added": [],
+      "removed": [],
+      "reason": "observer:shelf_clerk.direct_match"
+    },
+    {
+      "t": "2026-10-02T12:08:39.758+00:00",
+      "kind": "goal_enabled",
+      "text": "Quote the cheapest direct hit by exact name, price and store.",
+      "reason": "observer:shelf_clerk.direct_match",
+      "observer": "shelf_clerk",
+      "condition": "direct_match"
+    }
+  ],
+  "tool_calls": 4,
+  "budget": 5,
+  "planner_prompt_chars": 11461
+}

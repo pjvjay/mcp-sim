@@ -1,0 +1,83 @@
+{
+  "path_id": "happy-dry-run",
+  "mode": "guided",
+  "index": 0,
+  "passed": false,
+  "score": 0.0,
+  "matches": [
+    {
+      "path": "query",
+      "op": "$eq",
+      "expected": "penne",
+      "actual": "penne",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "path": "match",
+      "op": "$eq",
+      "expected": "direct",
+      "actual": "direct",
+      "passed": true,
+      "detail": ""
+    },
+    {
+      "path": "product_id",
+      "op": "$type",
+      "expected": "number",
+      "actual": "<missing>",
+      "passed": false,
+      "detail": "path missing"
+    },
+    {
+      "path": "product_name",
+      "op": "$regex",
+      "expected": "(?i)penne",
+      "actual": "<missing>",
+      "passed": false,
+      "detail": "path missing"
+    },
+    {
+      "path": "store",
+      "op": "$type",
+      "expected": "string",
+      "actual": "<missing>",
+      "passed": false,
+      "detail": "path missing"
+    },
+    {
+      "path": "price",
+      "op": "$gt",
+      "expected": 0,
+      "actual": "<missing>",
+      "passed": false,
+      "detail": "path missing"
+    },
+    {
+      "path": "origin_status",
+      "op": "$in",
+      "expected": [
+        "unknown",
+        "resolved",
+        "verified",
+        "unverified",
+        "pending",
+        "conflicting"
+      ],
+      "actual": "<missing>",
+      "passed": false,
+      "detail": "path missing"
+    }
+  ],
+  "checklist": [],
+  "failure_reasons": [
+    "deterministic: product_id $type",
+    "deterministic: product_name $regex",
+    "deterministic: store $type",
+    "deterministic: price $gt",
+    "deterministic: origin_status $in"
+  ],
+  "flags": [],
+  "votes": 0,
+  "judge_model": "dry-run"
+}

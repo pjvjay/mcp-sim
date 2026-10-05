@@ -1,0 +1,111 @@
+{
+  "scenario": "cheapest-penne",
+  "generated_at": "2026-10-02T12:08:44.211+00:00",
+  "run_dir": "runs/cheapest-penne/20261002T120836Z",
+  "runs": 4,
+  "passed": 0,
+  "pass_rate": 0.0,
+  "mean_score": 0.0,
+  "cost_usd": 0.0,
+  "cost_note": "estimate; local model(s) via Ollama cost 0 (no API spend); hosted calls, if any, are an estimate from the rate table; covers the agent, simulated-user and observer calls recorded in transcripts, not the planner or judge",
+  "usage": {},
+  "judge_models": [
+    "dry-run"
+  ],
+  "outcomes": {
+    "completed": 4
+  },
+  "cells": [
+    {
+      "path_id": "happy-dry-run",
+      "mode": "free",
+      "runs": 2,
+      "passed": 0,
+      "pass_rate": 0.0,
+      "mean_score": 0.0,
+      "cost_usd": 0.0,
+      "outcomes": {
+        "completed": 2
+      }
+    },
+    {
+      "path_id": "happy-dry-run",
+      "mode": "guided",
+      "runs": 2,
+      "passed": 0,
+      "pass_rate": 0.0,
+      "mean_score": 0.0,
+      "cost_usd": 0.0,
+      "outcomes": {
+        "completed": 2
+      }
+    }
+  ],
+  "worst_failures": [
+    {
+      "path_id": "happy-dry-run",
+      "mode": "free",
+      "index": 0,
+      "score": 0.0,
+      "outcome": "completed",
+      "reasons": [
+        "deterministic: product_id $type",
+        "deterministic: product_name $regex",
+        "deterministic: store $type",
+        "deterministic: price $gt",
+        "deterministic: origin_status $in"
+      ],
+      "transcript": "runs/cheapest-penne/20261002T120836Z/transcripts/happy-dry-run-free-0.jsonl",
+      "verdict": "runs/cheapest-penne/20261002T120836Z/verdicts/happy-dry-run-free-0.json"
+    },
+    {
+      "path_id": "happy-dry-run",
+      "mode": "free",
+      "index": 1,
+      "score": 0.0,
+      "outcome": "completed",
+      "reasons": [
+        "deterministic: product_id $type",
+        "deterministic: product_name $regex",
+        "deterministic: store $type",
+        "deterministic: price $gt",
+        "deterministic: origin_status $in"
+      ],
+      "transcript": "runs/cheapest-penne/20261002T120836Z/transcripts/happy-dry-run-free-1.jsonl",
+      "verdict": "runs/cheapest-penne/20261002T120836Z/verdicts/happy-dry-run-free-1.json"
+    },
+    {
+      "path_id": "happy-dry-run",
+      "mode": "guided",
+      "index": 0,
+      "score": 0.0,
+      "outcome": "completed",
+      "reasons": [
+        "deterministic: product_id $type",
+        "deterministic: product_name $regex",
+        "deterministic: store $type",
+        "deterministic: price $gt",
+        "deterministic: origin_status $in"
+      ],
+      "transcript": "runs/cheapest-penne/20261002T120836Z/transcripts/happy-dry-run-guided-0.jsonl",
+      "verdict": "runs/cheapest-penne/20261002T120836Z/verdicts/happy-dry-run-guided-0.json"
+    },
+    {
+      "path_id": "happy-dry-run",
+      "mode": "guided",
+      "index": 1,
+      "score": 0.0,
+      "outcome": "completed",
+      "reasons": [
+        "deterministic: product_id $type",
+        "deterministic: product_name $regex",
+        "deterministic: store $type",
+        "deterministic: price $gt",
+        "deterministic: origin_status $in"
+      ],
+      "transcript": "runs/cheapest-penne/20261002T120836Z/transcripts/happy-dry-run-guided-1.jsonl",
+      "verdict": "runs/cheapest-penne/20261002T120836Z/verdicts/happy-dry-run-guided-1.json"
+    }
+  ],
+  "unjudged": []
+}
